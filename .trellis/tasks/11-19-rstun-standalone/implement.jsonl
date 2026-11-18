@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "本仓 Rust 后端约定索引（单 crate，无 workspace）"}
+{"file": ".trellis/spec/backend/release-artifacts.md", "reason": "发布物契约：可执行位、tag↔资产↔digest、双架构 manifest"}
+{"file": ".trellis/tasks/11-19-rstun-standalone/research/T1-interop-matrix.md", "reason": "四方互操作矩阵与失败项判定（改协议前必读）"}
+{"file": ".trellis/tasks/11-19-rstun-standalone/research/S3-release-prep.md", "reason": "发版预检缺口（crates.io/arm64/版本一致性/拆仓）"}
