@@ -297,6 +297,12 @@ jobs:
             [ -d "$d" ] || continue
             name="$(basename "$d")"
             name="${name#rstun-}"
+            # `upload-artifact` / `download-artifact` 不保留文件权限位（GitHub 的已知行为），
+            # 直接打包会得到 0644 的二进制 —— 用户解压后 `./rstun` 报「权限不够」。
+            # 打包前补回可执行位（Windows 的 .exe 也照做，跨平台解压时更省心）。
+            for f in "$d"/*; do
+              [ -f "$f" ] && chmod +x "$f"
+            done
             ( cd "$d" && zip -r "../../zipped_assets/rstun-${name}-${VERSION}.zip" . )
             count=$((count + 1))
           done
