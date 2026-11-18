@@ -1,0 +1,63 @@
+# `script/lab/` —— 互操作矩阵（可选夹具）
+
+这里的脚本**不是 CI 门禁**：CI 只跑 `cargo test` + `script/ci/rstun-smoke.sh`（三平台）。
+本目录的价值是把「第三方实现能不能读我们的包、我们能不能读它们的包」固化成可重跑的夹具，
+下次改协议照着跑，任何一项从 ok 变 FAIL 就说明行为变了。
+
+| 文件 | 作用 |
+| --- | --- |
+| [`rstun-interop.sh`](./rstun-interop.sh) | 矩阵单入口：8 个项，可单项跑也可一次跑完 |
+| [`rstun-interop-probe.py`](./rstun-interop-probe.py) | 只用 python3 标准库的协议探针（逐条 `ok:` / `FAIL:` 断言） |
+
+结论与原始证据摘录见 [`docs/interop-matrix.md`](../../docs/interop-matrix.md)。
+
+## 用法
+
+```bash
+bash script/lab/rstun-interop.sh --list        # 列项 + 可选参数
+bash script/lab/rstun-interop.sh probe         # 只跑 rstun 自身协议矩阵（16 项子用例）
+bash script/lab/rstun-interop.sh --item pion,webrtc-stun   # 多选
+bash script/lab/rstun-interop.sh all           # 除 fuzz/ci 外全部（38 项子用例）
+bash script/lab/rstun-interop.sh full          # all + fuzz(600s) + ci
+```
+
+单项：`probe` / `pion` / `webrtc-stun` / `coturn` / `stun-types` / `rfc5769` / `fuzz` / `ci`。
+
+常用参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--port N` | `34780` | 端口基准，各子项在其上取偏移；**`3478` 会被直接拒跑（exit 2）** |
+| `--no-build` | — | 跳过 `cargo build`（复用已有 `target/debug/rstun`） |
+| `--fuzz-seconds N` | `600` | `fuzz` 项时长 |
+| `--keep` | — | 保留临时工程与日志（日志默认就保留，只清进程） |
+
+日志与临时工程：`$RSTUN_INTEROP_DIR`（默认 `/tmp/opencode/rstun-interop`）。
+每次运行都把每项输出写进 `logs/`；「多少条断言」= `grep -a -h '^ok:' $RSTUN_INTEROP_DIR/logs/*.log | wc -l`。
+
+## 依赖
+
+| 项 | 需要 | 缺依赖时 |
+| --- | --- | --- |
+| `probe` / `stun-types` / `rfc5769` / `ci` | `cargo` + `python3` | — （`ci` 的 YAML 检查另需 PyYAML） |
+| `pion` | `go`（夹具在 `test/interop/pion/`，`go mod tidy` 在临时目录跑） | SKIP |
+| `webrtc-stun` | `cargo`（夹具在 `test/interop/webrtc-stun/`） | SKIP |
+| `coturn` | `turnserver` + `turnutils_stunclient`（Debian: `apt-get install coturn`） | SKIP |
+| `fuzz` | `cargo-fuzz` + `nightly` 工具链 | SKIP |
+
+容器（`docker`/`podman`）**不需要**：coturn 用原生进程起，不触容器边界。
+IPv6 回环不可用时 `ipv6` 子项记 SKIP，不算失败。
+
+## 判据提醒
+
+`CHANGE-REQUEST`（RFC 5780）的回包来自**另一个源地址/端口**。端口受限 NAT 后的客户端会把
+陌生源的包丢掉，于是表现为「超时」——**这不等于是服务端没有换源**。
+
+判定换源是否真的发生，要看：
+
+- 本地回环（`127.0.0.1` ↔ `127.0.0.2`）：本脚本的 `probe/change-*` 与 `pion|webrtc-stun/rfc5780`；
+- 服务端 `--verbose` 日志里的 `from=` 字段（本脚本 coturn 项固定落 `logs/coturn-target-verbose.log`）；
+- 或 full-cone / DC 一类的客户端。
+
+同理，第三方工具**没有** STUN 服务端能力时（pion / webrtc-rs 都只有编解码 + 客户端），
+方向 B 只到编解码层 —— 那是对手能力边界，不是我们的失败。
