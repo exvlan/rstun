@@ -317,8 +317,12 @@ macOS / Windows 的 runner 结果只能由真实 CI 产生。本任务硬约束�
    丢包、MTU 分片不在本轮范围内（生产切换另有 S4 的外部 vantage 验证）。
 2. **coturn 客户端覆盖面窄**：只发 0x06 + PADDING（见 J1），单轴 CHANGE-REQUEST 靠我们自己的探针。
 3. **`RESPONSE-PORT` 的第三方只有 pion / webrtc-rs**；coturn 的 `stunclient` 不发该属性。
-4. **macOS / Windows 的 CI 矩阵结果待真实 CI 确认**（1.8：作业已写好，Linux 本地等价复现全绿）。
+4. **macOS / Windows 的 CI 矩阵已由独立仓 CI 确认**（三平台 test + 冒烟 + IPv6 全绿）。
 5. fuzz 只覆盖解析/编码纯函数，不含 `decide()` 与 socket 层（那部分由 e2e 单测覆盖）。
+6. **公网「change 回包收不到」不等于服务端换源失败**：生产实测两个不同运营商的家宽客户端都收不到
+   回包，而服务端抓包证明回包已从正确 socket 发出 —— 原因是客户端 NAT 非 full-cone，丢弃陌生源。
+   验证 `CHANGE-REQUEST` 的判据必须取本地回环、服务端抓包（`from=`）或 DC/full-cone 客户端，
+   详见任务 `research/S4-production-switch.md`。
 
 ## 12. 复现命令（逐个可粘）
 
