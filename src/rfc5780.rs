@@ -407,8 +407,7 @@ mod tests {
             "alt port 0 must be refused"
         );
         // No +1 neighbour for the default alt port.
-        let error =
-            Plan::from_cli("203.0.113.5:65535".parse().unwrap(), other, None).unwrap_err();
+        let error = Plan::from_cli("203.0.113.5:65535".parse().unwrap(), other, None).unwrap_err();
         assert!(error.contains("--alt-port"), "{error}");
     }
 
