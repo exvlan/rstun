@@ -1,0 +1,188 @@
+name: CI
+
+# 三个平台 × 三条验证线：
+#   test       单测（UDP/TCP/IPv6 都在进程内真 bind）+ 格式 + lint
+#   smoke      native 二进制起服务，真发 20 字节 Binding Request（UDP + TCP）
+#   smoke-ipv6 单独验 `--listen-v6`（v6-only 绑定，可与 v4 同端口共存）
+#
+# 为什么 fmt/clippy 只在 Linux 上跑：格式化与 lint 的结果与平台无关，
+# 三平台各跑一遍只是三倍等待。单测与冒烟才需要真机（socket 语义因平台而异）。
+#
+# 刻意**不装 mold**：本仓没有 `.cargo/config.toml` 强制别的链接器，
+# 默认 linker 就够（装了反而会在 macOS/Windows 上找不到）。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# 只读：CI 不发布任何东西（发版在 release.yml）。
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 测试二进制不带调试信息：runner 磁盘小、缓存也小，调试符号对 CI 无用。
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # toolchain 与 `rust-toolchain.toml` 一致；`rustflags: ""` 只清空 RUSTFLAGS，
+      # 本项目没有任何自定义 rustflags。
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          components: rustfmt,clippy
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: test-${{ runner.os }}-${{ runner.arch }}
+
+      # 单测里 bind 不到 127.0.0.2 / IPv6 的用例会自行跳过，
+      # 环境差异不会把「平台不支持某个地址」变成红灯。
+      - name: Unit tests
+        run: cargo test --no-fail-fast
+
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` 覆盖 lib/bin/测试；`-D warnings` 让 clippy 的任何提示都失败。
+      - name: Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets -- -D warnings
+
+  smoke:
+    name: smoke udp+tcp (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    env:
+      # 冒烟脚本用中文输出；Windows 控制台默认 codepage（cp936/cp1252）会让 Python
+      # 在 `print` 上抛 `UnicodeEncodeError`（协议根本没跑到）。强制 UTF-8 比改文案稳。
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: smoke-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build binary
+        run: cargo build
+
+      # Windows runner 的 Python 有时只有 `python`：探针脚本写的是 `python3`
+      # （Linux/macOS 与生产机都是它）。缺就补一个临时 shim，不改脚本。
+      - name: Ensure python3
+        if: runner.os == 'Windows'
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            mkdir -p "$HOME/bin"
+            printf '#!/bin/sh\nexec python "$@"\n' >"$HOME/bin/python3"
+            chmod +x "$HOME/bin/python3"
+            echo "$HOME/bin" >>"$GITHUB_PATH"
+            echo "已为 python3 建立 shim -> python"
+          fi
+
+      # 编译通过 ≠ 协议正确：真发 20 字节 Binding Request，断言 0x0101 + 映射地址。
+      - name: Smoke (UDP + TCP)
+        run: |
+          set -euo pipefail
+          BIN=target/debug/rstun
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          PORT=34780
+          "$BIN" server --listen "127.0.0.1:${PORT}" --tcp &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          bash script/ci/rstun-smoke.sh "127.0.0.1:${PORT}" --tcp --retries 10
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+
+  smoke-ipv6:
+    name: smoke ipv6 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: smoke-ipv6-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build binary
+        run: cargo build
+
+      - name: Ensure python3
+        if: runner.os == 'Windows'
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            mkdir -p "$HOME/bin"
+            printf '#!/bin/sh\nexec python "$@"\n' >"$HOME/bin/python3"
+            chmod +x "$HOME/bin/python3"
+            echo "$HOME/bin" >>"$GITHUB_PATH"
+            echo "已为 python3 建立 shim -> python"
+          fi
+
+      # `--listen-v6` 是 v6-only 绑定（`set_only_v6`），可以和安全地同端口跑 v4。
+      # Linux / macOS runner 都保证 `::1` 可用 → 失败必须红。
+      # Windows runner 的 IPv6 回环历史上时有时无 → 只告警（Linux 已覆盖正确性）。
+      - name: Smoke (IPv6)
+        run: |
+          set -euo pipefail
+          BIN=target/debug/rstun
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          PORT=34781
+          "$BIN" server --listen-v6 "[::1]:${PORT}" >ipv6.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          if bash script/ci/rstun-smoke.sh "[::1]:${PORT}" --retries 10; then
+            echo "IPv6 冒烟通过"
+          elif [[ "${RUNNER_OS}" == "Windows" ]]; then
+            echo "::warning::IPv6 冒烟失败：Windows runner 不保证 IPv6 回环（见 ipv6.log）"
+            cat ipv6.log || true
+          else
+            echo "::error::IPv6 冒烟失败：${RUNNER_OS} runner 保证 ::1 可用，这是真回归（见 ipv6.log）"
+            cat ipv6.log || true
+            exit 1
+          fi
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true

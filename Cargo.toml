@@ -1,0 +1,50 @@
+[package]
+name = "rstun"
+description = "Standalone STUN server (RFC 5389 Binding; RFC 5780 NAT behaviour discovery with `--alt-listen`). No TURN, no auth."
+homepage = "https://github.com/exvlan/rstun"
+repository = "https://github.com/exvlan/rstun"
+version = "26.410.100"
+# 本 crate 是一个**独立项目**：没有 workspace、没有 path 依赖，
+# `docker build .` 与 `cargo install --path .` 都能直接工作，
+# 所以 edition / rust-version / 依赖版本都写实数。
+edition = "2024"
+rust-version = "1.95"
+# **整仓 MPL-2.0**（`LICENSE`，官方全文逐字未改）。文件级 copyleft：改到本源文件
+# 必须以 MPL-2.0 公开，但不要求更大的作品整体换证。详见 README 的 License 小节。
+license = "MPL-2.0"
+readme = "README.md"
+keywords = ["stun", "rfc5389", "rfc5780", "nat", "networking"]
+categories = ["network-programming"]
+# 发布到 crates.io 时不带进包里：fuzz 目标是独立 workspace（nightly + libFuzzer），
+# test/ 是实验室夹具（Go module / webrtc 客户端），CI 描述与源码无关。
+exclude = ["fuzz/**", "test/**", ".github/**"]
+
+[[bin]]
+name = "rstun"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+# `all` 为了 set_only_v6 / set_reuse_address / listen。
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio = { version = "1.53", default-features = false, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "time",
+] }
+tracing = "0.1"
+# 只保留控制台输出：容器/systemd 采集 stdout 即可，不写滚动文件。
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "ansi",
+  "env-filter",
+  "fmt",
+] }
+
+[dev-dependencies]
+# 参考实现 oracle（**只用于测试**，运行期依赖仍只有上面 5 个）：
+# `stun-types` 是 STUN/TURN 生态里活跃维护的那一份（turn-types / WebRTC 侧的基础库），
+# 用它交叉验证我们的编解码 —— 若它读不了我们的响应，第三方客户端也读不了。
+stun-types = "2.0.5"

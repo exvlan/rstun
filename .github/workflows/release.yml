@@ -1,0 +1,358 @@
+name: Release
+
+# 手动发版（`workflow_dispatch`，不靠 tag 自动触发）：
+#   · 只传一个 `version`（**不带 `v`**，如 `26.410.100`），必须与 `Cargo.toml` 的
+#     `version` 一致 —— 不一致直接失败，避免「tag 说 A、二进制说 B」；
+#   · 一次 dispatch 交付两样：
+#       Release `rstun-v<version>` + 四端 `rstun-<platform>-<version>.zip`
+#       镜像 `ghcr.io/<owner>/rstun:<version>`（linux/amd64 + linux/arm64 双架构）
+#   · 幂等：Release 已存在则 `gh release upload --clobber` 只覆盖资产；
+#     镜像 tag 重复推即覆盖，manifest 用 `--amend` 重建。
+#
+# 冒烟不可省（编译通过 ≠ 协议正确）：native 二进制与容器各验一次
+# （`script/ci/rstun-smoke.sh` / `--version`）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          版本串（**不带 `v`**，如 26.410.100）。必须与 Cargo.toml 的 version 一致；
+          同时用于 ghcr 镜像 tag、Release 名 `rstun-v<version>` 与资产名
+          `rstun-<platform>-<version>.zip`
+        type: string
+        required: true
+
+# 默认最小权限；写权限按作业单独授予（Release 要 contents: write，推镜像要 packages: write）。
+# 全部用 `GITHUB_TOKEN`，不新增 secret。
+permissions:
+  contents: read
+
+concurrency:
+  # 同一版本重复 dispatch 时排队而不是互相取消：发版中途被打断会留下半套资产。
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # 版本解析与校验：一处算好，全 run 共用（build 注入、资产命名、Release tag、镜像 tag）。
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      build_version: ${{ steps.v.outputs.build_version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate version
+        id: v
+        env:
+          RAW: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          raw="$(printf '%s' "${RAW:-}" | tr -d '[:space:]')"
+          # 容错：误带 `v` 前缀也接受（版本串 / 资产名 / ghcr tag 统一不带 v）
+          version="${raw#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'; then
+            echo "::error::版本串格式不合法：${version}（期望 YY.QMM.Mmpp[-<channel>.<n>]，如 26.410.100 或 26.410.100-dev.1）"
+            exit 1
+          fi
+
+          # 版本只有一个真源：Cargo.toml。tag / 资产名 / 镜像 tag 都从它派生，
+          # 所以这里必须与 dispatch 输入一致（不一致就停，不发半套东西）。
+          manifest_version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          if [ "$manifest_version" != "$version" ]; then
+            echo "::error::Cargo.toml 的 version 是 ${manifest_version}，与输入的 ${version} 不一致"
+            exit 1
+          fi
+
+          sha6="$(git rev-parse --short=6 HEAD)"
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          {
+            echo "version=${version}"
+            echo "tag=rstun-v${version}"
+            echo "build_version=${version}+${sha6}"
+            echo "prerelease=${prerelease}"
+          } >>"$GITHUB_OUTPUT"
+          echo "version=${version}  tag=rstun-v${version}  build=${version}+${sha6}  prerelease=${prerelease}"
+
+  # 四端二进制：两个 linux-musl 在对应架构的 runner 上 native 构建并真跑冒烟；
+  # Windows native 跑 `--version`；macOS runner 是 arm64，x86_64 产物只编译（需 Rosetta）。
+  build:
+    name: Build (${{ matrix.name }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, name: linux-x86_64, smoke: linux }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, name: linux-aarch64, smoke: linux }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, name: windows-x86_64, smoke: version }
+          - { target: x86_64-apple-darwin, os: macos-latest, name: macos-x86_64, smoke: none }
+    runs-on: ${{ matrix.os }}
+    env:
+      # 版本串编进二进制（`--version` 与响应里的 SOFTWARE 属性都用它），
+      # 形态 `<version>+<sha6>`，与镜像作业同串。
+      RSTUN_BUILD_VERSION: ${{ needs.prepare.outputs.build_version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # 本仓只依赖 Rust：musl 目标自带静态 crt，不需要 mold / protoc / pkg-config。
+      # `rustflags: ""` 只清空 RUSTFLAGS 环境变量（本项目没有自定义 rustflags）。
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          target: ${{ matrix.target }}
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build rstun
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET"
+          BIN="target/${TARGET}/release/rstun"
+          if [[ "$TARGET" == *windows* ]]; then BIN="${BIN}.exe"; fi
+          ls -l "$BIN"
+
+      - name: Self-check (--version)
+        if: matrix.smoke != 'none'
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/rstun"
+          if [[ "$TARGET" == *windows* ]]; then BIN="${BIN}.exe"; fi
+          out="$("$BIN" --version)"
+          echo "$out"
+          # 版本串必须来自 RSTUN_BUILD_VERSION（含 sha6），否则说明注入链路断了
+          printf '%s\n' "$out" | grep -qF "${RSTUN_BUILD_VERSION}" \
+            || { echo "::error::--version 与 RSTUN_BUILD_VERSION 不一致（期望 ${RSTUN_BUILD_VERSION}）"; exit 1; }
+
+      - name: Binding smoke (UDP + TCP)
+        if: matrix.smoke == 'linux'
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/rstun"
+          PORT=34780
+          "$BIN" server --listen "127.0.0.1:${PORT}" --tcp &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+          bash script/ci/rstun-smoke.sh "127.0.0.1:${PORT}" --tcp --retries 10
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+
+      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          BIN="target/${TARGET}/release/rstun"
+          if [[ "$TARGET" == *windows* ]]; then BIN="${BIN}.exe"; fi
+          cp "$BIN" artifacts/
+          ls -l artifacts
+
+      # 资产名统一 **带 `rstun-` 前缀**（`rstun-<platform>-<version>.zip`），
+      # release 作业按 `pattern: rstun-*` 拉取后直接改名。
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rstun-${{ matrix.name }}
+          path: ./artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+  # 双架构镜像：两个 runner 各自 native build（不靠 QEMU 模拟），各推 `<version>-<arch>`，
+  # 再由 `manifest` 作业合成 `<version>`。context = 仓库根。
+  image:
+    name: Image (${{ matrix.arch }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, os: ubuntu-24.04 }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write # 推 ghcr.io/<owner>/rstun（仍是 GITHUB_TOKEN）
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build container image
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_VERSION: ${{ needs.prepare.outputs.build_version }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "RSTUN_BUILD_VERSION=${BUILD_VERSION}" \
+            --tag "rstun:${VERSION}-${{ matrix.arch }}" \
+            .
+
+      - name: Self-check (--version in image)
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_VERSION: ${{ needs.prepare.outputs.build_version }}
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm "rstun:${VERSION}-${{ matrix.arch }}" --version)"
+          echo "$out"
+          printf '%s\n' "$out" | grep -qF "${BUILD_VERSION}" \
+            || { echo "::error::镜像内 --version 与 RSTUN_BUILD_VERSION 不一致（期望 ${BUILD_VERSION}）"; exit 1; }
+
+      - name: Push architecture tag
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/rstun:${VERSION}-${{ matrix.arch }}"
+          printf '%s' "${GH_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          docker tag "rstun:${VERSION}-${{ matrix.arch }}" "$image"
+          docker push "$image"
+          echo "pushed ${image}" >>"$GITHUB_STEP_SUMMARY"
+
+  # 合成 `<version>`：`docker manifest create` 把两个架构标签合成一个 manifest list。
+  # 稳定版（版本不含 `-`）额外产一份 `latest`。
+  manifest:
+    name: Manifest
+    needs: [prepare, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Create and push multi-arch manifest
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repo="ghcr.io/${owner}/rstun"
+          printf '%s' "${GH_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+          tag() {
+            local target="$1"
+            # `--amend` 让重复 dispatch 幂等（已存在的本地 manifest list 直接覆盖）
+            docker manifest create --amend "${repo}:${target}" \
+              "${repo}:${VERSION}-amd64" "${repo}:${VERSION}-arm64"
+            docker manifest annotate --os linux --arch amd64 "${repo}:${target}" "${repo}:${VERSION}-amd64"
+            docker manifest annotate --os linux --arch arm64 "${repo}:${target}" "${repo}:${VERSION}-arm64"
+            docker manifest push "${repo}:${target}"
+            docker manifest inspect "${repo}:${target}" >/dev/null
+            echo "pushed ${repo}:${target}" >>"$GITHUB_STEP_SUMMARY"
+          }
+
+          tag "${VERSION}"
+          if [ "${PRERELEASE}" = "false" ]; then
+            tag latest
+          fi
+
+  # Release：`rstun-v<version>` + `rstun-<platform>-<version>.zip`（四端二进制）。
+  # 幂等：已存在则只覆盖资产，不改标题/说明（避免把人工补充的 release notes 冲掉）。
+  release:
+    name: Publish Release
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # 建/更新 Release 并上传资产
+    steps:
+      # `gh release create` 需要 git 仓库来解析/创建 tag（无 checkout 会
+      # `fatal: not a git repository`）。二进制走 artifact 传递。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
+      - name: Download binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: release_assets
+          pattern: rstun-*
+
+      - name: Package assets
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p zipped_assets
+          shopt -s nullglob
+          count=0
+          for d in release_assets/rstun-*; do
+            [ -d "$d" ] || continue
+            name="$(basename "$d")"
+            name="${name#rstun-}"
+            ( cd "$d" && zip -r "../../zipped_assets/rstun-${name}-${VERSION}.zip" . )
+            count=$((count + 1))
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "::error::没有找到任何 rstun-<platform> 产物 —— 拒绝发一个缺二进制的 Release"
+            exit 1
+          fi
+          echo "打包 ${count} 个平台"
+          ls -l zipped_assets
+
+      - name: Render release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "独立 STUN 服务器 \`rstun\`（RFC 5389 Binding；RFC 5780 需 \`--alt-listen\`）。"
+            echo ""
+            echo "| 平台 | 资产 |"
+            echo "| --- | --- |"
+            echo "| Linux x86_64 / aarch64（musl） | \`rstun-linux-<arch>-${VERSION}.zip\` |"
+            echo "| macOS x86_64 | \`rstun-macos-x86_64-${VERSION}.zip\` |"
+            echo "| Windows x86_64 | \`rstun-windows-x86_64-${VERSION}.zip\` |"
+            echo ""
+            echo "容器镜像：\`ghcr.io/${owner}/rstun:${VERSION}\`（linux/amd64 + linux/arm64；"
+            echo "版本不含 \`-\` 时另有 \`latest\`）。"
+            echo ""
+            echo "跑起来：\`rstun server --listen 0.0.0.0:3478\`（UDP；加 \`--tcp\` 同时答 TCP）。"
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(zipped_assets/*.zip)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在 → 只覆盖资产（--clobber，幂等；不动标题与说明）"
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            echo "创建 Release $TAG"
+            gh release create "$TAG" "${assets[@]}" \
+              --title "rstun ${VERSION}" --notes-file release_notes.md
+          fi
+
+      - name: Summary
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          {
+            echo "### Release"
+            echo ""
+            echo "- Release: \`${TAG}\`"
+          } >>"$GITHUB_STEP_SUMMARY"

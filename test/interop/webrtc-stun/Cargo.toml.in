@@ -1,0 +1,18 @@
+# `webrtc-stun` 互操作夹具的临时 Cargo 清单。
+#
+# **故意不叫 `Cargo.toml`**：它只被 `script/lab/rstun-interop.sh` 复制到
+# `/tmp/opencode/rstun-interop/webrtc-stun/Cargo.toml` 后构建，避免在仓库里
+# 多出一个「位于 workspace 内、却不属于 workspace」的 manifest（会让
+# `cargo metadata` / `cargo build` 的 workspace 解析出现歧义），
+# 也避免把 `Cargo.lock` 与第三方 crate 的依赖树带进本仓。
+[package]
+name = "rstun-interop-webrtc-stun"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# 生态里 Rust 侧最常用的 STUN 编解码/客户端实现（webrtc-rs）。
+stun = "0.17"
