@@ -18,7 +18,10 @@
   "commit": null,
   "pr_url": null,
   "subtasks": [],
-  "children": [],
+  "children": [
+    "11-19-rstun-turn-udp",
+    "11-19-rstun-turn-tls"
+  ],
   "parent": "11-19-rstun-complete",
   "relatedFiles": [],
   "notes": "",

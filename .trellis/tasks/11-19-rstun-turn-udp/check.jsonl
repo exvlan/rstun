@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/11-19-rstun-auth/prd.md", "reason": "强制长期凭据复用鉴权实现（401/438/nonce）"}
+{"file": ".trellis/tasks/11-19-rstun-abuse-guard/prd.md", "reason": "配额与限速协同，防端口耗尽与爆破"}
