@@ -3,3 +3,6 @@ fuzz/target
 fuzz/corpus
 fuzz/artifacts
 fuzz/coverage
+# Python probe artifacts
+__pycache__/
+*.pyc
