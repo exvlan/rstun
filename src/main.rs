@@ -56,6 +56,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
+pub mod limit;
 pub mod protocol;
 pub mod rfc5780;
 /// T1 互操作证据：RFC 5769 向量 + `stun-types` 双向（只在测试构建里编译）。
@@ -165,6 +166,51 @@ struct Args {
     /// log every Binding request with its source and mapped address
     #[arg(long)]
     verbose: bool,
+
+    /// per-source-IP token bucket (req/s), UDP and TCP; bare flag = 200.
+    /// Sources named by --allow skip this bucket; off by default
+    #[arg(long, value_name = "REQ/S", num_args = 0..=1, default_missing_value = "200")]
+    rate_limit: Option<u32>,
+
+    /// burst size of the --rate-limit bucket; defaults to 2x its rate
+    #[arg(long, value_name = "N")]
+    rate_burst: Option<u32>,
+
+    /// per source IP+port token bucket (req/s); bare flag = 20
+    #[arg(long, value_name = "REQ/S", num_args = 0..=1, default_missing_value = "20")]
+    rate_limit_port: Option<u32>,
+
+    /// server-wide token bucket (req/s): the last line before the sockets
+    #[arg(long, value_name = "REQ/S")]
+    global_rate: Option<u32>,
+
+    /// cap on work held at once: one slot per UDP datagram (until answered) and
+    /// per TCP connection (until closed). Over the cap, datagrams are dropped
+    /// and connections refused
+    #[arg(long, value_name = "N")]
+    max_inflight: Option<u32>,
+
+    /// refuse RESPONSE-PORT / CHANGE-REQUEST requests shorter than BYTES
+    /// (default 20 = the STUN header; a 28-byte RFC 5780 probe must pass).
+    /// Raising it trades RFC 5780 compatibility for a stricter floor
+    #[arg(long, value_name = "BYTES")]
+    reflect_min_request: Option<usize>,
+
+    /// refuse RESPONSE-PORT / CHANGE-REQUEST requests whose answer would exceed
+    /// `max(request x RATIO, request + 32)` (default 2.0; the 32 bytes are the
+    /// fixed XOR + RFC 5780 address attributes, SOFTWARE is omitted for small
+    /// probes). Enables the guard
+    #[arg(long, value_name = "RATIO")]
+    reflect_ratio: Option<f64>,
+
+    /// CIDR whose sources bypass the per-source rate limits and the reflection
+    /// guard, repeatable
+    #[arg(long = "allow", value_name = "CIDR")]
+    allow: Vec<limit::IpNet>,
+
+    /// CIDR whose sources are refused outright, repeatable; wins ties with --allow
+    #[arg(long = "deny", value_name = "CIDR")]
+    deny: Vec<limit::IpNet>,
 }
 
 /// Counters reported when the server stops; also what `--verbose` helps debug.
@@ -240,6 +286,40 @@ struct ServerContext {
     udp: Vec<(SocketAddr, Arc<UdpSocket>)>,
     /// `--mapped-address`: also emit the pre-XOR `MAPPED-ADDRESS`.
     mapped_address: bool,
+    /// Abuse guard; `None` unless at least one `--rate-limit`-family flag was
+    /// given, so the default path allocates nothing and checks nothing.
+    admission: Option<Arc<limit::Admission>>,
+}
+
+impl ServerContext {
+    /// UDP: one datagram = one unit of work, so in-flight slot + rate checks
+    /// happen together.
+    ///
+    /// `None` = guard off (the caller keeps the plain path). `Some(Err)` = do
+    /// not process the datagram. `Some(Ok(permit))` = the caller must keep the
+    /// permit alive until the answer has been sent (that is what the in-flight
+    /// cap counts).
+    fn admit(&self, peer: SocketAddr) -> Option<Result<limit::Permit, limit::Refusal>> {
+        self.admission
+            .as_ref()
+            .map(|admission| admission.admit(peer, std::time::Instant::now()))
+    }
+
+    /// TCP `accept`: take an in-flight slot for the connection's lifetime.
+    /// One idle connection holds no request, but it does hold an fd and a task.
+    fn acquire_inflight(&self) -> Option<Result<limit::Permit, limit::Refusal>> {
+        self.admission
+            .as_ref()
+            .map(|admission| admission.acquire_inflight())
+    }
+
+    /// TCP per request: the rate buckets only (the slot is already held by the
+    /// connection, and re-counting it would halve `--max-inflight`).
+    fn check_rates(&self, peer: SocketAddr) -> Option<Result<(), limit::Refusal>> {
+        self.admission
+            .as_ref()
+            .map(|admission| admission.check_rates(peer, std::time::Instant::now()))
+    }
 }
 
 impl ServerContext {
@@ -413,6 +493,54 @@ fn bind(
     Ok(bound)
 }
 
+/// Turn the abuse-guard flags into a policy, or explain why they are unusable.
+///
+/// `Ok(None)` means "no flag given": the caller then never builds an
+/// [`limit::Admission`], so nothing is allocated and no task is spawned.
+/// Values that parse but cannot work (`0` tokens, a burst below one, a
+/// `--reflect-min-request` under the 20-byte header) are startup errors — a
+/// silent no-op guard is worse than a refused start.
+fn build_policy(args: &Args) -> Result<Option<limit::Policy>, String> {
+    if args.rate_limit.is_none() && args.rate_burst.is_some() {
+        return Err("--rate-burst needs --rate-limit".to_string());
+    }
+    let per_ip = args.rate_limit.map(|rate| {
+        // The design's default is 200 req/s with a burst of 400: a household
+        // NAT with tens of devices (ICE connectivity checks) must not trip it.
+        limit::Rate::new(
+            f64::from(rate),
+            f64::from(args.rate_burst.unwrap_or_else(|| rate.saturating_mul(2))),
+        )
+    });
+    let per_port = args
+        .rate_limit_port
+        .map(|rate| limit::Rate::new(f64::from(rate), f64::from(rate.saturating_mul(2))));
+    let global = args
+        .global_rate
+        .map(|rate| limit::Rate::new(f64::from(rate), f64::from(rate.saturating_mul(2))));
+    let reflect = match (args.reflect_min_request, args.reflect_ratio) {
+        (None, None) => None,
+        (min_request, ratio) => Some(limit::Reflect {
+            min_request: min_request.unwrap_or(limit::DEFAULT_REFLECT_MIN_REQUEST),
+            ratio: ratio.unwrap_or(limit::DEFAULT_REFLECT_RATIO),
+        }),
+    };
+    let policy = limit::Policy {
+        per_ip,
+        per_port,
+        global,
+        max_inflight: args.max_inflight.map(|slots| slots as usize),
+        reflect,
+        allow: args.allow.clone(),
+        deny: args.deny.clone(),
+    };
+    if policy.is_off() {
+        return Ok(None);
+    }
+    policy.validate()?;
+    Ok(Some(policy))
+}
+
 /// Run the STUN Binding server until Ctrl-C (Unix: also SIGTERM).
 async fn run(args: Args) -> ExitCode {
     let (addresses, plan) = match resolve_listen(&args) {
@@ -420,6 +548,18 @@ async fn run(args: Args) -> ExitCode {
         Err(message) => {
             // 配置错误必须让人看见：不要静默降级成「单 IP、无 RFC 5780」的服务器。
             tracing::error!(%message, "rstun: invalid command line");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 抗滥用：仅当给了开关才建表/建信号量；`None` 时下面所有路径与 26.410.100 一致。
+    let admission = match build_policy(&args).and_then(|policy| match policy {
+        None => Ok(None),
+        Some(policy) => limit::Admission::new(policy).map(Some),
+    }) {
+        Ok(admission) => admission,
+        Err(message) => {
+            tracing::error!(%message, "rstun: invalid abuse-guard configuration");
             return ExitCode::FAILURE;
         }
     };
@@ -440,6 +580,7 @@ async fn run(args: Args) -> ExitCode {
         plan,
         udp: udp.clone(),
         mapped_address: args.mapped_address,
+        admission: admission.clone(),
     });
     let mut tasks = Vec::new();
 
@@ -454,6 +595,25 @@ async fn run(args: Args) -> ExitCode {
             format!("tcp {local}"),
             serve_tcp(listener, context.clone(), software.clone(), stats.clone()),
         ));
+    }
+    // Only a per-key table needs sweeping; a guard that is only a Semaphore or
+    // a CIDR list must not start a task it never uses.
+    if let Some(sweeper) = admission.as_ref().and_then(limit::start_sweeper) {
+        tasks.push(sweeper);
+    }
+
+    if let Some(admission) = &admission {
+        let policy = admission.policy();
+        tracing::info!(
+            per_ip = ?policy.per_ip,
+            per_port = ?policy.per_port,
+            global = ?policy.global,
+            max_inflight = ?policy.max_inflight,
+            reflect = ?policy.reflect,
+            allow = policy.allow.len(),
+            deny = policy.deny.len(),
+            "rstun: abuse guard enabled"
+        );
     }
 
     if let Some(plan) = plan {
@@ -484,6 +644,20 @@ async fn run(args: Args) -> ExitCode {
     for task in tasks {
         task.abort();
     }
+    // 被拒的请求数与协议统计分开报：前者只有开了抗滥用才非零。
+    if let Some(admission) = &admission {
+        let counts = admission.counters();
+        tracing::info!(
+            rate_limited_ip = counts.rate_limited_ip,
+            rate_limited_port = counts.rate_limited_port,
+            rate_limited_global = counts.rate_limited_global,
+            inflight_dropped = counts.inflight_dropped,
+            denied = counts.denied,
+            reflect_rejected = counts.reflect_rejected,
+            allowlisted = counts.allowlisted,
+            "rstun: abuse guard counters"
+        );
+    }
     let (received, answered, dropped) = stats.counters();
     tracing::info!(received, answered, dropped, "rstun: stopped");
     exit_code
@@ -500,6 +674,71 @@ where
             tracing::error!(listener = %name, %error, "rstun: listener stopped");
         }
     })
+}
+
+/// Requests below this size get an answer without the optional `SOFTWARE`
+/// attribute when they carry a redirect attribute (see [`answer_software`]).
+const SMALL_REDIRECT_REQUEST: usize = 40;
+
+/// Is this message one the reflection guard has jurisdiction over?
+///
+/// The guard only applies to **UDP** (a TCP answer can only reach the peer that
+/// opened the connection) and only to a redirect this server can actually
+/// honour: `RESPONSE-PORT` always can, `CHANGE-REQUEST` only when
+/// `--alt-listen` gave us a second address.
+///
+/// [`answer_software`] uses the same predicate on purpose: the SOFTWARE rule
+/// must not be wider than the guard, otherwise a TCP probe or a
+/// `CHANGE-REQUEST` without a plan would lose its `SOFTWARE` for no reason.
+fn redirect_is_guarded(
+    transport: Transport,
+    message: &protocol::Message<'_>,
+    context: &ServerContext,
+) -> bool {
+    if transport != Transport::Udp {
+        return false;
+    }
+    protocol::response_port(message.body).is_some()
+        || (context.plan.is_some()
+            && protocol::change_request(message.body)
+                .filter(protocol::ChangeRequest::any)
+                .is_some())
+}
+
+/// The `SOFTWARE` value to put into a Binding success answer.
+///
+/// `SOFTWARE` is optional (RFC 5389 §15.5.1) and costs 20 bytes on the wire.
+/// With the abuse guard on, a *small* probe **inside the guard's domain** (see
+/// [`redirect_is_guarded`]) gets an answer without it: the fixed part is then
+/// just `XOR-MAPPED-ADDRESS` (12) and, with `--alt-listen`, the RFC 5780 pair
+/// (24) — the 32 bytes [`limit::REFLECT_ALLOWANCE`] pays for. A 28-byte probe
+/// therefore gets 32 bytes instead of 52 (1.14x instead of 1.86x) and 56
+/// instead of 76 with `--alt-listen` (2.00x instead of 2.71x): the answer is at
+/// its irreducible size, which is what lets the ratio rule reject real growth.
+///
+/// Everything else keeps the full `SOFTWARE`: plain Binding (byte-frozen), any
+/// request of [`SMALL_REDIRECT_REQUEST`] bytes or more, a TCP probe, and a
+/// `CHANGE-REQUEST` that cannot redirect because there is no plan. With the
+/// guard off the full value is always used, so the default path stays
+/// byte-for-byte the pre-guard one.
+fn answer_software<'a>(
+    request_len: usize,
+    message: &protocol::Message<'_>,
+    transport: Transport,
+    context: &ServerContext,
+    software: &'a str,
+) -> &'a str {
+    let guard_on = context
+        .admission
+        .as_ref()
+        .is_some_and(|admission| admission.policy().reflect.is_some());
+    if !guard_on
+        || request_len >= SMALL_REDIRECT_REQUEST
+        || !redirect_is_guarded(transport, message, context)
+    {
+        return software;
+    }
+    ""
 }
 
 /// Resolve one message into a response, or explain why it is ignored.
@@ -586,13 +825,54 @@ fn decide(
     // unusual: over TCP the reply can only travel back on the connection it
     // arrived on, so both `RESPONSE-PORT` and `CHANGE-REQUEST` are ignored there
     // (RFC 5780 §5 is defined for UDP).
-    //
-    // The two attributes are orthogonal and may both apply:
-    // * §7.2 `CHANGE-REQUEST` picks the *source* socket;
-    // * §7.5 `RESPONSE-PORT` picks the *destination* port, keeping both the
-    //   source IP and the source port ("the Binding Response MUST be transmitted
-    //   to the source IP address of the Binding Request and the port contained in
-    //   RESPONSE-PORT").
+    let (from, to, addresses) = response_route(&message, peer, local, transport, context);
+
+    tracing::debug!(
+        source = %peer,
+        mapped = %peer,
+        %local,
+        transaction_id = %message.transaction_id,
+        response_origin = ?addresses.map(|addresses| addresses.origin),
+        padding = ?padding,
+        %from,
+        %to,
+        "rstun: binding request"
+    );
+
+    let bytes = protocol::binding_success_response(&protocol::SuccessResponse {
+        transaction_id: &message.transaction_id,
+        peer,
+        software: answer_software(datagram.len(), &message, transport, context, software),
+        addresses,
+        mapped_address: context.mapped_address,
+        padding,
+    });
+    if from == local && to == peer {
+        Ok(Decision::Respond(bytes))
+    } else {
+        Ok(Decision::RespondFrom { from, to, bytes })
+    }
+}
+
+/// Where an answer goes and which socket sends it.
+///
+/// Split out of [`decide`] because the reflection guard has to *estimate* the
+/// very same answer before `decide` builds it: one implementation of the RFC
+/// 5780 routing rules, two callers.
+///
+/// The two attributes are orthogonal and may both apply:
+/// * §7.2 `CHANGE-REQUEST` picks the *source* socket;
+/// * §7.5 `RESPONSE-PORT` picks the *destination* port, keeping both the
+///   source IP and the source port ("the Binding Response MUST be transmitted
+///   to the source IP address of the Binding Request and the port contained in
+///   RESPONSE-PORT").
+fn response_route(
+    message: &protocol::Message<'_>,
+    peer: SocketAddr,
+    local: SocketAddr,
+    transport: Transport,
+    context: &ServerContext,
+) -> (SocketAddr, SocketAddr, Option<protocol::ResponseAddresses>) {
     let (from, to) = match transport {
         Transport::Tcp => (local, peer),
         Transport::Udp => {
@@ -610,7 +890,7 @@ fn decide(
                         .map(|request| plan.changed(local, request))
                 })
                 .unwrap_or(local);
-            let to = match response_port {
+            let to = match protocol::response_port(message.body) {
                 // Any 16-bit port is a legal destination; whether anything
                 // listens there is the client's problem (`0` included — the
                 // kernel refuses the send, we log it and keep serving).
@@ -620,37 +900,191 @@ fn decide(
             (from, to)
         }
     };
+    (from, to, context.addresses(from))
+}
 
-    let addresses = context.addresses(from);
+/// [`decide`], with the abuse guard's reflection check in front of it.
+///
+/// The check is only enabled by `--reflect-min-request` / `--reflect-ratio`, so
+/// with the guard off this is `decide` plus one `Option` test.
+fn decide_guarded(
+    datagram: &[u8],
+    peer: SocketAddr,
+    local: SocketAddr,
+    transport: Transport,
+    context: &ServerContext,
+    software: &str,
+    stats: &ServerStats,
+) -> Result<Decision, protocol::ParseError> {
+    if let Some(admission) = &context.admission
+        && let Some(policy) = admission.policy().reflect
+    {
+        // Parsed here as well as in `decide` **only** when the guard is on: the
+        // guard needs the attribute list, and `decide` stays byte-for-byte the
+        // function it was.
+        let message = protocol::parse(datagram)?;
+        let inbound = Inbound {
+            datagram,
+            peer,
+            local,
+            transport,
+            context,
+            software,
+        };
+        if let Some(decision) = reflect_guard(&inbound, &message, admission, policy, stats) {
+            return Ok(decision);
+        }
+    }
+    decide(datagram, peer, local, transport, context, software)
+}
 
-    tracing::debug!(
-        source = %peer,
-        mapped = %peer,
-        %local,
-        transaction_id = %message.transaction_id,
-        response_origin = ?addresses.map(|addresses| addresses.origin),
-        padding = ?padding,
-        %from,
-        %to,
-        "rstun: binding request"
+/// The request path's fixed context, bundled so the guard stays readable.
+struct Inbound<'a> {
+    datagram: &'a [u8],
+    peer: SocketAddr,
+    local: SocketAddr,
+    transport: Transport,
+    context: &'a ServerContext,
+    software: &'a str,
+}
+
+/// Anti-reflection: refuse the attributes that let one small datagram make us
+/// send a large answer somewhere else (design §2/§4).
+///
+/// Only `RESPONSE-PORT` (moves the answer to an arbitrary **destination** port —
+/// the classic spoofed-source reflector) and `CHANGE-REQUEST` (moves the
+/// **source**) are gated; plain Binding is untouched, otherwise every probe
+/// would need to be as large as its answer.
+///
+/// The comparison uses the real encoder, not a guess: the same
+/// [`protocol::SuccessResponse`] `decide` will build is serialised and measured.
+fn reflect_guard(
+    inbound: &Inbound<'_>,
+    message: &protocol::Message<'_>,
+    admission: &limit::Admission,
+    policy: limit::Reflect,
+    stats: &ServerStats,
+) -> Option<Decision> {
+    // A TCP answer can only travel back on the connection the request came in
+    // on, so it cannot reflect onto a third party: the guard is UDP-only.
+    if inbound.transport != Transport::Udp {
+        return None;
+    }
+    // `--allow` is the operator saying "these sources are mine": an allowlisted
+    // source is exempt from the amplification rules (NAT'd probe networks, the
+    // monitoring host, …). Rate limits still apply unless `--allow` skipped
+    // them too, and the global/in-flight caps are never bypassed.
+    if admission.is_allowlisted(inbound.peer.ip()) {
+        return None;
+    }
+    // Everything else is either answered with a small 400/420 or ignored by
+    // `decide`; there is no large answer to prevent.
+    if protocol::message_class(message.msg_type) != MessageClass::Request
+        || protocol::message_method(message.msg_type) != BINDING_METHOD
+        || !protocol::unknown_attributes(message.body).is_empty()
+    {
+        return None;
+    }
+    let padding = protocol::padding_len(message.body);
+    let response_port = protocol::response_port(message.body);
+    // RESPONSE-PORT + PADDING is a 400 (RFC 5780 §6) — a *refusal*, so it goes
+    // through the same "a refusal must not amplify" rule as everything else on
+    // this path (and is counted in `reflect_rejected`). Without the guard,
+    // `decide` still answers the 400 itself.
+    if padding.is_some() && response_port.is_some() {
+        return Some(reflection_refusal(
+            inbound, message, policy, admission, stats,
+        ));
+    }
+    // The guard's domain: UDP, and a redirect we can actually honour
+    // (`RESPONSE-PORT` always, `CHANGE-REQUEST` only with a plan). A
+    // `CHANGE-REQUEST` without a plan moves nothing, so it is not a reflection
+    // vector and must not be gated — 28-byte RFC 5780 probes would otherwise be
+    // refused for no reason. `answer_software` shares this predicate.
+    if !redirect_is_guarded(inbound.transport, message, inbound.context) {
+        return None;
+    }
+
+    if inbound.datagram.len() < policy.min_request {
+        return Some(reflection_refusal(
+            inbound, message, policy, admission, stats,
+        ));
+    }
+
+    let context = inbound.context;
+    let (_from, _to, addresses) = response_route(
+        message,
+        inbound.peer,
+        inbound.local,
+        inbound.transport,
+        context,
     );
-
-    let bytes = protocol::binding_success_response(&protocol::SuccessResponse {
+    // Estimate with the very software value `decide` will emit, otherwise the
+    // ratio would be measured on a different message than the one we send.
+    let estimated = protocol::binding_success_response(&protocol::SuccessResponse {
         transaction_id: &message.transaction_id,
-        peer,
-        software,
+        peer: inbound.peer,
+        software: answer_software(
+            inbound.datagram.len(),
+            message,
+            inbound.transport,
+            context,
+            inbound.software,
+        ),
         addresses,
         mapped_address: context.mapped_address,
         padding,
-    });
-    if from == local && to == peer {
-        Ok(Decision::Respond(bytes))
+    })
+    .len();
+    if !policy.allows_response(inbound.datagram.len(), estimated) {
+        return Some(reflection_refusal(
+            inbound, message, policy, admission, stats,
+        ));
+    }
+    None
+}
+
+/// Answer a refused reflection probe — without becoming a reflector ourselves.
+///
+/// A `400 Bad Request` is **40 bytes** (20-byte header + 20-byte `ERROR-CODE`
+/// with the "Bad Request" reason). The refusal is only sent while it fits the
+/// *strict* ratio — deliberately without the [`limit::REFLECT_ALLOWANCE`] the
+/// success path gets, because that allowance pays for attributes (XOR / SOFTWARE
+/// / RFC 5780 pair) a 400 does not carry. If the 400 would be bigger than the
+/// request allows, the datagram is dropped silently. Either way it is counted:
+/// `reflect_rejected` plus the ordinary `dropped`, like every other refusal.
+fn reflection_refusal(
+    inbound: &Inbound<'_>,
+    message: &protocol::Message<'_>,
+    policy: limit::Reflect,
+    admission: &limit::Admission,
+    stats: &ServerStats,
+) -> Decision {
+    admission.count_reflect_rejected();
+    stats.count_dropped();
+    let bad_request = protocol::error_response(
+        &message.transaction_id,
+        BINDING_METHOD,
+        protocol::ERROR_BAD_REQUEST,
+        "Bad Request",
+    );
+    if bad_request.len() as f64 <= inbound.datagram.len() as f64 * policy.ratio {
+        Decision::Respond(bad_request)
     } else {
-        Ok(Decision::RespondFrom { from, to, bytes })
+        Decision::Ignore("reflection guard: too small to answer without amplifying")
     }
 }
 
 /// Serve one UDP socket until the task is aborted.
+///
+/// Two shapes, chosen once at startup:
+///
+/// * **serial** (no `--max-inflight`): one datagram at a time in this task —
+///   the default path, unchanged, no extra tasks;
+/// * **concurrent** (`--max-inflight` set): each datagram gets its own task so
+///   the in-flight cap can actually be reached. In the serial loop one listener
+///   holds at most one permit, so a cap above 1 could never trigger and
+///   `--max-inflight 1` would silently do nothing.
 async fn serve_udp(
     socket: Arc<UdpSocket>,
     context: Arc<ServerContext>,
@@ -659,6 +1093,10 @@ async fn serve_udp(
 ) -> std::io::Result<()> {
     let local = socket.local_addr()?;
     tracing::info!(%local, "rstun: UDP listener ready");
+    let concurrent = context
+        .admission
+        .as_ref()
+        .is_some_and(|admission| admission.policy().max_inflight.is_some());
     let mut buffer = vec![0_u8; UDP_RECV_BUFFER];
     loop {
         let (len, peer) = match socket.recv_from(&mut buffer).await {
@@ -671,54 +1109,113 @@ async fn serve_udp(
             }
         };
         stats.count_received();
-        let decision = decide(
-            &buffer[..len],
-            peer,
-            local,
-            Transport::Udp,
-            &context,
-            &software,
-        );
-        match decision {
-            Ok(Decision::Respond(response)) => match socket.send_to(&response, peer).await {
-                Ok(_) => stats.count_answered(),
-                Err(error) => {
-                    tracing::warn!(%local, %peer, %error, "rstun: UDP send_to failed")
-                }
-            },
-            Ok(Decision::RespondFrom { from, to, bytes }) => {
-                // `from` is the *source* address (CHANGE-REQUEST picks another
-                // socket we hold); `to` is the *destination* (RESPONSE-PORT moves
-                // only the port — the IP stays the one the request came from).
-                let target = context.socket_for(from);
-                let Some(target) = target else {
-                    stats.count_dropped();
-                    tracing::error!(
-                        %local,
-                        %peer,
-                        %from,
-                        "rstun: no socket bound for the requested response address"
-                    );
-                    continue;
-                };
-                match target.send_to(&bytes, to).await {
-                    Ok(_) => stats.count_answered(),
-                    Err(error) => tracing::warn!(
-                        %local,
-                        %from,
-                        %to,
-                        %error,
-                        "rstun: UDP send_to failed (RFC 5780)"
-                    ),
-                }
-            }
-            Ok(Decision::Ignore(reason)) => {
-                tracing::debug!(%local, %peer, reason, "rstun: ignored message")
-            }
-            Err(error) => {
+        // 抗滥用准入：在解析/判定之前只做「能不能处理」的判定，不改协议语义。
+        // permit 必须活到响应发出之后 —— 在途上限统计的就是「正在处理的请求」。
+        let permit = match context.admit(peer) {
+            None => None,
+            Some(Ok(permit)) => Some(permit),
+            Some(Err(refusal)) => {
                 stats.count_dropped();
-                tracing::debug!(%local, %peer, %error, "rstun: dropped malformed datagram")
+                tracing::debug!(
+                    %local,
+                    %peer,
+                    reason = refusal.reason(),
+                    counter = refusal.counter(),
+                    "rstun: UDP datagram refused by abuse guard"
+                );
+                continue;
             }
+        };
+        if concurrent {
+            let socket = socket.clone();
+            let context = context.clone();
+            let software = software.clone();
+            let stats = stats.clone();
+            let datagram = buffer[..len].to_vec();
+            tokio::spawn(async move {
+                respond_to_datagram(&socket, &context, &software, &stats, local, peer, &datagram)
+                    .await;
+                // Releasing the permit last is what the cap counts.
+                drop(permit);
+            });
+        } else {
+            respond_to_datagram(
+                &socket,
+                &context,
+                &software,
+                &stats,
+                local,
+                peer,
+                &buffer[..len],
+            )
+            .await;
+            drop(permit);
+        }
+    }
+}
+
+/// Resolve one datagram into a response and send it.
+///
+/// Split from [`serve_udp`] so the serial and the `--max-inflight` (spawned)
+/// shapes share one implementation — and so the permit the caller holds really
+/// outlives the send.
+async fn respond_to_datagram(
+    socket: &UdpSocket,
+    context: &ServerContext,
+    software: &str,
+    stats: &ServerStats,
+    local: SocketAddr,
+    peer: SocketAddr,
+    datagram: &[u8],
+) {
+    let decision = decide_guarded(
+        datagram,
+        peer,
+        local,
+        Transport::Udp,
+        context,
+        software,
+        stats,
+    );
+    match decision {
+        Ok(Decision::Respond(response)) => match socket.send_to(&response, peer).await {
+            Ok(_) => stats.count_answered(),
+            Err(error) => {
+                tracing::warn!(%local, %peer, %error, "rstun: UDP send_to failed")
+            }
+        },
+        Ok(Decision::RespondFrom { from, to, bytes }) => {
+            // `from` is the *source* address (CHANGE-REQUEST picks another
+            // socket we hold); `to` is the *destination* (RESPONSE-PORT moves
+            // only the port — the IP stays the one the request came from).
+            let target = context.socket_for(from);
+            let Some(target) = target else {
+                stats.count_dropped();
+                tracing::error!(
+                    %local,
+                    %peer,
+                    %from,
+                    "rstun: no socket bound for the requested response address"
+                );
+                return;
+            };
+            match target.send_to(&bytes, to).await {
+                Ok(_) => stats.count_answered(),
+                Err(error) => tracing::warn!(
+                    %local,
+                    %from,
+                    %to,
+                    %error,
+                    "rstun: UDP send_to failed (RFC 5780)"
+                ),
+            }
+        }
+        Ok(Decision::Ignore(reason)) => {
+            tracing::debug!(%local, %peer, reason, "rstun: ignored message")
+        }
+        Err(error) => {
+            stats.count_dropped();
+            tracing::debug!(%local, %peer, %error, "rstun: dropped malformed datagram")
         }
     }
 }
@@ -741,11 +1238,30 @@ async fn serve_tcp(
                 continue;
             }
         };
+        // 抗滥用（连接级）：在途上限按**连接**计数 —— 空闲连接也占 fd 与一个任务，
+        // 只按请求计数挡不住「握手后不说话」的洪水。请求级限速见下方。
+        let permit = match context.acquire_inflight() {
+            None => None,
+            Some(Ok(permit)) => Some(permit),
+            Some(Err(refusal)) => {
+                stats.count_dropped();
+                tracing::debug!(
+                    %local,
+                    %peer,
+                    reason = refusal.reason(),
+                    counter = refusal.counter(),
+                    "rstun: TCP connection refused by abuse guard"
+                );
+                drop(stream);
+                continue;
+            }
+        };
         let software = software.clone();
         let stats = stats.clone();
         let context = context.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_tcp_connection(stream, peer, context, &software, &stats).await
+            if let Err(error) =
+                serve_tcp_connection(stream, peer, context, &software, &stats, permit).await
             {
                 tracing::debug!(%local, %peer, %error, "rstun: TCP connection closed")
             }
@@ -760,6 +1276,8 @@ async fn serve_tcp_connection(
     context: Arc<ServerContext>,
     software: &str,
     stats: &ServerStats,
+    // Held for the whole connection: releasing it is what frees the slot.
+    _inflight: Option<limit::Permit>,
 ) -> std::io::Result<()> {
     let local = stream.local_addr()?;
     loop {
@@ -787,7 +1305,29 @@ async fn serve_tcp_connection(
             return Ok(());
         }
 
-        match decide(&frame, peer, local, Transport::Tcp, &context, software) {
+        // 抗滥用准入（请求级）：TCP 没有「丢一个 datagram」这回事，超限就直接关连接
+        // —— 与「不放大 / 不回 486」的设计一致（design §3）。在途槽位由连接持有，
+        // 这里只查名单与速率桶。
+        if let Some(Err(refusal)) = context.check_rates(peer) {
+            stats.count_dropped();
+            tracing::debug!(
+                %peer,
+                reason = refusal.reason(),
+                counter = refusal.counter(),
+                "rstun: TCP request refused by abuse guard, closing connection"
+            );
+            return Ok(());
+        }
+
+        match decide_guarded(
+            &frame,
+            peer,
+            local,
+            Transport::Tcp,
+            &context,
+            software,
+            stats,
+        ) {
             Ok(Decision::Respond(response)) => {
                 stream.write_all(&response).await?;
                 stats.count_answered();
@@ -983,6 +1523,7 @@ mod tests {
             plan: None,
             udp: vec![(address, socket.clone())],
             mapped_address: false,
+            admission: None,
         });
         tokio::spawn(serve_udp(
             socket.clone(),
@@ -999,6 +1540,7 @@ mod tests {
     /// same IP so the changed socket is one we actually hold.
     fn rfc5780_context() -> ServerContext {
         ServerContext {
+            admission: None,
             plan: Some(rfc5780::Plan::new(
                 "127.0.0.1:3478".parse().unwrap(),
                 "127.0.0.2".parse().unwrap(),
@@ -1066,6 +1608,7 @@ mod tests {
                 plan: Some(plan),
                 udp: sockets.clone(),
                 mapped_address: false,
+                admission: None,
             });
             let stats = Arc::new(ServerStats::default());
             for (local, socket) in sockets {
@@ -1182,6 +1725,7 @@ mod tests {
             plan: None,
             udp: Vec::new(),
             mapped_address: false,
+            admission: None,
         });
         tokio::spawn(serve_tcp(
             listener,
@@ -1482,6 +2026,7 @@ mod tests {
             plan: Some(plan),
             udp: bound.udp.clone(),
             mapped_address: false,
+            admission: None,
         });
         let stats = Arc::new(ServerStats::default());
         for (_, socket) in bound.udp {
@@ -2089,6 +2634,7 @@ mod tests {
                 plan: None,
                 udp: Vec::new(),
                 mapped_address,
+                admission: None,
             };
             match decide(
                 &request,
@@ -2310,6 +2856,953 @@ mod tests {
             }
             other => panic!("expected a response to port 3479, got {other:?}"),
         }
+    }
+
+    // ---------- 抗滥用（限速 / 在途 / 反射防护 / 名单） ----------
+
+    /// A context whose only configuration is the abuse guard under test.
+    fn guarded_context(policy: limit::Policy) -> ServerContext {
+        ServerContext {
+            admission: Some(limit::Admission::new(policy).expect("policy must build")),
+            ..ServerContext::default()
+        }
+    }
+
+    fn admission_of(context: &ServerContext) -> &Arc<limit::Admission> {
+        context
+            .admission
+            .as_ref()
+            .expect("guard must be configured")
+    }
+
+    /// A 40-byte `Binding Request` carrying `RESPONSE-PORT` (8 bytes) plus two
+    /// inert attributes: the probe used by the "raised `--reflect-min-request`"
+    /// tests (`20` is the default, so 28 bytes already clears it).
+    fn forty_byte_response_port_request(transaction_id: [u8; 12], port: u16) -> Vec<u8> {
+        let request = request_with_attributes(
+            transaction_id,
+            &[
+                (protocol::ATTR_RESPONSE_PORT, &port.to_be_bytes()),
+                (protocol::ATTR_PRIORITY, &[0_u8; 4]),
+                (protocol::ATTR_SOFTWARE, b""),
+            ],
+        );
+        assert_eq!(request.len(), 40, "helper must produce a 40-byte request");
+        request
+    }
+
+    /// The smallest datagram that can carry a redirect attribute: 20-byte header
+    /// + one 8-byte `RESPONSE-PORT` (4-byte TLV header, 2-byte value, 2-byte pad).
+    fn minimal_response_port_request(transaction_id: [u8; 12], port: u16) -> Vec<u8> {
+        let request = request_with_attribute(
+            transaction_id,
+            protocol::ATTR_RESPONSE_PORT,
+            &port.to_be_bytes(),
+        );
+        assert_eq!(
+            request.len(),
+            28,
+            "28 bytes is the smallest RESPONSE-PORT probe"
+        );
+        request
+    }
+
+    #[test]
+    fn abuse_guard_is_off_until_a_flag_is_given() {
+        assert!(build_policy(&Args::default()).unwrap().is_none());
+        // `--allow`/`--deny` alone are a guard too (they change admission).
+        let deny_only = build_policy(&Args {
+            deny: vec!["127.0.0.1/32".parse().unwrap()],
+            ..Args::default()
+        })
+        .unwrap()
+        .expect("a deny list is a guard");
+        assert!(deny_only.deny.len() == 1);
+        assert!(deny_only.per_ip.is_none());
+    }
+
+    #[test]
+    fn bare_rate_limit_flags_use_the_documented_defaults() {
+        let cli = Cli::try_parse_from(["rstun", "server", "--rate-limit", "--rate-limit-port"])
+            .expect("the value of these flags is optional");
+        let Command::Server(args) = cli.command;
+        let policy = build_policy(&args).unwrap().expect("guard enabled");
+        // Design §4: 200 req/s with a burst of 400 per source IP, 20 req/s per
+        // source port.
+        assert_eq!(policy.per_ip, Some(limit::Rate::new(200.0, 400.0)));
+        assert_eq!(policy.per_port, Some(limit::Rate::new(20.0, 40.0)));
+    }
+
+    #[test]
+    fn one_reflect_flag_enables_the_guard_with_the_documented_defaults() {
+        // Either numeric flag turns the guard on; the other value comes from the
+        // documented default (min = the 20-byte header, ratio 2.0).
+        for args in [
+            Args {
+                reflect_min_request: Some(20),
+                ..Args::default()
+            },
+            Args {
+                reflect_ratio: Some(2.0),
+                ..Args::default()
+            },
+        ] {
+            let policy = build_policy(&args).unwrap().expect("guard enabled");
+            assert_eq!(
+                policy.reflect,
+                Some(limit::Reflect {
+                    min_request: limit::DEFAULT_REFLECT_MIN_REQUEST,
+                    ratio: limit::DEFAULT_REFLECT_RATIO,
+                }),
+                "{args:?}"
+            );
+        }
+        assert_eq!(limit::DEFAULT_REFLECT_MIN_REQUEST, 20);
+        assert_eq!(limit::DEFAULT_REFLECT_RATIO, 2.0);
+    }
+
+    #[test]
+    fn explicit_rate_limit_values_win() {
+        let cli = Cli::try_parse_from([
+            "rstun",
+            "server",
+            "--rate-limit",
+            "50",
+            "--rate-burst",
+            "7",
+            "--global-rate",
+            "1000",
+            "--max-inflight",
+            "8",
+        ])
+        .unwrap();
+        let Command::Server(args) = cli.command;
+        let policy = build_policy(&args).unwrap().expect("guard enabled");
+        assert_eq!(policy.per_ip, Some(limit::Rate::new(50.0, 7.0)));
+        assert_eq!(policy.global, Some(limit::Rate::new(1000.0, 2000.0)));
+        assert_eq!(policy.max_inflight, Some(8));
+    }
+
+    #[test]
+    fn unusable_abuse_guard_values_fail_startup() {
+        // clap rejects what it cannot parse (negative numbers, bad CIDRs)...
+        assert!(Cli::try_parse_from(["rstun", "server", "--rate-limit", "-1"]).is_err());
+        assert!(Cli::try_parse_from(["rstun", "server", "--deny", "10.0.0.0/33"]).is_err());
+        assert!(Cli::try_parse_from(["rstun", "server", "--allow", "not-a-cidr"]).is_err());
+        // ...and `build_policy` rejects values that parse but cannot work.
+        for args in [
+            Args {
+                rate_limit: Some(0),
+                ..Args::default()
+            },
+            Args {
+                rate_burst: Some(10),
+                ..Args::default()
+            },
+            Args {
+                rate_limit: Some(10),
+                rate_burst: Some(0),
+                ..Args::default()
+            },
+            Args {
+                rate_limit_port: Some(0),
+                ..Args::default()
+            },
+            Args {
+                global_rate: Some(0),
+                ..Args::default()
+            },
+            Args {
+                max_inflight: Some(0),
+                ..Args::default()
+            },
+            Args {
+                reflect_min_request: Some(19),
+                ..Args::default()
+            },
+            Args {
+                reflect_ratio: Some(0.0),
+                ..Args::default()
+            },
+            Args {
+                reflect_ratio: Some(-1.0),
+                ..Args::default()
+            },
+        ] {
+            assert!(build_policy(&args).is_err(), "{args:?} should be refused");
+        }
+    }
+
+    /// A policy with only the reflection guard configured.
+    fn reflect_policy(min_request: usize, ratio: f64) -> limit::Policy {
+        limit::Policy {
+            reflect: Some(limit::Reflect { min_request, ratio }),
+            ..limit::Policy::default()
+        }
+    }
+
+    /// `decide_guarded` with a throwaway stats object: these tests assert the
+    /// *decision*, and the counters through the context's admission.
+    fn guarded(
+        datagram: &[u8],
+        peer: &str,
+        local: &str,
+        transport: Transport,
+        context: &ServerContext,
+    ) -> Decision {
+        decide_guarded(
+            datagram,
+            peer.parse().unwrap(),
+            local.parse().unwrap(),
+            transport,
+            context,
+            TEST_SOFTWARE,
+            &ServerStats::default(),
+        )
+        .unwrap()
+    }
+
+    /// `--alt-listen` shape: a plan exists, so answers carry the RFC 5780 pair.
+    fn alt_listen_context(policy: limit::Policy) -> ServerContext {
+        ServerContext {
+            plan: Some(rfc5780::Plan::new(
+                "127.0.0.1:3478".parse().unwrap(),
+                "127.0.0.2".parse().unwrap(),
+                3479,
+            )),
+            udp: Vec::new(),
+            mapped_address: false,
+            admission: Some(limit::Admission::new(policy).expect("policy must build")),
+        }
+    }
+
+    fn success_bytes(decision: Decision) -> Vec<u8> {
+        match decision {
+            Decision::Respond(bytes) | Decision::RespondFrom { bytes, .. } => bytes,
+            other => panic!("expected a response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reflect_defaults_let_a_real_rfc5780_probe_through() {
+        // The real probe coturn's `stunclient` sends: 28-byte RESPONSE-PORT.
+        // With the guard on the answer omits the optional SOFTWARE, so the
+        // 28-byte probe gets 32 bytes (TEST_SOFTWARE adds 16 here, and 20 with
+        // the production string — omitted either way) = 1.14x.
+        let context = guarded_context(reflect_policy(
+            limit::DEFAULT_REFLECT_MIN_REQUEST,
+            limit::DEFAULT_REFLECT_RATIO,
+        ));
+        let request = minimal_response_port_request(TEST_TRANSACTION, 23480);
+        assert_eq!(request.len(), 28);
+
+        match guarded(
+            &request,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &context,
+        ) {
+            Decision::RespondFrom { to, bytes, .. } => {
+                assert_eq!(to.port(), 23480, "RESPONSE-PORT must still be honoured");
+                assert_eq!(
+                    u16::from_be_bytes([bytes[0], bytes[1]]),
+                    protocol::BINDING_SUCCESS_RESPONSE
+                );
+                assert_eq!(
+                    attribute_types(&bytes),
+                    vec![protocol::ATTR_XOR_MAPPED_ADDRESS],
+                    "a small redirect answer carries no SOFTWARE"
+                );
+                assert_eq!(bytes.len(), 32, "20-byte header + XOR-MAPPED-ADDRESS");
+                let policy = limit::Reflect {
+                    min_request: limit::DEFAULT_REFLECT_MIN_REQUEST,
+                    ratio: limit::DEFAULT_REFLECT_RATIO,
+                };
+                assert!(
+                    policy.allows_response(request.len(), bytes.len()),
+                    "{} bytes for a {} byte probe must be inside the policy",
+                    bytes.len(),
+                    request.len()
+                );
+            }
+            other => panic!("a 28-byte RFC 5780 probe must be answered, got {other:?}"),
+        }
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 0);
+    }
+
+    #[test]
+    fn reflect_defaults_cover_the_alt_listen_answer() {
+        // The acceptance case: with --alt-listen the answer also carries
+        // RESPONSE-ORIGIN + OTHER-ADDRESS (24 bytes). Without SOFTWARE that is
+        // 56 bytes for a 28-byte probe = 2.00x, inside
+        // max(28 x 2.0, 28 + 32) = 60. (With SOFTWARE it would be 76 = 2.71x
+        // and the guard would refuse it — which is why the omission exists.)
+        let context = alt_listen_context(reflect_policy(
+            limit::DEFAULT_REFLECT_MIN_REQUEST,
+            limit::DEFAULT_REFLECT_RATIO,
+        ));
+        let request = minimal_response_port_request(TEST_TRANSACTION, 23480);
+        let bytes = success_bytes(guarded(
+            &request,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &context,
+        ));
+        assert_eq!(bytes.len(), 56, "20 header + XOR 12 + the RFC 5780 pair");
+        assert_eq!(
+            attribute_types(&bytes),
+            vec![
+                protocol::ATTR_XOR_MAPPED_ADDRESS,
+                protocol::ATTR_RESPONSE_ORIGIN,
+                protocol::ATTR_OTHER_ADDRESS
+            ],
+            "no SOFTWARE on a small redirect answer"
+        );
+        assert!(
+            limit::Reflect {
+                min_request: 20,
+                ratio: limit::DEFAULT_REFLECT_RATIO
+            }
+            .allows_response(request.len(), bytes.len())
+        );
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 0);
+    }
+
+    #[test]
+    fn software_is_dropped_only_for_small_redirect_probes() {
+        // The whole matrix of the SOFTWARE rule, in one place. The rule is
+        // exactly as wide as the guard's domain (`redirect_is_guarded`):
+        //   guard on + UDP + redirect that can be honoured + < 40 bytes -> no SOFTWARE
+        //   guard on + UDP + redirect + >= 40                            -> SOFTWARE
+        //   guard on + UDP + plain Binding                               -> SOFTWARE (byte-frozen)
+        //   guard on + UDP + CHANGE-REQUEST without a plan               -> SOFTWARE
+        //   guard on + TCP + redirect                                    -> SOFTWARE
+        //   guard off + anything                                         -> SOFTWARE (26.410.100 bytes)
+        let small = minimal_response_port_request(TEST_TRANSACTION, 23480);
+        let big = forty_byte_response_port_request(TEST_TRANSACTION, 23480);
+        let plain = binding_request(TEST_TRANSACTION);
+        let change = change_request(TEST_TRANSACTION, protocol::CHANGE_IP);
+        assert_eq!(change.len(), 28);
+        let guarded_ctx = guarded_context(reflect_policy(20, 2.0));
+        let alt_ctx = alt_listen_context(reflect_policy(20, 2.0));
+        let plain_ctx = ServerContext::default();
+
+        let has_software = |decision: Decision| {
+            attribute_types(&success_bytes(decision)).contains(&protocol::ATTR_SOFTWARE)
+        };
+
+        assert!(!has_software(guarded(
+            &small,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &guarded_ctx
+        )));
+        assert!(has_software(guarded(
+            &big,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &guarded_ctx
+        )));
+        assert!(has_software(guarded(
+            &plain,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &guarded_ctx
+        )));
+        // F-A: the rule must not be wider than the guard.
+        // 1. TCP: the guard never applies, so the probe keeps its SOFTWARE.
+        assert!(has_software(guarded(
+            &small,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Tcp,
+            &guarded_ctx
+        )));
+        // 2. UDP without `--alt-listen`: CHANGE-REQUEST cannot redirect, so the
+        //    request is not guarded and keeps its SOFTWARE.
+        assert!(has_software(guarded(
+            &change,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &guarded_ctx
+        )));
+        // 3. UDP with `--alt-listen`: the same probe *is* guarded, so no SOFTWARE.
+        assert!(!has_software(guarded(
+            &change,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &alt_ctx
+        )));
+
+        // Guard off: the 28-byte redirect probe keeps its SOFTWARE (48 bytes
+        // with TEST_SOFTWARE, 52 with the production string), exactly as
+        // 26.410.100 answered it.
+        let unguarded = success_bytes(guarded(
+            &small,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &plain_ctx,
+        ));
+        assert_eq!(unguarded.len(), 48);
+        assert!(attribute_types(&unguarded).contains(&protocol::ATTR_SOFTWARE));
+    }
+
+    #[test]
+    fn the_guard_actually_rejects_a_padded_redirect_probe() {
+        // The case that proves the ratio rule is not a formality: a 40-byte
+        // request made of CHANGE-REQUEST (8) + PADDING 8 (12) with
+        // --alt-listen would get 76 + 12 = 88 bytes (84 with TEST_SOFTWARE),
+        // which is above max(40 x 2.0, 40 + 32) = 80.
+        let context = alt_listen_context(reflect_policy(
+            limit::DEFAULT_REFLECT_MIN_REQUEST,
+            limit::DEFAULT_REFLECT_RATIO,
+        ));
+        let request = request_with_attributes(
+            TEST_TRANSACTION,
+            &[
+                (
+                    protocol::ATTR_CHANGE_REQUEST,
+                    &protocol::CHANGE_PORT.to_be_bytes(),
+                ),
+                (protocol::ATTR_PADDING, &[0_u8; 8]),
+            ],
+        );
+        assert_eq!(request.len(), 40);
+        let stats = ServerStats::default();
+        let decision = decide_guarded(
+            &request,
+            "198.51.100.9:5000".parse().unwrap(),
+            "127.0.0.1:3478".parse().unwrap(),
+            Transport::Udp,
+            &context,
+            TEST_SOFTWARE,
+            &stats,
+        )
+        .unwrap();
+        match decision {
+            Decision::Respond(response) => {
+                assert_eq!(error_details(&response).0, 400);
+                assert!(
+                    (response.len() as f64)
+                        <= limit::Reflect {
+                            min_request: 20,
+                            ratio: 2.0
+                        }
+                        .allowed_response_len(request.len()),
+                    "the refusal itself must stay inside the allowance"
+                );
+            }
+            other => panic!("a padded redirect probe must be refused, got {other:?}"),
+        }
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 1);
+        assert_eq!(stats.counters(), (0, 0, 1));
+
+        // More padding makes the request pay for the growth: PADDING 16 gives a
+        // 48-byte request, 92-byte answer and max(96, 80) = 96, so it passes —
+        // the rule is "answer no bigger than what you sent", not "no PADDING".
+        let padded = request_with_attributes(
+            TEST_TRANSACTION,
+            &[
+                (
+                    protocol::ATTR_CHANGE_REQUEST,
+                    &protocol::CHANGE_PORT.to_be_bytes(),
+                ),
+                (protocol::ATTR_PADDING, &[0_u8; 16]),
+            ],
+        );
+        assert_eq!(padded.len(), 48);
+        assert!(matches!(
+            guarded(
+                &padded,
+                "198.51.100.9:5000",
+                "127.0.0.1:3478",
+                Transport::Udp,
+                &context
+            ),
+            Decision::RespondFrom { .. }
+        ));
+    }
+
+    #[test]
+    fn reflect_min_request_still_gates_when_raised() {
+        // Raising the size floor is the operator's choice; it must still work
+        // and must still answer with a 400 when that 400 does not amplify.
+        let context = guarded_context(reflect_policy(40, limit::DEFAULT_REFLECT_RATIO));
+        let small = minimal_response_port_request(TEST_TRANSACTION, 23480);
+        let stats = ServerStats::default();
+        let decision = decide_guarded(
+            &small,
+            "198.51.100.9:5000".parse().unwrap(),
+            "127.0.0.1:3478".parse().unwrap(),
+            Transport::Udp,
+            &context,
+            TEST_SOFTWARE,
+            &stats,
+        )
+        .unwrap();
+        match decision {
+            Decision::Respond(response) => {
+                assert_eq!(error_details(&response).0, 400);
+                assert!(
+                    response.len() <= 40,
+                    "the 400 is 40 bytes; it must not amplify either"
+                );
+            }
+            other => panic!("expected a 400, got {other:?}"),
+        }
+        // A refusal counts both as a reflection rejection and as a dropped
+        // request, like every other refusal path.
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 1);
+        assert_eq!(stats.counters(), (0, 0, 1));
+
+        // 40 bytes clears the raised floor; the 48-byte answer is still inside
+        // max(80, 104).
+        let big = forty_byte_response_port_request(TEST_TRANSACTION, 23480);
+        assert_eq!(
+            u16::from_be_bytes({
+                let bytes = success_bytes(guarded(
+                    &big,
+                    "198.51.100.9:5000",
+                    "127.0.0.1:3478",
+                    Transport::Udp,
+                    &context,
+                ));
+                [bytes[0], bytes[1]]
+            }),
+            protocol::BINDING_SUCCESS_RESPONSE
+        );
+    }
+
+    #[test]
+    fn reflection_guard_drops_when_even_a_400_would_amplify() {
+        // A strict ratio (no allowance on the refusal path): the 40-byte 400 is
+        // bigger than 28 x 0.5, so nothing is sent at all.
+        let context = guarded_context(reflect_policy(40, 0.5));
+        let stats = ServerStats::default();
+        let decision = decide_guarded(
+            &minimal_response_port_request(TEST_TRANSACTION, 23480),
+            "198.51.100.9:5000".parse().unwrap(),
+            "127.0.0.1:3478".parse().unwrap(),
+            Transport::Udp,
+            &context,
+            TEST_SOFTWARE,
+            &stats,
+        )
+        .unwrap();
+        assert!(
+            matches!(decision, Decision::Ignore(_)),
+            "a refusal that would amplify must be silent, got {decision:?}"
+        );
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 1);
+        assert_eq!(stats.counters(), (0, 0, 1));
+    }
+
+    #[test]
+    fn padding_plus_response_port_refusal_goes_through_the_guard() {
+        // RFC 5780 §6 already refuses PADDING + RESPONSE-PORT with a 400. With
+        // the guard on that refusal is produced by `reflection_refusal` — so it
+        // is counted, and it is subject to the same "a refusal must not
+        // amplify" rule.
+        let port = 23480_u16;
+        let request = request_with_attributes(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_RESPONSE_PORT, &port.to_be_bytes()),
+                (protocol::ATTR_PADDING, &[0_u8; 4]),
+            ],
+        );
+        assert_eq!(request.len(), 36);
+
+        let context = guarded_context(reflect_policy(20, limit::DEFAULT_REFLECT_RATIO));
+        let stats = ServerStats::default();
+        let decision = decide_guarded(
+            &request,
+            "198.51.100.9:5000".parse().unwrap(),
+            "127.0.0.1:3478".parse().unwrap(),
+            Transport::Udp,
+            &context,
+            TEST_SOFTWARE,
+            &stats,
+        )
+        .unwrap();
+        match decision {
+            Decision::Respond(response) => assert_eq!(error_details(&response).0, 400),
+            other => panic!("expected the §6 400, got {other:?}"),
+        }
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 1);
+        assert_eq!(stats.counters(), (0, 0, 1));
+
+        // With a ratio that cannot afford the 400 the combination is dropped.
+        let strict = guarded_context(reflect_policy(20, 0.5));
+        assert!(matches!(
+            guarded(
+                &request,
+                "198.51.100.9:5000",
+                "127.0.0.1:3478",
+                Transport::Udp,
+                &strict
+            ),
+            Decision::Ignore(_)
+        ));
+    }
+
+    #[test]
+    fn change_request_is_only_gated_when_a_plan_exists() {
+        // Without --alt-listen a CHANGE-REQUEST cannot move the answer to
+        // another address (we hold none), so it is not a reflection vector and
+        // must not be refused for its size.
+        let request = change_request(TEST_TRANSACTION, protocol::CHANGE_IP);
+        assert_eq!(request.len(), 28);
+        let without_plan = guarded_context(reflect_policy(40, limit::DEFAULT_REFLECT_RATIO));
+        match guarded(
+            &request,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &without_plan,
+        ) {
+            Decision::Respond(response) => assert_binding_success(
+                &response,
+                TEST_TRANSACTION,
+                "198.51.100.9:5000".parse().unwrap(),
+            ),
+            other => panic!("CHANGE-REQUEST without a plan must be answered, got {other:?}"),
+        }
+        assert_eq!(admission_of(&without_plan).counters().reflect_rejected, 0);
+
+        // With a plan the same probe can move the source, so the size floor
+        // applies.
+        let with_plan = alt_listen_context(reflect_policy(40, limit::DEFAULT_REFLECT_RATIO));
+        match guarded(
+            &request,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &with_plan,
+        ) {
+            Decision::Respond(response) => assert_eq!(error_details(&response).0, 400),
+            other => panic!("a 28-byte CHANGE-REQUEST with a plan must be refused, got {other:?}"),
+        }
+        assert_eq!(admission_of(&with_plan).counters().reflect_rejected, 1);
+    }
+
+    #[test]
+    fn reflection_guard_exempts_allowlisted_sources() {
+        // `--allow` says "these sources are mine": they are exempt from the
+        // amplification rules, which is the documented way to keep a probing
+        // network (or the monitoring host) working with a strict guard.
+        let context = guarded_context(limit::Policy {
+            reflect: Some(limit::Reflect {
+                min_request: 40,
+                ratio: 0.1,
+            }),
+            allow: vec!["198.51.100.0/24".parse().unwrap()],
+            ..limit::Policy::default()
+        });
+        let request = minimal_response_port_request(TEST_TRANSACTION, 23480);
+        match guarded(
+            &request,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &context,
+        ) {
+            Decision::RespondFrom { to, .. } => assert_eq!(to.port(), 23480),
+            other => panic!("an allowlisted source must not be gated, got {other:?}"),
+        }
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 0);
+
+        // A source outside the block is still gated by the same policy; at ratio
+        // 0.1 even the 40-byte 400 would amplify, so the datagram is dropped.
+        match guarded(
+            &request,
+            "203.0.113.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &context,
+        ) {
+            Decision::Ignore(reason) => assert!(reason.contains("reflection guard")),
+            other => panic!("a non-allowlisted source must be gated, got {other:?}"),
+        }
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 1);
+    }
+
+    #[test]
+    fn reflection_guard_ignores_plain_binding_and_the_tcp_path() {
+        let context = guarded_context(reflect_policy(40, 0.1));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+
+        // A 20-byte plain Binding request has no redirect attribute: it must not
+        // be caught by the size rule (that would break every normal client).
+        let plain = binding_request(TEST_TRANSACTION);
+        assert_eq!(plain.len(), 20);
+        match guarded(
+            &plain,
+            &peer.to_string(),
+            &local.to_string(),
+            Transport::Udp,
+            &context,
+        ) {
+            Decision::Respond(response) => {
+                assert_binding_success(&response, TEST_TRANSACTION, peer)
+            }
+            other => panic!("plain Binding must still be answered, got {other:?}"),
+        }
+
+        // Over TCP a redirect attribute cannot reflect onto a third party (the
+        // answer stays on the connection), so the probe is answered in-band.
+        let tcp_probe = minimal_response_port_request(TEST_TRANSACTION, 23480);
+        match guarded(
+            &tcp_probe,
+            &peer.to_string(),
+            &local.to_string(),
+            Transport::Tcp,
+            &context,
+        ) {
+            Decision::Respond(response) => {
+                assert_binding_success(&response, TEST_TRANSACTION, peer)
+            }
+            other => panic!("TCP must answer in-band, got {other:?}"),
+        }
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 0);
+    }
+
+    #[test]
+    fn enabled_guard_leaves_plain_answers_byte_identical() {
+        // 「开启准入 ≠ 改协议」：同一请求，开了限速得到的字节必须与关闭时一致。
+        let request = binding_request([0x92; 12]);
+        let peer: SocketAddr = "198.51.100.9:4242".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let plain = match decide(
+            &request,
+            peer,
+            local,
+            Transport::Udp,
+            &ServerContext::default(),
+            TEST_SOFTWARE,
+        )
+        .unwrap()
+        {
+            Decision::Respond(bytes) => bytes,
+            other => panic!("expected a response, got {other:?}"),
+        };
+        let guarded_context = guarded_context(limit::Policy {
+            per_ip: Some(limit::Rate::new(100.0, 100.0)),
+            ..limit::Policy::default()
+        });
+        let guarded_bytes = match guarded(
+            &request,
+            &peer.to_string(),
+            &local.to_string(),
+            Transport::Udp,
+            &guarded_context,
+        ) {
+            Decision::Respond(bytes) => bytes,
+            other => panic!("expected a response, got {other:?}"),
+        };
+        assert_eq!(guarded_bytes, plain);
+    }
+
+    /// Drain whatever a socket has received within `window`.
+    async fn drain(socket: &UdpSocket, window: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut buffer = [0_u8; 512];
+        let mut received = 0;
+        while let Ok(Ok(_)) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await
+        {
+            received += 1;
+        }
+        received
+    }
+
+    #[tokio::test]
+    async fn rate_limit_drops_the_flooding_source_and_spares_another() {
+        let socket = Arc::new(udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
+        let address = socket.local_addr().unwrap();
+        let admission = limit::Admission::new(limit::Policy {
+            per_ip: Some(limit::Rate::new(1.0, 3.0)),
+            ..limit::Policy::default()
+        })
+        .unwrap();
+        let context = Arc::new(ServerContext {
+            plan: None,
+            udp: vec![(address, socket.clone())],
+            mapped_address: false,
+            admission: Some(admission.clone()),
+        });
+        let stats = Arc::new(ServerStats::default());
+        tokio::spawn(serve_udp(
+            socket,
+            context,
+            Arc::from(TEST_SOFTWARE),
+            stats.clone(),
+        ));
+
+        let flooder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // A second loopback source: 127.0.0.0/8 is local on Linux/macOS. If the
+        // sandbox refuses it, skip instead of failing on the environment.
+        let Ok(neighbour) = UdpSocket::bind("127.0.0.2:0").await else {
+            eprintln!("skipping rate-limit e2e: cannot bind 127.0.0.2");
+            return;
+        };
+
+        for _ in 0..20 {
+            flooder
+                .send_to(&binding_request([0x90; 12]), address)
+                .await
+                .unwrap();
+        }
+        let answered = drain(&flooder, Duration::from_millis(300)).await;
+        assert!(
+            (1..=6).contains(&answered),
+            "a 3-token burst should answer a handful of 20 requests, got {answered}"
+        );
+        assert!(
+            admission.counters().rate_limited_ip >= 14,
+            "the rest must be counted as rate limited: {:?}",
+            admission.counters()
+        );
+
+        // The other source has its own bucket and is not collateral damage.
+        neighbour
+            .send_to(&binding_request([0x91; 12]), address)
+            .await
+            .unwrap();
+        let mut buffer = [0_u8; 512];
+        let (len, from) =
+            tokio::time::timeout(Duration::from_secs(5), neighbour.recv_from(&mut buffer))
+                .await
+                .expect("another source must still be answered")
+                .unwrap();
+        assert_eq!(from, address);
+        assert_binding_success(&buffer[..len], [0x91; 12], neighbour.local_addr().unwrap());
+        assert_eq!(stats.counters().1, answered as u64 + 1);
+    }
+
+    #[tokio::test]
+    async fn max_inflight_actually_drops_udp_datagrams() {
+        // Regression: the serial receive loop holds at most one permit, so a cap
+        // above 1 could never trigger and `--max-inflight` was a no-op over UDP.
+        // With the cap set, each datagram is handed to its own task while it
+        // holds a permit — so the cap is reachable and the excess is counted.
+        let socket = Arc::new(udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
+        let address = socket.local_addr().unwrap();
+        let admission = limit::Admission::new(limit::Policy {
+            max_inflight: Some(1),
+            ..limit::Policy::default()
+        })
+        .unwrap();
+        let context = Arc::new(ServerContext {
+            plan: None,
+            udp: vec![(address, socket.clone())],
+            mapped_address: false,
+            admission: Some(admission.clone()),
+        });
+        let stats = Arc::new(ServerStats::default());
+        tokio::spawn(serve_udp(
+            socket,
+            context,
+            Arc::from(TEST_SOFTWARE),
+            stats.clone(),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for _ in 0..300 {
+            client
+                .send_to(&binding_request([0x96; 12]), address)
+                .await
+                .unwrap();
+        }
+        let answered = drain(&client, Duration::from_millis(500)).await;
+        // `#[tokio::test]` runs on a current-thread runtime: the spawned
+        // handlers only get polled when the receive loop yields, so the single
+        // slot is still held for the following datagrams — the excess must be
+        // refused *and counted*, not silently serialised.
+        assert!(
+            answered < 300,
+            "a one-slot cap must refuse some of the 300 datagrams (answered {answered})"
+        );
+        assert!(
+            admission.counters().inflight_dropped > 0,
+            "the cap must show up in the counters: {:?}",
+            admission.counters()
+        );
+
+        // The cap is not a latch: once the queue settles a new request is served.
+        let _ = drain(&client, Duration::from_millis(200)).await;
+        client
+            .send_to(&binding_request([0x97; 12]), address)
+            .await
+            .unwrap();
+        let mut buffer = [0_u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buffer))
+            .await
+            .expect("the server must recover once permits are released")
+            .unwrap();
+        assert_binding_success(&buffer[..len], [0x97; 12], client.local_addr().unwrap());
+    }
+
+    #[tokio::test]
+    async fn deny_list_refuses_one_source_without_touching_the_other() {
+        let socket = Arc::new(udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
+        let address = socket.local_addr().unwrap();
+        let context = Arc::new(ServerContext {
+            plan: None,
+            udp: vec![(address, socket.clone())],
+            mapped_address: false,
+            admission: Some(
+                limit::Admission::new(limit::Policy {
+                    deny: vec!["127.0.0.1/32".parse().unwrap()],
+                    ..limit::Policy::default()
+                })
+                .unwrap(),
+            ),
+        });
+        let stats = Arc::new(ServerStats::default());
+        tokio::spawn(serve_udp(
+            socket,
+            context.clone(),
+            Arc::from(TEST_SOFTWARE),
+            stats.clone(),
+        ));
+
+        let Ok(denied) = UdpSocket::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let Ok(allowed) = UdpSocket::bind("127.0.0.2:0").await else {
+            eprintln!("skipping deny-list e2e: cannot bind 127.0.0.2");
+            return;
+        };
+        denied
+            .send_to(&binding_request([0x92; 12]), address)
+            .await
+            .unwrap();
+        assert_eq!(
+            drain(&denied, Duration::from_millis(300)).await,
+            0,
+            "--deny 127.0.0.1/32 must drop the request outright"
+        );
+
+        allowed
+            .send_to(&binding_request([0x93; 12]), address)
+            .await
+            .unwrap();
+        let mut buffer = [0_u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), allowed.recv_from(&mut buffer))
+            .await
+            .expect("a source outside --deny must be answered")
+            .unwrap();
+        assert_binding_success(&buffer[..len], [0x93; 12], allowed.local_addr().unwrap());
+        assert_eq!(stats.counters(), (2, 1, 1));
     }
 
     // ---------- CLI ----------
