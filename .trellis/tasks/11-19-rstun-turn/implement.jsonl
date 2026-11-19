@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/11-19-rstun-auth/prd.md", "reason": "TURN 强制鉴权复用长期凭据/nonce 设计"}
+{"file": ".trellis/tasks/11-19-rstun-abuse-guard/prd.md", "reason": "TURN 配额与 relay 端口耗尽必须与限速/并发上限协同"}

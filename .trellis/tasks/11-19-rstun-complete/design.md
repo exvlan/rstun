@@ -17,9 +17,23 @@
 | nonce | 无状态 HMAC，默认 1h 过期 | 多实例无需共享存储 | 内存表（重启失效、多实例不一致）|
 | 观测 | 指标默认关闭；开启时独立 `--metrics-listen`（手写最小 HTTP/1.1 文本响应，无新依赖） | 保持「无 HTTP 面」默认 | 依赖 axum/hyper（依赖膨胀）|
 | 配置 | CLI 保持唯一真源；新增可选的 env 映射（`RSTUN_*`） | 容器友好且不加解析依赖 | TOML/配置文件（需 serde）|
-| TLS | 不做（属 TURN/turns 域） | 与 TURN 决策绑定 | 现在做（无消费方）|
+| TLS | 仅 TURN（`turns:`/DTLS）需要；**feature flag 编译**，默认不编 | 避免 STUN-only 用户承担 rustls 依赖 | 默认编译（体积/依赖膨胀）|
+| TURN relay | 每 allocation 一个绑定 UDP socket + 独立任务；`--relay-ports` 控制范围 | 与 coturn 语义一致，便于诊断 | 共享 socket + 多路复用（复杂度高）|
+| TURN 鉴权 | **强制**长期凭据（复用 auth 子任务） | 开放中继是被滥用的头号来源 | 匿名中继（禁止）|
 
-## 3. 数据流（鉴权开启时）
+## 3. 数据流（TURN 开启时）
+
+```
+TURN 连接（UDP/TCP/TLS）→ 鉴权（强制长期凭据）→ 方法分发
+  Allocate    → 按 5 元组查表；配额/端口检查 → 建 relay socket → 200 + XOR-RELAYED-ADDRESS/LIFETIME
+  Refresh     → 续期或（LIFETIME=0）释放
+  CreatePermission → peer IP 白名单（TTL 5m）
+  ChannelBind → 通道号 0x4000–0x7FFF ↔ peer 地址（TTL 10m）
+  Send/Data indication、ChannelData → 双向转发（仅白名单 peer）
+定时回收：allocation 600s、permission 5m、channel 10m、relay 端口释放
+```
+
+## 4. 数据流（仅 STUN + 鉴权时）
 
 ```
 UDP/TCP 收包 → 解析 → 方法/类判定 → 未知 comprehension-required → 420
@@ -32,12 +46,12 @@ UDP/TCP 收包 → 解析 → 方法/类判定 → 未知 comprehension-required
   → 编码响应 → 发送
 ```
 
-## 4. 兼容性
+## 5. 兼容性
 
 - 无鉴权配置时行为与 `26.410.100` **逐字节一致**（冻结测试继续生效）。
 - 新增属性（REALM/NONCE/ERROR 401/438）只在鉴权路径出现。
 - ICE/鉴权已知属性白名单保持不变（避免 420 误伤）。
 
-## 5. 回滚
+## 6. 回滚
 
 每个子任务独立可回滚：鉴权与限速都由配置开关控制，默认关闭；打开后出问题可运行时关闭并重启。
