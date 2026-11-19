@@ -1,0 +1,51 @@
+# rstun 单服务部署（Compose v2 / `docker compose`）
+#
+#   docker compose -f contrib/docker/compose.yaml up -d
+#   docker compose -f contrib/docker/compose.yaml config      # 只校验
+#
+# 为什么是 `network_mode: host`：RFC 5780 的 CHANGE-REQUEST 判据是「响应从哪个
+# 源地址/源端口发出」，bridge 的 `-p` 端口映射会做一次 NAT，客户端看到的源地址
+# 永远是宿主机的映射端口 → change-ip / change-port 永远失败。容器必须直接使用
+# 宿主机的网络栈（README「容器部署：必须 host 网络」）。
+#
+# 参数优先级：命令行 `command:` > `RSTUN_*` 环境变量 > 内置默认值。
+# 想用环境变量配置时，把 `command:` 里同名的 flag 删掉再写 `environment:`。
+
+services:
+  rstun:
+    image: ghcr.io/exvlan/rstun:26.410.100
+    container_name: rstun
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - server
+      - --listen=0.0.0.0:3478
+      - --tcp
+      # 只绑回环：健康/指标默认不对外（对外请用反代或内网地址）。
+      - --health-listen=127.0.0.1:9100
+      - --drain-timeout=5
+    # 与 --drain-timeout 对齐并留余量；SIGTERM 后进程会自己 drain 再退出。
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
+    environment:
+      # 只用 `RSTUN_*` 时打开（上面的 command 已写死 listen/tcp，会覆盖同名变量）。
+      # RSTUN_LISTEN: "0.0.0.0:3478"
+      RUST_LOG: info
+    healthcheck:
+      # 镜像里没有 curl/python（debian-slim，非 root）：用 bash 的 /dev/tcp 直接
+      # 发一行 HTTP 请求，断言状态行是 200。
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/9100 &&
+          printf "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 &&
+          head -n 1 <&3 | grep -q " 200 "'
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

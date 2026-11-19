@@ -1,0 +1,40 @@
+{{- if .Values.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rstun.fullname" . }}
+  labels:
+    {{- include "rstun.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if ne .Values.service.type "ClusterIP" }}
+  # RFC 5780 的判据是回包源地址：Cluster 策略的 DNAT 会把节点地址换掉。
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "rstun.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- range $index, $address := .Values.listen.addresses }}
+    {{- $port := 3478 }}
+    {{- if contains ":" $address }}
+    {{- $port = (splitList ":" $address | last) }}
+    {{- end }}
+    - name: {{ if eq $index 0 }}stun-udp{{ else }}stun-udp-{{ $index }}{{ end }}
+      port: {{ $.Values.service.port }}
+      targetPort: {{ $port | int }}
+      protocol: UDP
+    {{- if $.Values.listen.tcp }}
+    - name: {{ if eq $index 0 }}stun-tcp{{ else }}stun-tcp-{{ $index }}{{ end }}
+      port: {{ $.Values.service.port }}
+      targetPort: {{ $port | int }}
+      protocol: TCP
+    {{- end }}
+    {{- if and $.Values.rfc5780.enabled $.Values.rfc5780.altPort }}
+    # RFC 5780 的 alt 端口（同一个 `--alt-port`，两个 IP 上都监听）。
+    - name: stun-alt-udp
+      port: {{ $.Values.rfc5780.altPort | int }}
+      targetPort: {{ $.Values.rfc5780.altPort | int }}
+      protocol: UDP
+    {{- end }}
+    {{- end }}
+{{- end }}

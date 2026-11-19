@@ -1,0 +1,159 @@
+{{- /*
+参数优先级与二进制一致：命令行 flag > RSTUN_* 环境变量 > 默认值。
+这里**只用命令行 flag**（并允许 `env` 追加 RSTUN_*）：环境变量只在没有同名 flag
+时生效，而模板里 flag 已经写全了，写 RSTUN_LISTEN 会被覆盖 —— values.yaml 已注明。
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rstun.fullname" . }}
+  labels:
+    {{- include "rstun.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.hostNetwork }}
+  # hostNetwork 下同一节点只能有一个 Pod 占 3478：滚动更新会抢端口。
+  strategy:
+    type: Recreate
+  {{- end }}
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rstun.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rstun.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: {{ .Values.dnsPolicy }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: rstun
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - server
+            {{- range .Values.listen.addresses }}
+            - --listen={{ . }}
+            {{- end }}
+            {{- range .Values.listen.v6 }}
+            - --listen-v6={{ . }}
+            {{- end }}
+            {{- if .Values.listen.tcp }}
+            - --tcp
+            {{- end }}
+            {{- if .Values.rfc5780.enabled }}
+            {{- if not .Values.rfc5780.altListen }}
+            {{- fail "rfc5780.enabled=true 需要 rfc5780.altListen（第二个公网 IP）" }}
+            {{- end }}
+            - --alt-listen={{ .Values.rfc5780.altListen }}
+            {{- if .Values.rfc5780.altPort }}
+            - --alt-port={{ .Values.rfc5780.altPort }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.health.enabled }}
+            - --health-listen={{ .Values.health.listen }}
+            {{- end }}
+            - --drain-timeout={{ .Values.drainTimeoutSeconds }}
+            {{- if .Values.abuse.rateLimit }}
+            - --rate-limit={{ .Values.abuse.rateLimit }}
+            {{- end }}
+            {{- if .Values.abuse.rateLimitPort }}
+            - --rate-limit-port={{ .Values.abuse.rateLimitPort }}
+            {{- end }}
+            {{- if .Values.abuse.globalRate }}
+            - --global-rate={{ .Values.abuse.globalRate }}
+            {{- end }}
+            {{- if .Values.abuse.maxInflight }}
+            - --max-inflight={{ .Values.abuse.maxInflight }}
+            {{- end }}
+            {{- if .Values.abuse.reflectRatio }}
+            - --reflect-ratio={{ .Values.abuse.reflectRatio }}
+            {{- end }}
+            {{- range .Values.abuse.allow }}
+            - --allow={{ . }}
+            {{- end }}
+            {{- range .Values.abuse.deny }}
+            - --deny={{ . }}
+            {{- end }}
+            {{- range .Values.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          ports:
+            {{- range $index, $address := .Values.listen.addresses }}
+            {{- $port := 3478 }}
+            {{- if contains ":" $address }}
+            {{- $port = (splitList ":" $address | last) }}
+            {{- end }}
+            - name: {{ if eq $index 0 }}stun-udp{{ else }}stun-udp-{{ $index }}{{ end }}
+              containerPort: {{ $port | int }}
+              protocol: UDP
+            {{- if $.Values.listen.tcp }}
+            - name: {{ if eq $index 0 }}stun-tcp{{ else }}stun-tcp-{{ $index }}{{ end }}
+              containerPort: {{ $port | int }}
+              protocol: TCP
+            {{- end }}
+            {{- end }}
+            {{- if and .Values.rfc5780.enabled .Values.rfc5780.altPort }}
+            - name: stun-alt-udp
+              containerPort: {{ .Values.rfc5780.altPort | int }}
+              protocol: UDP
+            {{- end }}
+            {{- if .Values.health.enabled }}
+            - name: http-ops
+              containerPort: {{ splitList ":" .Values.health.listen | last | int }}
+              protocol: TCP
+            {{- end }}
+          {{- with .Values.env }}
+          env:
+            {{- range $name, $value := . }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          {{- if .Values.health.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.health.path }}
+              port: http-ops
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.health.path }}
+              port: http-ops
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 6
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

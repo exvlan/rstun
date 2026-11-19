@@ -1,0 +1,71 @@
+# /etc/systemd/system/rstun.service
+#
+# 安装：
+#   install -m 0755 rstun /usr/local/bin/rstun
+#   useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin rstun
+#   install -d -m 0750 -o root -g rstun /etc/rstun
+#   install -m 0640 -o root -g rstun rstun.env /etc/rstun/rstun.env   # 可选
+#   systemctl daemon-reload && systemctl enable --now rstun
+#
+# 参数优先级：命令行 flag > `RSTUN_*` 环境变量 > 内置默认值。
+# 只想改 listen 地址时，把 `RSTUN_LISTEN=...` 写进 EnvironmentFile 即可，
+# ExecStart 里不要再写同名 flag（写了就以它为准）。
+#
+# 停止：systemctl stop rstun → SIGTERM → 停止收新包 → 等在途（--drain-timeout，
+# 默认 5s）→ 打印 received/answered/dropped 统计 → 退出码 0。
+# 第二个 SIGTERM 会立即退出（运维兜底），所以 TimeoutStopSec 只需略大于 drain。
+
+[Unit]
+Description=rstun (STUN Binding server; RFC 5780 NAT behaviour discovery with --alt-listen)
+Documentation=https://github.com/exvlan/rstun
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rstun
+Group=rstun
+EnvironmentFile=-/etc/rstun/rstun.env
+
+# 只做 RFC 5389（单地址；通配也可以）：
+# ExecStart=/usr/local/bin/rstun server --listen 0.0.0.0:3478 --listen-v6 [::]:3478 --tcp
+#
+# 启用 RFC 5780：两个公网 IP 都必须写具体地址（不能是 0.0.0.0），
+# `--alt-port` 缺省是 listen 端口 + 1。
+ExecStart=/usr/local/bin/rstun server \
+    --listen 203.0.113.10:3478 \
+    --alt-listen 198.51.100.20:3478 \
+    --alt-port 3479 \
+    --tcp \
+    --health-listen 127.0.0.1:9100
+
+Restart=on-failure
+RestartSec=2
+
+# 优雅退出：--drain-timeout 默认 5s，这里留 2 倍余量。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# 单实例、无写盘、尽可能小的攻击面。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+LimitNOFILE=65536
+
+# 3478 是 >1024 的端口，普通用户就能绑，**不需要** CAP_NET_BIND_SERVICE。
+# 只有把监听改到 53 / 443 这类特权端口时才取消下面两行注释（并同步改
+# `User=` 或保留 AmbientCapabilities）：
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

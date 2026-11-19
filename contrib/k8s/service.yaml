@@ -1,0 +1,28 @@
+# STUN 的 Service。
+#
+# hostNetwork 部署（见 deployment.yaml）时 Pod 已经直接用节点 IP，严格说不需要
+# Service；保留它是为了让「集群内外怎么访问」有单一入口。
+#
+# `externalTrafficPolicy: Local` 是 RFC 5780 的关键：kube-proxy 默认的 Cluster
+# 策略会做一次 DNAT，CHANGE-REQUEST 的回包源地址不再是客户端看到的那个节点地址，
+# NAT 行为发现会判错。没有云 LB 时把 `type` 改成 `NodePort` 也一样要保留这一行。
+apiVersion: v1
+kind: Service
+metadata:
+  name: rstun
+  labels:
+    app.kubernetes.io/name: rstun
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: rstun
+  ports:
+    - name: stun-udp
+      port: 3478
+      targetPort: stun-udp
+      protocol: UDP
+    - name: stun-tcp
+      port: 3478
+      targetPort: stun-tcp
+      protocol: TCP

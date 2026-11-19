@@ -1,0 +1,18 @@
+apiVersion: v2
+name: rstun
+description: Standalone STUN Binding server (RFC 5389; RFC 5780 with alt-listen) with /healthz and /metrics
+type: application
+version: 0.1.0
+# 镜像 tag 就是 rstun 的发布版本（见 CHANGELOG）；改镜像不必改 chart 版本。
+appVersion: "26.410.100"
+kubeVersion: ">=1.24.0-0"
+home: https://github.com/exvlan/rstun
+sources:
+  - https://github.com/exvlan/rstun
+keywords:
+  - stun
+  - rfc5389
+  - rfc5780
+  - nat
+# 刻意**不引**任何第三方 chart 依赖（bitnami/common 之类）：模板都自带。
+dependencies: []

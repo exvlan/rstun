@@ -1,0 +1,100 @@
+# rstun Helm values（最小 chart，无第三方依赖）
+#
+# 参数优先级（与二进制一致）：`args` 里的命令行 flag > `env` 里的 `RSTUN_*` > 默认值。
+# 只写 `env.RSTUN_*` 也能跑；同时写会被 `args` 覆盖。
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/exvlan/rstun
+  tag: "26.410.100"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# STUN 监听（UDP 总是开；`tcp: true` 在同样的地址上再开 TCP）。
+listen:
+  # 一个或多个 `host:port`。启用 altListen 时**第一个**是 RFC 5780 primary。
+  addresses:
+    - 0.0.0.0:3478
+  # IPv6 监听（v6-only，永远不会参与 RFC 5780）。
+  v6: []
+  tcp: true
+
+# RFC 5780（NAT 行为发现）：需要两个公网 IP，只有 hostNetwork 才有意义。
+rfc5780:
+  enabled: false
+  # 第二个公网 IP（`host:port`，只用 IP，端口来自 altPort）。
+  altListen: ""
+  # 缺省 = primary 端口 + 1（不写就不加 `--alt-port`，也不暴露该端口）。
+  # 设成具体数字时模板会同时暴露 `stun-alt-udp` 容器端口与 Service 端口。
+  altPort: null
+
+# 运维端点：`/healthz`（readiness）+ `/metrics`（Prometheus 文本）。
+health:
+  enabled: true
+  # 0.0.0.0 让 kubelet 探针能连到 Pod IP；只在本机看就写 127.0.0.1。
+  listen: 0.0.0.0:9100
+  path: /healthz
+
+# 抗滥用（默认全关；开鉴权时强烈建议至少开 --rate-limit）。
+abuse:
+  rateLimit: null          # 每源 IP 每秒请求数（裸 flag = 200）
+  rateLimitPort: null      # 每源 IP+端口每秒请求数（裸 flag = 20）
+  globalRate: null
+  maxInflight: null
+  reflectRatio: null
+  allow: []                # CIDR 列表：跳过每源桶与反射防护
+  deny: []                 # CIDR 列表：直接拒绝
+
+# 优雅退出：SIGTERM 后等待在途请求的上限（秒）。
+drainTimeoutSeconds: 5
+
+# 额外命令行参数（会追加在自动生成的参数之后）。
+extraArgs: []
+# 额外的环境变量（`RSTUN_*` 就写这里）。
+env: {}
+  # RUST_LOG: info
+
+service:
+  enabled: true
+  type: LoadBalancer
+  # RFC 5780 必须 Local：Cluster 策略的 DNAT 会改掉回包源地址。
+  externalTrafficPolicy: Local
+  port: 3478
+
+# 3478 上的判据依赖真实源/目的地址 → 默认 hostNetwork。
+hostNetwork: true
+dnsPolicy: ClusterFirstWithHostNet
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi
+  limits:
+    memory: 64Mi
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# 停止时给 kubelet 的宽限（要大于 drainTimeoutSeconds）。
+terminationGracePeriodSeconds: 20

@@ -1,0 +1,109 @@
+# rstun（STUN Binding + 可选 RFC 5780）在 Kubernetes 上的最小部署。
+#
+#   kubectl apply -f contrib/k8s/
+#
+# 注意：
+#   * RFC 5780（CHANGE-REQUEST / OTHER-ADDRESS）要求 **两个公网 IP**，在 k8s 里
+#     只有 hostNetwork（或 hostPort + 对应 Node 地址）才能保住「响应源地址」的
+#     判据；下面的示例用 hostNetwork，`dnsPolicy: ClusterFirstWithHostNet` 保证
+#     仍能解析集群 DNS。
+#   * `--health-listen` 必须绑在探针能连到的地址上：hostNetwork 下用 0.0.0.0；
+#     非 hostNetwork 时用 Pod IP（0.0.0.0 也可以）。
+#   * 端口 3478 > 1024，容器不需要任何 capability；`--alt-port 3479` 同理。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rstun
+  labels:
+    app.kubernetes.io/name: rstun
+    app.kubernetes.io/component: stun
+spec:
+  # 一个 Pod 独占一个节点的 3478/3479（hostNetwork），滚动更新时先起新 Pod 会
+  # 抢不到端口 —— 所以用 Recreate。
+  strategy:
+    type: Recreate
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rstun
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rstun
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rstun
+          image: ghcr.io/exvlan/rstun:26.410.100
+          imagePullPolicy: IfNotPresent
+          args:
+            - server
+            # 把地址换成该节点真正可达的公网/内网地址；0.0.0.0 只适用于单地址部署。
+            - --listen=0.0.0.0:3478
+            - --tcp
+            - --health-listen=0.0.0.0:9100
+            - --drain-timeout=5
+            # 启用 RFC 5780 时改成下面三行（两个具体 IP + alt 端口）：
+            # - --listen=203.0.113.10:3478
+            # - --alt-listen=198.51.100.20:3478
+            # - --alt-port=3479
+          ports:
+            - name: stun-udp
+              containerPort: 3478
+              protocol: UDP
+            - name: stun-tcp
+              containerPort: 3478
+              protocol: TCP
+            # RFC 5780 的「另一个端口」（--alt-port）。默认不启用，所以这里注释掉：
+            # 开了 RFC 5780 时一并打开，否则节点防火墙/LB 的可读性会差一截。
+            # - name: stun-alt-udp
+            #   containerPort: 3479
+            #   protocol: UDP
+            - name: http-ops
+              containerPort: 9100
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: info
+            # 也可以用 `RSTUN_*` 代替 args（命令行 flag 优先）：
+            # - name: RSTUN_LISTEN
+            #   value: "0.0.0.0:3478"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http-ops
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            # 进程还活着但别再用它做流量判断：真死由 kubelet 重启，卡住的 socket
+            # 由 readiness 摘流。
+            httpGet:
+              path: /healthz
+              port: http-ops
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
