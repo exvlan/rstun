@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/abuse-guard.md", "reason": "反射拒绝/错误响应不得成为放大器；500/300 的大小约束参照此契约"}
+{"file": ".trellis/spec/backend/index.md", "reason": "本仓 Rust 约定与门禁"}
+{"file": ".trellis/tasks/11-19-rstun-proto-complete/design.md", "reason": "FINGERPRINT 算术、300/500 触发条件与兼容性矩阵"}
+{"file": ".trellis/tasks/11-19-rstun-auth/prd.md", "reason": "401/438 语义与 RFC 8489 属性归属（本任务只做未鉴权侧）"}

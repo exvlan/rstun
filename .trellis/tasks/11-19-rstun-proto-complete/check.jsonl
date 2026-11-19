@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "复核约定与冻结测试"}
+{"file": ".trellis/tasks/11-19-rstun-proto-complete/design.md", "reason": "核对实现是否满足错误码矩阵与默认零差异"}
