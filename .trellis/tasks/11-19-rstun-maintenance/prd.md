@@ -2,7 +2,8 @@
 
 > 承接 `11-19-rstun-standalone`（已归档）：拆仓、首发 `rstun-v26.410.100`、生产切换均已完成。
 > 本任务是 `11-19-rstun-complete` 的子任务，只收**遗留与长期事项**，不重复已完成工作。
-> 用户已选定**本任务第一个启动**（crates.io 首发）。
+> **执行时序（用户定稿）**：本任务的 M2/M3 随「阶段 B · GitHub 分发」执行；
+> **M1（crates.io）放在整个父任务最后**（阶段 C），不先发。
 
 ## Goal
 
@@ -11,7 +12,7 @@
 
 ## Scope
 
-### M1 · crates.io 首发
+### M1 · crates.io 首发（**阶段 C，最后执行**）
 
 - 校验 crate 名 `rstun` 可用（`curl -s https://crates.io/api/v1/crates/rstun`，需可访问网络的机器）。
 - `cargo package --list` 复核（应仍不含 `fuzz/`、`test/`、`.github/`）。
@@ -19,13 +20,13 @@
 - 发布后：干净容器里 `cargo install rstun` 成功，`rstun --version` 正确。
 - **前置**：确认 `version` 与最新 tag `rstun-v26.410.100` 一致（或升到新版本再发）。
 
-### M2 · arm64 / macOS 补验
+### M2 · arm64 / macOS 补验（阶段 B，与分发产物验证同批）
 
 - `linux-aarch64`：在 arm64 机器（或 `ubuntu-24.04-arm` runner）实跑二进制 + `rstun-smoke.sh`。
 - `macOS x86_64`：Intel Mac 或 Rosetta 上实跑 `--version` + UDP/TCP 冒烟（CI 只编译不执行）。
 - Windows：已由 CI `--version` 覆盖；如条件允许补一次 UDP 冒烟。
 
-### M3 · 长期回归
+### M3 · 长期回归（阶段 B 出口一并完成）
 
 - 每次发布前跑 `bash script/lab/rstun-interop.sh all`（38 项 / 176 断言）。
 - `cargo fuzz` 定期跑（≥10 分钟），corpus 可选持久化到独立分支/制品。

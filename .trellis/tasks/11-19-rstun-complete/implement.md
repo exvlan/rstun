@@ -2,17 +2,33 @@
 
 > 子任务各自有 PRD 与验收；本文件只定义顺序、门禁与集成点。
 
-## 顺序
+## 顺序（用户定稿：功能 → GitHub 分发 → crates.io）
+
+### 阶段 A · 功能开发（先把服务做完整）
 
 1. **abuse-guard（P0）**：先止血（伪造源 + RESPONSE-PORT 的反射放大是当前唯一可被利用的缺口）。
-2. **proto-complete**：错误路径闭环，为鉴权提供 401/438/500 的基础。
+2. **proto-complete（P1）**：错误路径闭环，为鉴权提供 401/438/500 的基础。
 3. **auth（P1）**：依赖 1（限速防爆破）与 2（错误码）。
-4. **ops（P1）**：与 2/3 并行可行；readiness/metrics 用于验证 1–3。
-5. **turn（P2，最大项）**：**依赖 1（配额/防滥用）、3（长期凭据）、4（指标）**；
+4. **ops（P1）**：与 2/3 并行；readiness/metrics 用于验证 1–3。
+5. **turn（P2，最大项）**：依赖 1（配额/防滥用）、3（长期凭据）、4（指标）；
    分两批：UDP 中继闭环 → TLS/DTLS + REST 凭据 + 配额完善。
-6. **qa（P2）**：基准与混沌在 STUN 部分完成后固化；TURN 的中继压测单列。
-7. **dist（P2）**：分发与文档，可与 qa 并行。
-8. **maintenance**：crates.io 首发可随时进行（不依赖其它子任务），arm64 补验随发布。
+
+> 阶段 A 出口：STUN + TURN 功能面齐全，`rstun-interop.sh all` 与浏览器/turnutils 验收全绿。
+
+### 阶段 B · 产物与镜像的 GitHub 分发
+
+6. **qa（P2）**：基准、混沌、覆盖率、fuzz/矩阵定时——为分发提供可回归的质量基线。
+7. **dist（P2）**：Release 资产（4 平台 zip）、`ghcr.io/exvlan/rstun` 双架构镜像、
+   包管理器（brew/deb）、文档站与社区文件、供应链门禁（audit/deny/SBOM）。
+8. **maintenance 的 M2/M3**：`linux-aarch64` 与 macOS x86_64 实机补验（分发产物必须真跑过）、
+   发布前长期回归记录。
+
+> 阶段 B 出口：所有分发渠道（GitHub Release + 镜像 + brew/deb）产物可用且被实机验证。
+
+### 阶段 C · crates.io 首发（最后）
+
+9. **maintenance 的 M1**：`cargo publish` → 干净环境 `cargo install rstun` 验证。
+   **必须在阶段 B 之后**：源码包是对外承诺的最后一道，要等二进制/镜像渠道稳定后再发。
 
 ## 门禁（每个子任务都必须）
 
