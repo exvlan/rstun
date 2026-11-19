@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/ops.md", "reason": "端点契约（1 连接 1 请求、2s 总时限、并发上限）与本次关闭路径改动直接相关"}
+{"file": ".trellis/tasks/archive/2026-11/11-19-rstun-ops/design.md", "reason": "原实现的设计（HTTP 关闭语义/资源上限）"}
