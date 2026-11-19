@@ -550,6 +550,9 @@ pub const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 /// Largest request head accepted, **terminator included**: a head of exactly
 /// this many bytes is served, one byte more is a `400`.
 pub const HTTP_MAX_HEAD: usize = 8 * 1024;
+/// How long the close path may spend swallowing bytes the client already sent,
+/// after the answer is written (see [`drain_input`]).
+pub const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 /// Default for `--health-max-connections`.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
@@ -664,7 +667,37 @@ async fn write_reply(
         Ok(Ok(())) => {}
     }
     let _ = tokio::time::timeout_at(deadline, stream.shutdown()).await;
+    drain_input(stream, deadline).await;
     Ok(())
+}
+
+/// Swallow whatever the client already sent, so that closing the socket does
+/// not turn into a RST that makes the client drop the answer just written.
+///
+/// Closing with unread bytes in the receive buffer is a *FIN* on Linux but a
+/// *RST* on macOS, and a peer may discard the already-arrived response when it
+/// sees the reset. Both refusal paths have unread bytes by construction: an
+/// over-cap connection is answered before its request is read at all, and a
+/// a too-large head stops reading at the limit, leaving the tail of the oversized head unread. Without
+/// this drain the `503`/`400` is written but not reliably delivered.
+///
+/// Bounded twice over: [`HTTP_DRAIN_TIMEOUT`] *and* the connection deadline, so
+/// a client that keeps sending cannot buy more time than an idle one, and the
+/// total exchange stays within [`HTTP_CONNECTION_TIMEOUT`]. Nothing read here
+/// is parsed — the request was refused, not understood — so the documented
+/// "one request per connection" is preserved.
+async fn drain_input(stream: &mut TcpStream, deadline: tokio::time::Instant) {
+    let drain_deadline = deadline.min(tokio::time::Instant::now() + HTTP_DRAIN_TIMEOUT);
+    let mut sink = [0_u8; 1024];
+    loop {
+        match tokio::time::timeout_at(drain_deadline, stream.read(&mut sink)).await {
+            // EOF, a reset, or the budget is gone: nothing left worth
+            // swallowing, and the answer is already on the wire.
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+            // Discarded on purpose: this is the tail of a refused request.
+            Ok(Ok(_)) => {}
+        }
+    }
 }
 
 /// What was read off the socket before parsing.
@@ -1594,18 +1627,12 @@ mod tests {
         let address = net.local_addr().expect("local address");
         let server = tokio::spawn(serve_http(net, state.clone(), 8));
 
-        let head = |total: usize| {
-            let prefix = "GET /healthz HTTP/1.1\r\nHost: probe\r\nX-Filler: ";
-            let suffix = "\r\n\r\n";
-            let filler = total - prefix.len() - suffix.len();
-            format!("{prefix}{}{suffix}", "a".repeat(filler))
-        };
-        let exact = head(HTTP_MAX_HEAD);
+        let exact = head_of(HTTP_MAX_HEAD);
         assert_eq!(exact.len(), HTTP_MAX_HEAD);
         let response = request(address, &exact).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
-        let over = head(HTTP_MAX_HEAD + 1);
+        let over = head_of(HTTP_MAX_HEAD + 1);
         assert_eq!(over.len(), HTTP_MAX_HEAD + 1);
         let response = request(address, &over).await;
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
@@ -1614,16 +1641,215 @@ mod tests {
         server.abort();
     }
 
+    /// A `GET /healthz` head of exactly `total` bytes, terminator included.
+    fn head_of(total: usize) -> String {
+        let prefix = "GET /healthz HTTP/1.1\r\nHost: probe\r\nX-Filler: ";
+        let suffix = "\r\n\r\n";
+        let filler = total - prefix.len() - suffix.len();
+        format!("{prefix}{}{suffix}", "a".repeat(filler))
+    }
+
+    /// Over the cap with junk behind the request: the refusal is answered
+    /// *before* a byte of the request is read, so everything is left unread —
+    /// exactly the shape that made macOS reset the connection and swallow the
+    /// `503` (the client then saw `ConnectionReset` instead of the answer).
+    ///
+    /// The assertion is the contract, not the platform: the answer must arrive
+    /// in full even though the server never read the request.
+    #[tokio::test]
+    async fn an_over_cap_refusal_reads_its_503_even_with_junk_following() {
+        let (state, _listener) = ops_state();
+        let net = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = net.local_addr().expect("local address");
+        let server = tokio::spawn(serve_http(net, state.clone(), 1));
+
+        // The single permit goes to a connection that never sends a byte.
+        let _idle = tokio::net::TcpStream::connect(address).await.expect("idle");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut payload = get("/healthz").into_bytes();
+        payload.extend_from_slice(&[b'!'; 512]);
+        let response = request_bytes(address, &payload).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("too many concurrent connections"),
+            "{response}"
+        );
+        assert_eq!(state.stats.ops_rejected(), 1);
+
+        server.abort();
+    }
+
+    /// The same for the `400` path: reading stops one byte into an oversized
+    /// head, so the tail is still queued when the answer is written.
+    #[tokio::test]
+    async fn an_oversized_head_reads_its_400_even_with_junk_following() {
+        let (state, _listener) = ops_state();
+        let net = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = net.local_addr().expect("local address");
+        let server = tokio::spawn(serve_http(net, state.clone(), 8));
+
+        let mut payload = head_of(HTTP_MAX_HEAD + 1).into_bytes();
+        payload.extend_from_slice(&[b'!'; 512]);
+        let response = request_bytes(address, &payload).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("request head too large"), "{response}");
+
+        server.abort();
+    }
+
+    /// The drain has its own small budget, and it never outlives the connection
+    /// deadline: neither a silent client nor one that keeps pushing bytes can
+    /// extend the close past `HTTP_DRAIN_TIMEOUT`.
+    ///
+    /// Driven directly (rather than through `serve_http`) because the client
+    /// sees the FIN from `shutdown(Write)` long before the drain finishes: the
+    /// drain's duration is only observable on the server side.
+    #[tokio::test]
+    async fn the_close_drain_never_outlives_its_own_budget() {
+        for flood in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("local address");
+            // 600 ms is three times the drain budget: an unbounded drain would
+            // still be reading (or waiting) when the assertion runs.
+            let client = tokio::spawn(async move {
+                let mut stream = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("connect");
+                let _ = stream.write_all(b"junk").await;
+                if flood {
+                    for _ in 0..30 {
+                        if stream.write_all(&[b'!'; 512]).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                } else {
+                    // Open but silent: the drain must end on its budget, since
+                    // it will never see EOF.
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                }
+            });
+
+            let (mut server_stream, _peer) = listener.accept().await.expect("accept");
+            let started = std::time::Instant::now();
+            drain_input(
+                &mut server_stream,
+                tokio::time::Instant::now() + HTTP_CONNECTION_TIMEOUT,
+            )
+            .await;
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= HTTP_DRAIN_TIMEOUT / 2,
+                "flood={flood}: the drain gave up without swallowing: {elapsed:?}"
+            );
+            // Bound the *drain budget* itself, not just the connection deadline:
+            // a drain that ignored `HTTP_DRAIN_TIMEOUT` (and only respected the
+            // 2 s connection deadline) would slip through with the old assertion.
+            assert!(
+                elapsed < HTTP_DRAIN_TIMEOUT + std::time::Duration::from_millis(150),
+                "flood={flood}: the drain outlived its own budget: {elapsed:?}"
+            );
+            client.abort();
+        }
+    }
+
+    /// A connection deadline already inside the drain budget wins: the drain
+    /// never pushes an exchange past `HTTP_CONNECTION_TIMEOUT`.
+    #[tokio::test]
+    async fn the_close_drain_is_clamped_by_the_connection_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect");
+            let _ = stream.write_all(b"junk").await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        });
+
+        let (mut server_stream, _peer) = listener.accept().await.expect("accept");
+        let started = std::time::Instant::now();
+        drain_input(
+            &mut server_stream,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < HTTP_DRAIN_TIMEOUT,
+            "the connection deadline must clamp the drain: {elapsed:?}"
+        );
+        client.abort();
+    }
+
+    /// One connection, one answer: a pipelined second request is swallowed by
+    /// the drain, never parsed.
+    #[tokio::test]
+    async fn a_pipelined_second_request_is_drained_not_answered() {
+        let (state, _listener) = ops_state();
+        let net = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = net.local_addr().expect("local address");
+        let server = tokio::spawn(serve_http(net, state.clone(), 8));
+
+        let payload = format!("{}{}", get("/healthz"), get("/metrics"));
+        let response = request_bytes(address, payload.as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            response.matches("HTTP/1.1 ").count(),
+            1,
+            "a second request must not be answered: {response}"
+        );
+        assert!(
+            !response.contains("# TYPE rstun_requests_total"),
+            "{response}"
+        );
+
+        server.abort();
+    }
+
     async fn request(address: SocketAddr, head: &str) -> String {
+        request_bytes(address, head.as_bytes()).await
+    }
+
+    /// Send `payload`, then read until the server closes.
+    ///
+    /// A reset *after* the answer has arrived is not a failure (the answer is
+    /// what the endpoint owes the client, and asserting on it is what catches a
+    /// missing drain); a reset *instead of* an answer is exactly the macOS
+    /// failure this endpoint must not have, so it panics.
+    async fn request_bytes(address: SocketAddr, payload: &[u8]) -> String {
         let mut stream = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect");
-        stream.write_all(head.as_bytes()).await.expect("write");
+        stream.write_all(payload).await.expect("write");
         let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
-            .await
-            .expect("response within 2s")
-            .expect("read");
+        match tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response)).await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                // A reset is tolerable only when the *whole* declared response
+                // already arrived (macOS may reset the tail of the close). A
+                // truncated body is a real failure, not noise.
+                let complete = match String::from_utf8_lossy(&response)
+                    .split_once("\r\n\r\n")
+                    .map(|(head, body)| (head.to_ascii_lowercase(), body.len()))
+                {
+                    Some((head, body_len)) => head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .map(|declared| declared == body_len)
+                        .unwrap_or(true),
+                    None => false,
+                };
+                assert!(
+                    complete,
+                    "connection reset with an incomplete answer: {error:?}"
+                );
+            }
+            Err(_) => panic!("response within 2s"),
+        }
         String::from_utf8_lossy(&response).into_owned()
     }
 }
