@@ -5,6 +5,47 @@
 
 ## Unreleased
 
+### 鉴权（RFC 5389 §10 短期/长期 + RFC 8489 §9.2，**默认关闭**）
+
+- **短期凭据**（`--auth-user` + `--auth-pass`，或 `--auth-file` 多用户）：key = 口令
+  （RFC 5389 §15.4），校验 `MESSAGE-INTEGRITY`（HMAC-SHA1）。缺 `USERNAME`/`MESSAGE-INTEGRITY`
+  → `400`（§10.1.2）；未知用户/口令不符 → `401`。**没有任何凭据配置时行为与 `26.410.100`
+  逐字节一致**（17 请求 × 3 配置对照 + 冻结测试）。
+- **长期凭据**（`--realm` + `--auth-secret` + `--auth-file`/`--auth-user`）：无凭据 → `401`
+  （`REALM` + `NONCE` + `PASSWORD-ALGORITHMS`）；nonce 过期 → `438` + 新 `NONCE` + `REALM` +
+  `PASSWORD-ALGORITHMS`；口令/用户/realm 不符 → `401`。key = `MD5(username:realm:password)`。
+  **缺失 ≠ 无效**：缺 `REALM` / `NONCE` / 身份属性（`USERNAME` 与 `USERHASH` 都缺）→ `400`，
+  值不对 → `401`（RFC 8489 §9.2.4）。
+- **RFC 8489 的 SHA256 / PASSWORD-ALGORITHM(S) / USERHASH**（**不是**「8489 全量」：
+  nonce cookie 与 `SECURITY-FEATURE` 位未实现，见 README「未实现（有意）」）：
+  `MESSAGE-INTEGRITY-SHA256`（key = `SHA256(user:realm:pass)`）、`PASSWORD-ALGORITHM`
+  协商（缺省 MD5，coturn 兼容）、`PASSWORD-ALGORITHMS` 广告、`USERHASH`
+  （**§14.4，完整 32 字节** `SHA256(user:realm)`；16 字节截断值按值无效回 401）。
+  `--auth-require-sha256` 拒绝 MD5 凭据（401）。
+- **无状态 nonce**：`base64url( expiry(5B) | HMAC-SHA256(secret, expiry|client_ip)[..11] )`，
+  默认 1 小时（`--nonce-lifetime`）。同一 `--auth-secret` 的实例互认对方的 nonce，
+  重启不失效，**没有服务端表**。过期判定严格（设计稿的 ±5 分钟宽限未实现，见 README 说明）。
+- **响应也签**：通过鉴权的 **200 / 420 / 400** 都带与请求同算法的 `MESSAGE-INTEGRITY` /
+  `MESSAGE-INTEGRITY-SHA256`（RFC 5389 §10.2.2），`stun-types` 的 `validate_integrity`
+  可以验签。**`500` 不签名**（在 `decide` 之下的发送/编码失败路径上拿不到 identity）。
+- **判定顺序**：准入（限速/反射防护）→ FINGERPRINT → 300 → **鉴权** → 420 → 400 组合 → 应答。
+  `300` 先于鉴权（重定向不需凭据），FINGERPRINT 先于鉴权；`401`/`438` 同样先过限速桶。
+- **放大面（已登记）**：`401` 与 `438` 都是 **96 字节**（realm `example.org`；对 20B 请求
+  4.80×、对 28B 3.43×），带 MI 的 200 = 76 字节。**开鉴权必须同时开限速**；配了凭据但没开
+  任何抗滥用开关时启动即 `warn`。开鉴权会打断匿名 ICE（README 明写）。反射防护在开启鉴权时
+  按「签名后的成功响应」与「401 挑战」的较大者估算，避免把 96B 的 401 按 76B 估低。
+- **依赖 5 → 9**：`hmac` / `sha1` / `sha2` / `md-5`（RustCrypto，纯 Rust、无 C）。
+  常量时间比较自写（`auth::ct_eq`），没有引入 `subtle` 作为直接依赖；自写 base64url（22 字符
+  nonce），没有引入 `base64`。
+- **非法配置启动失败**：`--auth-user` 缺 `--auth-pass`（及反向）、`--realm` 缺 `--auth-secret`
+  （及反向）、`--realm` 无用户、`--nonce-lifetime 0`、`--nonce-lifetime` 无 `--realm`、
+  `--auth-require-sha256` 无 `--realm`、`--auth-file` 读不到/格式错/空文件。
+- **互操作**：新增 `rstun-interop.sh auth` 项（独立 Python 客户端算 key/MAC：401 → MI → 200
+  → 验签 → 错口令 401 → 32 字节 `USERHASH` 200 / 16 字节 401，15 条断言，矩阵 41→42 项 /
+  191→203 条）；`tests_interop` 新增
+  `stun-types` 长凭证请求双向（SHA1 + SHA256）；`auth` 模块用 RFC 5769 §2.4 原文向量
+  （`MESSAGE-INTEGRITY = f6702465…`）锁死校验侧公式。
+
 ### 协议闭环（`500` / `FINGERPRINT` / `ALTERNATE-SERVER` / RFC 8489 语义）
 
 - **`500 Server Error`**（RFC 5389 §15.6）：`send_to` 失败（除 `ConnectionRefused` /
@@ -24,15 +65,16 @@
   IPv4 响应 56 字节 / IPv6 68 字节；**裸 Binding 的 300 不在反射防护域**，带 `RESPONSE-PORT` /
   `CHANGE-REQUEST` 的请求仍受防护管辖，且估算的是实发的 300（不是不会被发送的成功响应）。
 - **RFC 8489 属性语义**：未开鉴权时 `MESSAGE-INTEGRITY-SHA256` / `PASSWORD-ALGORITHM` /
-  `USERHASH` 按「理解但不用」忽略（不触发 420）；鉴权（401/438）仍属 `rstun-auth`。
-- **CRC-32 自实现**：新增 `src/crc32.rs`（IEEE 查表，`const fn` 建表），零新依赖
-  （`cargo tree -e normal --depth 1` 仍是 5 个）；RFC 5769 §2.1 的 `0xe57a3bcf` 作为向量锁死。
+  `USERHASH` 按「理解但不用」忽略（不触发 420）；鉴权本身见上面「鉴权」一节。
+- **CRC-32 自实现**：新增 `src/crc32.rs`（IEEE 查表，`const fn` 建表），本轮零新依赖
+  （`cargo tree -e normal --depth 1` 当时仍是 5 个；鉴权带来的 4 个见上面「鉴权」一节）；
+  RFC 5769 §2.1 的 `0xe57a3bcf` 作为向量锁死。
 - **兼容性**：两个开关都不给时行为/字节与 `26.410.100` 完全一致
-  （`plain_response_bytes_are_frozen` + 27 组「旧二进制 vs 新二进制」逐字节对照：
-  9 类请求 × 默认 / `--mapped-address` / `--alt-listen`）。
+  （`plain_response_bytes_are_frozen` + 68 组「旧二进制 vs 新二进制」逐字节对照：
+  17 个请求 × 默认 / `--mapped-address` / `--alt-listen` / `--check-fingerprint`）。
 - **互操作**：`tests_interop` 新增 `300` / `500` 的 `stun-types` 解码与 RFC 5769 FINGERPRINT
   校验；互操作矩阵 `probe` 新增 `fingerprint` / `fingerprint-drop` / `alternate` 三项，
-  共 **41 项子用例 / 191 条断言**。
+  共 **42 项子用例 / 203 条断言**。
 
 ### 抗滥用（默认全关）
 
@@ -70,7 +112,7 @@
   `enabled_guard_leaves_plain_answers_byte_identical` 锁住）；非法值（0、负数、
   `--rate-burst` 单独出现、`--reflect-min-request < 20`、`--reflect-ratio <= 0`、
   CIDR 解析失败）一律启动失败。
-- 工程：tokio 只多开 `sync` feature（运行期依赖仍是那 5 个 crate）；新增
+- 工程：tokio 只多开 `sync` feature（本轮没有新增依赖；鉴权的 4 个 crate 见上面）；新增
   `script/lab/rstun-abuse.sh`（关/开限速、单源洪水、反射防护默认值与严格门槛、
   allow/deny、`--max-inflight`、TCP 洪水的对照矩阵，逐条断言真实字节数与放大比，
   不需要 root/NET_RAW）。

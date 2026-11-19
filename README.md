@@ -4,8 +4,9 @@
 一个 crate、一个二进制、一个镜像，`cargo install` 就能跑，不依赖任何宿主项目。
 
 **范围声明（先读）**：本服务**只做 STUN** —— RFC 5389 Binding（+ 可选的 RFC 5780 NAT 行为
-发现）。**不做 TURN**（`Allocate` / `Refresh` / `Channel` 一律 `400`），**不做任何鉴权**，
-没有租户、配置文件和数据库。需要 TURN 中继或按用户鉴权时请用 coturn，不要往这里加。
+发现），加**可选的**鉴权（RFC 5389 §10 短期/长期凭据 + RFC 8489 §9.2 的 SHA256/USERHASH，
+**默认关闭**）。**不做 TURN**（`Allocate` / `Refresh` / `Channel` 一律 `400`），没有租户、
+配置文件或数据库。需要 TURN 中继时请用 coturn，不要往这里加。
 
 **命名**：crate 与二进制都叫 `rstun`。**绝对不能改叫 `stun`** —— Debian 的 `stun-client`
 包已经占用 `/usr/bin/stun`，同名会直接撞包/覆盖。
@@ -117,6 +118,32 @@ Options:
       --deny <CIDR>
           CIDR whose sources are refused outright, repeatable; wins ties with --allow
 
+      --auth-user <USER>
+          short-term credential user name (RFC 5389 §10.1); needs --auth-pass. Short-term only
+          applies without --realm: the key is the password itself
+
+      --auth-pass <PASS>
+          password of --auth-user (short-term) or of the single long-term user
+
+      --auth-file <PATH>
+          file with one `user:password` per line ('#' comments and blank lines ignored); repeatable
+          users for long-term, or several short-term users
+
+      --realm <REALM>
+          long-term credential realm (RFC 5389 §10.2); turns on the 401/438 flow. Needs
+          --auth-secret and at least one user
+
+      --auth-secret <SECRET>
+          secret that signs the stateless NONCE (any string; the same value on every instance makes
+          nonces interchangeable). Required with --realm
+
+      --nonce-lifetime <SECONDS>
+          NONCE lifetime in seconds (default 3600); only meaningful with --realm
+
+      --auth-require-sha256
+          long-term only: refuse PASSWORD-ALGORITHM=MD5 (401 unless the client uses SHA256). Needs
+          --realm
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -137,6 +164,9 @@ Options:
 | `Binding Request` + `CHANGE-REQUEST`（仅 UDP，且落在四 socket 之一）                                | 从**被请求的那个 socket** 发出响应（换 IP / 换端口 / 两者），仍带 `XOR-MAPPED-ADDRESS` + `RESPONSE-ORIGIN` + `OTHER-ADDRESS`；落在普通地址上时按 §5 **忽略**该属性，仍从原 socket 回包      |
 | `Binding Request` + `RESPONSE-PORT`（仅 UDP）                                                       | 响应**发往**「请求的源 IP + `RESPONSE-PORT` 端口」：只改**目的端口**，**源 IP/源端口不变**（仍从收到请求的 socket 发出，`RESPONSE-ORIGIN` 也仍是它）；端口无需已绑定，任意 `0–65535` 都照发 |
 | 落在**普通监听地址**上的 `Binding Request`（多 `--listen` 里非 primary 的地址、全部 `--listen-v6`） | 普通 5389 响应（`XOR-MAPPED-ADDRESS` + `SOFTWARE`）：**不带** `RESPONSE-ORIGIN`/`OTHER-ADDRESS`；`CHANGE-REQUEST` 按 §5 忽略（回包源不变）                                                  |
+| `Binding Request`（**配置了凭据**，无 `MESSAGE-INTEGRITY` / 口令错 / 用户未知 / realm 不符）          | `401 Unauthorized` + `REALM` + `NONCE` + `PASSWORD-ALGORITHMS`（长期凭据；短期凭据只有 `ERROR-CODE`）                                                                                       |
+| 同上，且 `NONCE` 是本服务签发但已过期                                                               | `438 Stale Nonce` + 新 `NONCE` + `REALM`（RFC 5389 §10.2.2）                                                                                                                               |
+| 同上，且凭据有效                                                                                    | 普通 200，并带与请求同算法的 `MESSAGE-INTEGRITY` / `MESSAGE-INTEGRITY-SHA256`                                                                                                              |
 | `Binding Request` + `PADDING`（RFC 5780 §7.6）                                                      | 响应**带同样长度**的 `PADDING`（永远不超过请求长度），用于 MTU / 分片探测；`PADDING` 恒为最后一个属性                                                                                       |
 | `Binding Request` + `RESPONSE-PORT` + `PADDING`                                                     | `400 Bad Request`（RFC 5780 §6："the server MUST return an error response of type 400"；§7.5 `MUST NOT process` 与 §10 `are rejected` 同指这条）                                            |
 | `Binding Request` + 未知的 **comprehension-required** 属性（如 `0x0033`）                           | `420 Unknown Attribute`（`0x0111`）+ `ERROR-CODE 420` + `UNKNOWN-ATTRIBUTES`（`0x000A`，每个类型 2 字节，值长度恰为 `2×N`；不足 4 字节的由通用 TLV padding 补齐且**不计入** Length，§15.9） |
@@ -167,23 +197,25 @@ Options:
 
 | RFC | 覆盖 | 说明 |
 | --- | --- | --- |
-| **RFC 5389** | 服务端全行为 | Binding、`XOR-MAPPED-ADDRESS`、`SOFTWARE`、`MAPPED-ADDRESS`（可选）、`ERROR-CODE`（300/400/420/500）、`UNKNOWN-ATTRIBUTES`、`FINGERPRINT`（`--check-fingerprint` 校验）、`ALTERNATE-SERVER`（`--alternate-server`） |
+| **RFC 5389** | 服务端全行为 | Binding、`XOR-MAPPED-ADDRESS`、`SOFTWARE`、`MAPPED-ADDRESS`（可选）、`ERROR-CODE`（300/400/401/420/438/500）、`UNKNOWN-ATTRIBUTES`、`FINGERPRINT`（`--check-fingerprint` 校验）、`ALTERNATE-SERVER`（`--alternate-server`）、**鉴权 §10**（短期 / 长期凭据，`--auth-user` / `--realm`，默认关闭） |
 | **RFC 5780** | 全量 | `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`（四条 change 路径，见下文） |
-| **RFC 8489** | 属性处理 | `MESSAGE-INTEGRITY-SHA256` / `PASSWORD-ALGORITHM` / `USERHASH` 在「已知属性」表内（不触发 420）；`PASSWORD-ALGORITHMS`（`0x8002` 类）属 comprehension-optional，按 §7.3.1 直接忽略。鉴权本身属独立任务（`rstun-auth`），本服务**不发** 401/438 |
-| **RFC 8445（ICE）** | 属性容忍 | `PRIORITY` / `USE-CANDIDATE` / `ICE-CONTROLLING` / `ICE-CONTROLLED` 不触发 420 |
+| **RFC 8489** | 鉴权扩展 | `MESSAGE-INTEGRITY-SHA256` / `PASSWORD-ALGORITHM(S)` 协商 / `USERHASH`（§14.4，32 字节，无 `USERNAME` 的长凭证）；`PASSWORD-ALGORITHM` 缺省按 MD5 派生（coturn 兼容）。**未实现** nonce cookie / security-feature 位（见「未实现（有意）」） |
+| **RFC 8445（ICE）** | 属性容忍 | `PRIORITY` / `USE-CANDIDATE` / `ICE-CONTROLLING` / `ICE-CONTROLLED` 不触发 420；**开鉴权后**无凭据的 ICE 探测会收到 401（见「鉴权」） |
 
 ### 错误码矩阵
 
 | 码 | 触发 | 备注 |
 | --- | --- | --- |
-| `300` | 配置了 `--alternate-server`（每个 Binding 请求） | 带 `ALTERNATE-SERVER`；**不带** `XOR-MAPPED-ADDRESS`；优先于 RFC 5780 与 420 |
-| `400` | 非 Binding 方法；`PADDING` + `RESPONSE-PORT`；`FINGERPRINT` 不在末位 / 值不匹配（默认） | 不带 `UNKNOWN-ATTRIBUTES` |
-| `420` | 请求带未知 comprehension-required 属性 | 带 `2N` 字节的 `UNKNOWN-ATTRIBUTES` |
-| `438` | nonce 过期 | **未实现**（属 `rstun-auth`）；本服务不会发出 |
-| `500` | 响应编码不变量被破坏、`send_to` 失败、内部不可恢复错误 | 固定文案 `Server Error`，固定 **40 字节**，不泄露 `io::Error` |
+| `300` | 配置了 `--alternate-server`（每个 Binding 请求） | 带 `ALTERNATE-SERVER`；**不带** `XOR-MAPPED-ADDRESS`；优先于鉴权、RFC 5780 与 420 |
+| `400` | 非 Binding 方法；`PADDING` + `RESPONSE-PORT`；`FINGERPRINT` 不在末位 / 值不匹配（默认）；**凭据请求缺必需属性**（短期：`USERNAME`/`MESSAGE-INTEGRITY`；长期：`REALM`/`NONCE`/`USERNAME` 与 `USERHASH` 两者皆缺） | 不带 `UNKNOWN-ATTRIBUTES`；**只表示"消息不完整"**，值错一律 401 |
+| `401` | 配置了凭据但请求未通过鉴权（无 `MESSAGE-INTEGRITY`、错口令、未知用户、`USERHASH` 长度≠32、realm 不符、nonce 不是本服务签发的、`--auth-require-sha256` 下用了 MD5） | 长期凭据时带 `REALM` + `NONCE` + `PASSWORD-ALGORITHMS`；短期凭据只有 `ERROR-CODE` |
+| `420` | 请求带未知 comprehension-required 属性 | 带 `2N` 字节的 `UNKNOWN-ATTRIBUTES`；**在鉴权之后**（未认证客户端探测不到这张表）；已认证请求的 420 **带 MI** |
+| `438` | nonce 是本服务签发的但已过期（`--nonce-lifetime`） | 带新 `NONCE` + `REALM` + `PASSWORD-ALGORITHMS`（RFC 8489 §9.2.4 对 401/438 同样要求） |
+| `500` | 响应编码不变量被破坏、`send_to` 失败、内部不可恢复错误 | 固定文案 `Server Error`，固定 **40 字节**，不泄露 `io::Error`；**不签名**（在 `decide` 之下、identity 已不可得，已登记） |
 
 `--check-fingerprint` / `--alternate-server` 两个开关**默认关闭**：不给它们时，任何请求的响应字节与
-`26.410.100` 完全一致（`plain_response_bytes_are_frozen` 与 27 组「旧二进制 vs 新二进制」逐字节对照）。
+`26.410.100` 完全一致（`plain_response_bytes_are_frozen` 与 68 组「旧二进制 vs 新二进制」逐字节对照：
+17 个请求 × 默认 / `--mapped-address` / `--alt-listen` / `--check-fingerprint`）。
 
 ### 420 与「已知属性」表
 
@@ -193,7 +225,7 @@ RFC 5389 §7.3.1 要求：请求里出现**服务端没实现的 comprehension-r
 
 | 类别           | 属性                                                                                                                                                                           | 为什么不能算未知                                               |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
-| 鉴权（未实现） | `USERNAME` `0x0006`、`MESSAGE-INTEGRITY` `0x0008`、`MESSAGE-INTEGRITY-SHA256` `0x001C`、`REALM` `0x0014`、`NONCE` `0x0015`、`PASSWORD-ALGORITHM` `0x001D`、`USERHASH` `0x001E` | RFC 5389 §10.2.2 允许客户端主动带；RFC 3489 时代客户端会顺手带 |
+| 鉴权（默认关） | `USERNAME` `0x0006`、`MESSAGE-INTEGRITY` `0x0008`、`MESSAGE-INTEGRITY-SHA256` `0x001C`、`REALM` `0x0014`、`NONCE` `0x0015`、`PASSWORD-ALGORITHM` `0x001D`、`USERHASH` `0x001E` | RFC 5389 §10.2.2 允许客户端主动带；不开鉴权时必须忽略而不是 420 |
 | ICE 连通性检查 | `PRIORITY` `0x0024`、`USE-CANDIDATE` `0x0025`、`ICE-CONTROLLED` `0x8029`、`ICE-CONTROLLING` `0x802A`                                                                           | ICE 的 Binding 请求**标配**这些属性；回 420 等于打死打洞       |
 
 把它们当作未知，会把正常客户端打成 420 —— 这比「少一条合规检查」危险得多。反过来，真的没实现的
@@ -210,9 +242,10 @@ RFC 5389 §7.3.1 要求：请求里出现**服务端没实现的 comprehension-r
 
 ### 协议闭环：`--check-fingerprint` / `--alternate-server`
 
-两个开关都**默认关闭**；关闭时既不二次解析、也不改任何字节（27 组「旧二进制 vs 新二进制」逐字节
-对照覆盖普通 Binding / SOFTWARE / FINGERPRINT / 420 / PADDING / RESPONSE-PORT / CHANGE-REQUEST / 400
-× 默认 / `--mapped-address` / `--alt-listen`）。
+两个开关都**默认关闭**；关闭时既不二次解析、也不改任何字节（68 组「旧二进制 vs 新二进制」逐字节
+对照覆盖 17 个请求 × 默认 / `--mapped-address` / `--alt-listen` / `--check-fingerprint`：普通 Binding、
+SOFTWARE、FINGERPRINT、ICE 簇、鉴权簇、420、`PADDING`、`RESPONSE-PORT`、`CHANGE-REQUEST`、
+非 Binding 方法）。
 
 **`--check-fingerprint`**（RFC 5389 §15.5）
 
@@ -248,9 +281,95 @@ RFC 5389 §7.3.1 要求：请求里出现**服务端没实现的 comprehension-r
 - UDP 的 `send_to` 失败会回 500；TCP 上「写失败」意味着连接已不可用（没有可回包的信道），
   只有**编码不变量**失败才会在同一条连接上回 500。
 
+### 鉴权：`--auth-user` / `--realm`（RFC 5389 §10 + RFC 8489 §9.2）
+
+**默认完全关闭**：不配凭据时 `MESSAGE-INTEGRITY` 等属性照旧被忽略，响应字节与 `26.410.100`
+逐字节一致（`plain_response_bytes_are_frozen` + 17 请求 × 3 配置的「旧二进制 vs 新二进制」对照）。
+一旦配置凭据，**只有 Binding 请求**受保护（indication 仍忽略，非 Binding 方法仍 400）。
+
+**短期凭据**（RFC 5389 §10.1，`--auth-user` + `--auth-pass`）
+
+- key **就是口令**（§15.4），只校验 `MESSAGE-INTEGRITY`（HMAC-SHA1）。
+- 缺 `USERNAME` 或 `MESSAGE-INTEGRITY`（§10.1.2 要求两者同时存在）→ **400 Bad Request**；
+  未知用户 / 口令不符 → **401**（短期没有 realm/nonce 可提供）。
+- `--auth-file` 也可用：一行一个 `user:password`，即多用户短期凭据。
+  口令走命令行会在 `ps` 里可见，生产环境请用 `--auth-file`（`chmod 600`）。
+
+**长期凭据**（RFC 5389 §10.2 + RFC 8489 §9.2，`--realm` + `--auth-secret`）
+
+```
+客户端                                rstun
+  ── Binding（无凭据） ──▶            401 + REALM + NONCE + PASSWORD-ALGORITHMS
+  ── USERNAME/REALM/NONCE + MI ──▶    200（响应同样带 MESSAGE-INTEGRITY）
+  ── 同一条但 nonce 过期 ──▶          438 + 新 NONCE + REALM + PASSWORD-ALGORITHMS
+```
+
+- **缺失 ≠ 无效**：长凭据请求缺 `REALM` / `NONCE` / 身份属性（`USERNAME` 与 `USERHASH`
+  都没有）→ **400**；属性齐全但值不对（realm 不符、用户不存在、`USERHASH` 不是 32 字节、
+  MAC 不匹配）→ **401**。
+
+- key 派生：`MD5(username:realm:password)`（`MESSAGE-INTEGRITY`）或
+  `SHA256(username:realm:password)`（`MESSAGE-INTEGRITY-SHA256`）。口令本身**从不直接比较**
+  —— 比的是 MAC，且用自写的**常量时间** `auth::ct_eq`（不引入 `subtle` 依赖）；
+  `USERNAME` 与 `USERHASH` 的比对同样走它（避免用户名存在性时序探测）。
+- `PASSWORD-ALGORITHM`（§14.12）缺省按 **MD5**（与 coturn 一致）；`PASSWORD-ALGORITHMS`
+  （§14.11）在 401 里列出可接受集合。`--auth-require-sha256` 时只列 SHA256，
+  用 MD5 的客户端回 401。
+- `USERHASH`（§14.4）可替代 `USERNAME`，此时请求里**没有**明文用户名。值必须是**完整**的
+  `SHA256(username:realm)`（**32 字节**）；16 字节的截断值不是 `USERHASH`，按值无效回 401。
+- **nonce 无状态**：`base64url( expiry(5B) | HMAC-SHA256(secret, expiry|client_ip)[..11] )`
+  （22 个字符）。校验只重算 HMAC 与过期时间，**没有服务端表**：同一 `--auth-secret` 的多个
+  实例/重启后的进程都能互认对方的 nonce。有效期 `--nonce-lifetime`（默认 3600 秒）。
+- **过期判定是严格的**（`now >= expiry` 即过期）：设计稿里的「±5 分钟时钟偏差容忍」没有
+  实现成宽限期 —— 那会把每个配置的有效期都拉长 5 分钟（`--nonce-lifetime 1` 就不再是 1 秒）。
+  需要容忍时钟偏差时把 `--nonce-lifetime` 调大即可。
+- 判定顺序（最终实现）：**限速/反射防护（准入）→ FINGERPRINT → 300 → 鉴权 → 420 → 400 组合
+  → 正常应答**。`300` 先于鉴权（重定向不需要认证），FINGERPRINT 先于鉴权（先证消息完整、
+  再证凭据）；`401`/`438` 本身也先过了限速桶，所以 401 洪水不会绕过准入。
+
+**放大面（必须配合限速）**
+
+| 响应 | 字节（realm=`example.org`） | 对 20B 请求 | 对 28B 请求 |
+| --- | --- | --- | --- |
+| `401`（`ERROR-CODE` + `REALM` + `NONCE` + `PASSWORD-ALGORITHMS`） | **96**（realm 每多 4 字节 +4） | 4.80× | 3.43× |
+| `438`（`ERROR-CODE` + `REALM` + `NONCE` + `PASSWORD-ALGORITHMS`） | **96** | 4.80× | 3.43× |
+| `200` 成功（含 `MESSAGE-INTEGRITY`） | **76** | 3.80× | 2.71× |
+| `200` 成功（含 `MESSAGE-INTEGRITY-SHA256`） | **88** | 4.40× | 3.14× |
+
+结论：**开鉴权必须同时开限速**（`--rate-limit` 至少覆盖每源 IP，`--reflect-ratio` 覆盖重定向
+探针）。启动时若配了凭据却没开任何抗滥用开关，会打一条 `warn` 明说这一点。
+
+`401` / `438` 只回**请求源**、不响应 `RESPONSE-PORT`，因此不能被引到任意第三方端口（不构成
+反射）；回包量仍受每源令牌桶约束。反射防护的比例规则只管带重定向属性的**成功**应答；开启鉴权
+时它的估算取「签名后的成功响应」与「401 挑战」的**较大者**（未认证请求实发 96B 的 401，
+不能按 76B 的成功响应去估）。这两类响应的放大面与 `300` 的已知放大面同属一类，
+`docs/interop-matrix.md` 与本节都登记了实测字节数。
+
+**对既有能力的影响**
+
+- **ICE**：开鉴权后，无凭据的 ICE 连通性检查会收到 401（与 coturn 一致）。需要匿名 ICE 时
+  不要开鉴权 —— 这也是它默认关闭的原因。
+- **RFC 5780**：`CHANGE-REQUEST` / `RESPONSE-PORT` 与鉴权正交，带凭据即可正常使用；
+  反射防护先于鉴权，所以小于门槛的重定向探针仍可能先被 400/静默丢弃。
+- **`--alternate-server`**：300 先于鉴权，配置了重定向的实例不需要凭据。
+
+
+
 ### 未实现（有意）
 
-- TURN（`Allocate`/`Refresh`/`Channel`）、鉴权（401/438）。
+- TURN（`Allocate`/`Refresh`/`Channel`）。
+- 鉴权的**服务端状态**部分：没有用户数据库、没有按 realm 路由、没有 nonce 黑名单
+  （nonce 无状态，靠 HMAC + 过期时间；要吊销就换 `--auth-secret`）。
+- **nonce 的绑定范围**：只有 `HMAC(secret, expiry|client_ip)`，**不绑源端口**、不含
+  nonce cookie，也不实现 RFC 8489 §9.2.3 的 `NONCE`/`SECURITY-FEATURE` 位
+  （`0x80`/`0x40`）。影响：同一 NAT 出口后的两台客户端在同一 IP 上可互换 nonce；
+  没有防重放的一次性 nonce（靠短 `--nonce-lifetime` 缩小窗口）。跨实例互认只需要
+  共享 `--auth-secret`。
+- 不实现 SASLprep：`--auth-pass` / `--auth-file` 里的口令按原样使用（ASCII 部署足够；
+  非 ASCII 口令请先自行 SASLprep）。`--auth-file` **只去掉行尾 `CR/LF`**，口令里的
+  首尾空格是数据、不会被 trim。
+- 鉴权开启时 `500 Server Error` **不签名**：它在 `decide` 之下的编码/发送失败路径上产生，
+  那里拿不到本次请求的 identity；客户端应按「内部错误」处理而不是验签。
 - `FINGERPRINT` 默认**不校验**（保持字节兼容），需要显式 `--check-fingerprint`。
 - `ALTERNATE-SERVER` 只接受 `ip:port` 形式，且只用一个目标（RFC 也允许 domain 形式）。
 - `RESPONSE-PORT` 在 **TCP** 上忽略（回包只能沿原连接返回；§5 的这套机制只定义在 UDP 上）。
@@ -555,14 +674,16 @@ recv → 名单（deny 优先 → 直接拒；allow 命中 → 跳过每源桶�
 |      | `rstun`                                                                                                                                                                                         | coturn                                        |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
 | 定位 | 只做 STUN，Binding + **NAT 行为发现**的**最小服务**                                                                                                                                             | 完整 STUN/TURN（中继）+ 鉴权 + 多租户         |
-| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`（无 TURN） | RFC 5389 / 5780 全量 / TURN（5766、turns 等） |
+| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）+ 鉴权（短期/长期，默认关闭）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`（无 TURN） | RFC 5389 / 5780 全量 / TURN（5766、turns 等） |
 | 配置 | 纯命令行参数（无配置文件）                                                                                                                                                                      | 上百行 `turnserver.conf`、数据库/鉴权后端     |
+| 鉴权 | 短期 / 长期凭据 + RFC 8489 SHA256、USERHASH；用户来自 `--auth-user` 或 `--auth-file`，**无数据库**                                                                                              | 长期凭据 + 数据库/Redis/文件后端，TURN 也受保护 |
 | 依赖 | 纯 Rust，无 OpenSSL/libevent                                                                                                                                                                    | 依赖 libevent/OpenSSL + 系统配置              |
 | 部署 | 单二进制 / 一个几十 MB 的镜像                                                                                                                                                                   | 发行版包 / 官方镜像 + 配置卷                  |
 | 用途 | 需要「公网 STUN 映射 + NAT 行为发现」、不需要中继的场景                                                                                                                                         | 需要 TURN 中继、按用户鉴权的通用基础设施      |
 
 结论：**需要 TURN 中继时仍然用 coturn**。本服务负责「公网 STUN 映射 + NAT 行为发现」这一段，
-把它部署到 UDP 回程可用的地址上即可。
+把它部署到 UDP 回程可用的地址上即可。鉴权只覆盖 STUN Binding 这一层，且用户清单是静态文件 /
+单个 flag —— 需要多租户、动态配额或 TURN 侧鉴权时，coturn 仍是唯一选择。
 
 ## 构建与运行
 
@@ -713,12 +834,19 @@ nft add rule inet filter input tcp dport 3478 accept   # 仅 --tcp 时需要
 
 ## 依赖面
 
-运行期依赖只有 5 个 crates.io 包，没有任何 path 依赖：
+运行期依赖 **9** 个 crates.io 包，没有任何 path 依赖：
 
 ```
 clap  socket2  tokio  tracing  tracing-subscriber
+hmac  sha1  sha2  md-5            ← 鉴权（RFC 5389 §10 / RFC 8489 §9.2）
 （dev-only: stun-types 2.0.5 —— 只用做编解码的参考实现 oracle，不进二进制）
 ```
+
+`hmac` / `sha1` / `sha2` / `md-5` 都是 **RustCrypto**，纯 Rust、无 C 依赖（不需要
+OpenSSL/libssl-dev）。引入它们的原因：鉴权要 HMAC-SHA1、HMAC-SHA256 与 MD5 三种算法，
+而「不手写密码学」是硬约束 —— 自己实现 S 盒/压缩函数只会得到一堆难测的代码。
+**底线是「不写算法」而不是「不加依赖」**：这四个 crate 加起来仍比 `ring`/`openssl` 小得多，
+且 `cargo tree -e normal --depth 1` 一眼能看完。
 
 `stun-types` 在 `[dev-dependencies]` 里，`cargo tree -e normal` 看不到它。编解码是手写的：
 `stun-types` 缺全部 RFC 5780 属性，把运行时交给第三方库也换不来协议覆盖，只会多几层依赖。
@@ -726,7 +854,7 @@ clap  socket2  tokio  tracing  tracing-subscriber
 ## 测试
 
 ```bash
-cargo test          # 141 个单测：3 crc32 + 30 protocol + 7 rfc5780 + 67 server + 27 limit + 7 interop
+cargo test          # 170 个单测：3 crc32 + 30 protocol + 7 rfc5780 + 82 server + 27 limit + 13 auth + 8 interop
 ```
 
 覆盖：
@@ -801,11 +929,12 @@ cargo test          # 141 个单测：3 crc32 + 30 protocol + 7 rfc5780 + 67 ser
 | coturn `turnutils_stunclient` 4.6.1 | 生产同款客户端：完整 RFC 5780 三响应、`CHANGE-REQUEST` 回包源 |
 | pion/stun v3（Go）                  | 主流 WebRTC 生态的编解码 + 客户端                             |
 | webrtc-rs `stun` 0.17               | Rust 生态的编解码 + 客户端（含 IPv6）                         |
-| `stun-types` 2.0.5                  | 编解码 oracle（`[dev-dependencies]`，不进运行时）             |
+| `stun-types` 2.0.5                  | 编解码 oracle（`[dev-dependencies]`，不进运行时）；长凭证请求 → 我们的 200 可被它 `validate_integrity` 验签 |
+| `rstun-interop-probe.py auth-long-term` | 独立实现（`hashlib`/`hmac`）的长期凭据客户端：self-computed key/MAC |
 
-结论：四方**双向**全绿（41 项子用例 / 191 条断言，`probe` 新增 `fingerprint` /
-`fingerprint-drop` / `alternate` 三项），RFC 5769 四段标准字节全通过，
-`cargo-fuzz` 解析路径 600 s 零 panic / 零挂死。
+结论：四方**双向**全绿（42 项子用例 / 203 条断言，`probe` 新增 `fingerprint` /
+`fingerprint-drop` / `alternate` 三项，`auth` 项覆盖长期凭据的完整 401 → MI → 200 流程），
+RFC 5769 四段标准字节全通过，`cargo-fuzz` 解析路径 600 s 零 panic / 零挂死。
 
 `test/interop/` 里是第三方客户端夹具（Go module 与 webrtc-stun 工程源码），
 `fuzz/` 是独立 workspace（`cargo +nightly fuzz run parse` 只覆盖解析/编码纯函数）。
