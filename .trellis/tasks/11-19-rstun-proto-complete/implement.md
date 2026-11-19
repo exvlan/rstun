@@ -10,7 +10,7 @@
 | 4 | `error_response(500)` + `server_error_for(&io::Error)` 映射；接入 UDP/TCP 的编码/发送失败路径 | 单测映射表；e2e 非法目标触发（或纯函数覆盖） | 小 commit |
 | 5 | RFC 8489 属性语义明确化（未开鉴权：忽略）+ README「支持子集」表 | 文档评审；`is_known_attribute` 不变 | 文档 commit |
 | 6 | 错误码矩阵写入 README（300/400/420/438/500） | 人工评审 + 与实现对照 | 同上 |
-| 7 | 互操作：`tests_interop` 增加 300/500 解码用例；`rstun-interop.sh` 增加一组「alternate-server」探测（可选） | 矩阵仍 38 项全绿 + 新用例 | 小 commit |
+| 7 | 互操作：`tests_interop` 增加 300/500 解码用例；`rstun-interop.sh` 增加 `alternate` / `fingerprint` / `fingerprint-drop` 探测。pion / webrtc 夹具不解析错误响应类型（能力边界，见 `docs/interop-matrix.md` §11） | 矩阵 41 项全绿 + 新用例 | 小 commit |
 | 8 | 全量门禁 + 默认路径字节对照（33 请求 × 3 配置）| 与 `26.410.100` 逐字节一致 | — |
 
 ## 门禁
@@ -19,7 +19,7 @@
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
-bash script/lab/rstun-interop.sh all          # 38 项
+bash script/lab/rstun-interop.sh all          # 41 项
 bash script/lab/rstun-abuse.sh                # 10 组（反射防护不受影响）
 cargo tree -e normal --depth 1                # 仍 5 个
 ```

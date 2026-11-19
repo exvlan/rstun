@@ -13,8 +13,13 @@
 | 条件 | 现状 | 改为 |
 | --- | --- | --- |
 | 响应编码失败（`Vec` 分配失败/长度溢出这类不变量违反）| 记日志 | 500（能编码则发，不能则丢）|
-| UDP `send_to` 失败（除 `EINVAL/ENETUNREACH` 这类客户端地址问题）| 记日志 | 500 |
+| UDP `send_to` 失败（除 `ConnectionRefused` / `NetworkUnreachable` / `AddrNotAvailable` 这类客户端地址问题）| 记日志 | 500 |
 | 监听任务内部不可恢复错误 | 记日志 + 任务结束 | 500（尽力），随后由 supervisor 记录 |
+
+> 纠错（2026-11-19，实现期发现）：本节初稿把 `EINVAL`（以及 `ENETUNREACH`）也列为「客户端地址问题」。
+> 实现按冷复核的显式清单只排除 `ConnectionRefused` / `NetworkUnreachable` / `AddrNotAvailable`，
+> **`EINVAL` → 500**。`RESPONSE-PORT 0` 触发 `EINVAL → 500` 正是本任务的 e2e 手段：
+> 目的端口 0 无法投递，回一个固定 40 字节的 500 比静默丢弃更可诊断，语义上可接受。
 
 **不触发**：请求本身非法（400/420）、鉴权失败（401/438）、限速/反射拒绝（静默丢弃）。
 

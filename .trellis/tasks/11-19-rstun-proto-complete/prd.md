@@ -23,7 +23,8 @@
 
 - [ ] 单元测试：500 / 400(FINGERPRINT 错) / 300(ALTERNATE-SERVER) 各自构造并断言
 - [ ] FINGERPRINT 正确时不改变正常响应字节（默认关闭时零差异）
-- [ ] 与 `stun-types`、pion、webrtc-rs 解码互通（矩阵新增用例）
+- [ ] 300/500 解码由 `stun-types` 覆盖（矩阵新增用例）；pion / webrtc-rs 的夹具不解析错误响应类型
+  （能力边界，已在 `docs/interop-matrix.md` §11 登记）
 - [ ] 错误码矩阵文档化
 
 ## 风险
