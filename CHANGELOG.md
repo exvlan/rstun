@@ -5,6 +5,51 @@
 
 ## Unreleased
 
+### 运维面（readiness / metrics / `RSTUN_*` / 优雅 drain / 部署清单）
+
+- **`--health-listen <addr>`（默认关闭）**：可选的最小 HTTP/1.1 端点（**手写，未引入
+  hyper/axum**，运行期依赖仍是 9 个）。资源维度的两条硬上限：**整条连接 2 秒**（读头与写响应
+  共用同一个截止时间 —— 每读重置的超时挡不住「每 1.5s 发 1 字节」的慢速客户端）与
+  **并发连接上限 `--health-max-connections`（默认 64，可用 `RSTUN_HEALTH_MAX_CONNECTIONS` 配）**：
+  超出上限**不排队**，立刻回 `503 too many concurrent connections` 并关闭（排队会保留洪水想
+  耗尽的 fd），超限次数见新指标 `rstun_ops_rejected_total`。请求头（含终止空行）上限 **8192
+  字节**：恰好 8192 可服务、8193 起 `400`。`GET /healthz` 只在**每个已配置监听都还在服务**时回
+  `200 {"status":"ok","listeners":N}`；任一 listener 任务退出（错误返回 / 被 abort）→
+  `503 {"status":"degraded",...,"stale":[...]}`；drain 期间 → `503 {"status":"draining"}`。
+  其它方法 `405` + `Allow`，未知路径 `404`，带**非零** `Content-Length`（或 `Transfer-Encoding`）
+  的请求 `400` 并关连接（`Content-Length: 0` 视为没有 body）；一个连接只答一个请求、读超时 2s、
+  请求头（含终止空行）上限 8192 字节、整条连接 2s 总时限、并发连接上限，不读 body。
+  **不给该参数时没有 HTTP 监听、没有额外任务、字节行为不变**。
+- **`GET /metrics`（Prometheus 文本）**：`rstun_requests_total{transport,result}`、
+  `rstun_rate_limited_total{scope}`、`rstun_inflight_dropped_total`、
+  `rstun_reflect_rejected_total`、`rstun_denied_total`、`rstun_allowlisted_total`、
+  `rstun_fingerprint_rejected_total`、`rstun_socket_errors_total{transport}`、
+  `rstun_auth_total{result}`、`rstun_build_info{version}`、`rstun_start_time_seconds`、
+  `rstun_uptime_seconds`、`rstun_health`。与退出统计**同一组 `Counters`**（不双份计数）；
+  标签集合固定（三个枚举维度）。TURN 未落地，`rstun_turn_*` **不输出**（不是恒 0）。
+  为此 `ServerStats` 新增 transport × outcome 桶（`ok/error/ignored/dropped`），退出日志的
+  `received/answered/dropped` 语义**未变**（含既有的「反射拒绝会同时记 answered 与 dropped」）。
+- **`RSTUN_*` 环境变量映射**：每个 flag 一个同名变量（大写、`-` → `_`），列表用逗号分隔。
+  **空字符串视为未设置**（compose 的 `${RSTUN_REALM:-}` 不会把启动打挂）；
+  `RSTUN_VERBOSE=1` 与 `--verbose` 等价（环境变量现在在日志初始化**之前**应用）。
+  **命令行显式值优先**（`--listen` 与 `RSTUN_LISTEN` 不合并），只补没写的那些；解析失败
+  **启动失败并指明来源**（`RSTUN_ALT_PORT: invalid value …`）；启动日志列出实际生效的变量；
+  未映射的 `RSTUN_*`（如 `RSTUN_BUILD_VERSION`）被忽略。
+- **优雅退出（drain）**：`--drain-timeout`（默认 5s，0 = 立即）。SIGTERM 后 UDP 停 `recv_from`、
+  TCP 停 `accept`、已建连接不再读新帧，等在途（datagram / TCP 连接 / 正在处理的帧）完成后
+  打印统计并退出 0；超时则 `warn` 并照样退出（退出码仍 0）。**第二个 SIGTERM 立即退出**。
+- **部署清单（`contrib/`）**：`systemd/rstun.service`、`docker/compose.yaml`
+  （`network_mode: host` + `/dev/tcp` 健康检查）、`k8s/{deployment,service}.yaml`
+  （`hostNetwork`、`readinessProbe → /healthz`、只读根文件系统、`externalTrafficPolicy: Local`；
+  RFC 5780 的 alt 端口随 `rfc5780.altPort` 一起暴露）、
+  `helm/`（最小 chart，values 覆盖 listen/rfc5780/health/abuse，无第三方 chart 依赖）。
+- **测试 +28**：`RSTUN_*` 映射与优先级（含空值、连接上限）、HTTP 解析六种结局、
+  **慢速客户端被 2s 总时限关闭**、**并发上限立刻 503 且端点仍服务**、**请求头 8192/8193 边界**、
+  `/healthz` 200→503（真实 socket）、`/metrics` 固定标签集合与随计数增长、
+  `wait_idle` 等在途/到点放弃、`Lifecycle` 订阅。
+  回归：`interop all` 42 项、`abuse` 10 组、冻结测试全绿；`cargo tree -e normal --depth 1` 仍 9 个。
+
+
 ### 鉴权（RFC 5389 §10 短期/长期 + RFC 8489 §9.2，**默认关闭**）
 
 - **短期凭据**（`--auth-user` + `--auth-pass`，或 `--auth-file` 多用户）：key = 口令

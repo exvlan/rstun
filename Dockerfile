@@ -19,9 +19,11 @@
 # 说明：
 # - 一个容器只跑一个 rstun 进程；多地址用 `--listen` / `--listen-v6` 重复指定，
 #   RFC 5780 则用 `--listen` + `--alt-listen`（镜像本身不用改）。
-# - 镜像里没有 ca-certificates / curl / python：本服务不发起任何出站连接，
-#   也没有 HTTP 探针端点，所以**不设 HEALTHCHECK**（见 README「健康检查」，
-#   探针从外部跑 `script/ci/rstun-smoke.sh`）。
+# - 镜像里没有 ca-certificates / curl / python：本服务不发起任何出站连接。
+#   二进制**自带**可选的只读运维端点（`--health-listen` → `/healthz` + `/metrics`），
+#   但镜像里没有能在容器内发 HTTP 的工具，所以**不设 HEALTHCHECK**：容器健康检查写在
+#   编排层（见 `contrib/docker/compose.yaml` 用 bash `/dev/tcp`），STUN 回程仍从外部跑
+#   `script/ci/rstun-smoke.sh`（见 README「运维面」）。
 # - 二进制名是 `rstun`，**不能**叫 `stun`：Debian `stun-client` 已占用 `/usr/bin/stun`。
 
 # ---------- build ----------

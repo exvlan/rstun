@@ -188,8 +188,10 @@ Options:
 - **抗滥用默认关闭**：不给 `--rate-limit` 族参数时不建表、不起后台任务、不改任何字节；
   开启后超限请求在 `decide()` **之前**被丢弃（UDP）或关连接（TCP），协议语义不变。
   参数、默认值推导与 NAT 误伤排查见「[抗滥用](#抗滥用限速--并发--反射防护)」。
-- 退出：Ctrl-C 与 Unix `SIGTERM`（systemd / `docker stop` 都走 SIGTERM），退出前打印
-  `received / answered / dropped` 统计；开了抗滥用时前面还有一行 `abuse guard counters`。
+- 退出：Ctrl-C 与 Unix `SIGTERM`（systemd / `docker stop` 都走 SIGTERM）。SIGTERM 先**优雅
+  drain**（停收新包 → 等在途，上限 `--drain-timeout`，默认 5s），再打印
+  `received / answered / dropped` 统计并退出 0；开了抗滥用时前面还有一行
+  `abuse guard counters`。第二个 SIGTERM 立即退出。详见「[运维面](#运维面readiness--metrics--env--优雅退出--部署清单)」。
 - 日志只走 stdout/stderr（`tracing`）：`RUST_LOG` 优先，否则 `--verbose` → `debug`，
   默认 `info`。**不写滚动文件**（容器/systemd 自己采集）。
 
@@ -763,10 +765,133 @@ docker run -d --name rstun --network host rstun:dev server \
 - 镜像推的就是**冒烟通过的那一份**：两个架构各自 build → 推 `:<version>-amd64` /
   `:<version>-arm64` → `docker manifest create/annotate/push` 合成 `:<version>`。
 
-## 健康检查
+## 运维面（readiness / metrics / env / 优雅退出 / 部署清单）
 
-镜像**没有** `HEALTHCHECK`：镜像里没有 curl / python / STUN 客户端，也没有 HTTP 就绪端点，
-容器内做假探针只会掩盖问题。建议在**外部**探测：
+运维只要回答两个问题：「它真的在服务吗？」「它现在怎么样？」。两者都由**一个可选的只读
+HTTP 端点**回答 —— **不给 `--health-listen` 就没有任何 HTTP 监听、没有额外任务、字节行为
+不变**（`interop all` 42 项、`abuse` 10 组、冻结测试都在这个前提下通过）。
+
+```bash
+rstun server --listen 0.0.0.0:3478 --tcp --health-listen 127.0.0.1:9100
+```
+
+### `/healthz`（readiness）
+
+```bash
+curl -si http://127.0.0.1:9100/healthz
+# HTTP/1.1 200 OK
+# {"status":"ok","listeners":1}
+```
+
+| 情形 | 响应 |
+| --- | --- |
+| 每个已配置的监听都还在服务 | `200 {"status":"ok","listeners":N}` |
+| 任一监听任务意外结束（错误返回 / panic / abort） | `503 {"status":"degraded","listeners":N,"stale":["udp 1.2.3.4:3478"]}` |
+| 正在 SIGTERM 之后 drain | `503 {"status":"draining","listeners":N,...}` —— LB 据此摘流 |
+| 未知路径 | `404`；`POST` 等其它方法 `405` + `Allow: GET, HEAD` |
+| 请求带**非零** `Content-Length`（或有 `Transfer-Encoding`） | `400` 并关闭连接（端点不读 body；`Content-Length: 0` 视为没有 body，照常按方法判定） |
+
+判定来自 supervisor：每个 listener 任务持有一个 `AtomicBool`，任务**任何**结束方式（错误、
+drain 后正常返回、被 abort）都会把它置 false。所以「进程还活着」不等于 `200`：**绑定失败不是
+`503` 而是启动失败**（任何 socket 绑不上 → 进程直接退出 1，不会「起了一半还说健康」）；
+起来之后某个监听任务意外结束（panic / abort）才是 `503` + `stale`。socket 读错误（瞬时 ICMP 等）
+不会结束监听，按 `RECV_ERROR_BACKOFF` 重试 → 不产生 `stale`。
+
+**资源上限**（都在 `--health-listen` 开启时才生效）：
+
+- **整条连接 2 秒**：读头与写响应共用同一个截止时间。每读一次重置的超时挡不住「每 1.5s 发 1
+  字节」的慢速客户端（旧行为可拖到分钟级），现在从 `accept` 起 2s 必然关闭。
+- **并发上限 `--health-max-connections`（默认 64）**：`accept` 后 `try_acquire`，**超出上限不排队**
+  —— 立刻回 `503 too many concurrent connections` 并关闭（排队会保留洪水想耗尽的那个 fd）。
+  `/healthz`/`/metrics` 本身不受已占用连接拖累：只要还有空槽就能服务，超限计数见
+  `rstun_ops_rejected_total`。
+- 请求头（含终止空行）上限 **8192 字节**：恰好 8192 可服务，8193 起 `400 request head too large`。
+
+### `/metrics`（Prometheus 文本）
+
+```bash
+curl -s http://127.0.0.1:9100/metrics | grep -E '^# TYPE|^rstun_requests_total'
+```
+
+| 指标 | 类型 | 标签 |
+| --- | --- | --- |
+| `rstun_requests_total` | counter | `transport=udp/tcp`、`result=ok/error/ignored/dropped` |
+| `rstun_rate_limited_total` | counter | `scope=ip/ip_port/global` |
+| `rstun_inflight_dropped_total` | counter | — |
+| `rstun_reflect_rejected_total` | counter | — |
+| `rstun_denied_total` / `rstun_allowlisted_total` | counter | —（`--deny` / `--allow` 命中）|
+| `rstun_fingerprint_rejected_total` | counter | — |
+| `rstun_socket_errors_total` | counter | `transport=udp/tcp`（`recv_from`/`accept` 失败）|
+| `rstun_auth_total` | counter | `result=ok/unauthorized/stale_nonce/bad_request` |
+| `rstun_ops_rejected_total` | counter | —（运维端点因 `--health-max-connections` 拒绝的连接）|
+| `rstun_build_info` | gauge = 1 | `version`（编译期常量）|
+| `rstun_start_time_seconds` / `rstun_uptime_seconds` | gauge | — |
+| `rstun_health` | gauge | —（1 = `/healthz` 会回 200）|
+
+- **与退出统计同源**：`/metrics` 读的就是退出时打印的那组 `Counters`
+  （`limit::Counters` + `auth::Counters` + `ServerStats`），没有第二份计数。
+- **标签集合固定**：只有 `transport` / `result` / `scope` 三个枚举维度，没有按对端 IP 的标签 ——
+  指标基数不会随流量爆炸。
+- `result` 的归属：`ok` = 应答已发出；`dropped` = 策略拒绝（限速 / 在途 / 反射防护）；
+  `error` = 读不懂或内部不变量失败；`ignored` = 有意不作答（indication、`--fingerprint-action drop`）。
+  后两者与退出日志的 `dropped` 总量**有意重叠**（退出日志的 `received/answered/dropped` 语义
+  未变，见 `.trellis/spec/backend/abuse-guard.md` §4）。
+- **TURN 指标暂缺**：`rstun_turn_allocations` / `rstun_turn_bytes_total` 在 TURN 落地前
+  **不输出**（而不是恒为 0 —— 0 会被读成「TURN 开着但空闲」）。
+- 安全：端点只做 `GET`/`HEAD`、一个连接只答一个请求（无 keep-alive）、**整条连接 2 秒总时限**、
+  请求头（含终止空行）上限 **8192 字节**、并发连接上限（`--health-max-connections`）、不读 body；
+  响应里没有路径、配置值或证书信息。**默认示例都绑 127.0.0.1**，
+  对外请用反代或内网地址。
+
+### 配置：环境变量（`RSTUN_*`）
+
+命令行的每个 flag 都有一个同名环境变量：`--health-listen` ⇔ `RSTUN_HEALTH_LISTEN`（大写、
+`-` → `_`）。**命令行显式值优先**，环境变量只补「没写」的那些：
+
+```bash
+RSTUN_LISTEN=0.0.0.0:3478 RSTUN_TCP=1 RSTUN_REALM=example.org \
+  rstun server --health-listen 127.0.0.1:9100
+```
+
+- 列表型用逗号：`RSTUN_LISTEN="10.0.0.5:3478,10.0.0.6:3478"`、`RSTUN_DENY="10.0.0.0/8,192.168.0.0/16"`。
+  **列表不合并**：命令行给了 `--listen` 就以命令行为准，`RSTUN_LISTEN` 整条被忽略。
+- 开关型：`1/true/yes/on` 为开，`0/false/no/off`（含空串）为关。
+- **空字符串 = 未设置**：compose 里 `${RSTUN_REALM:-}` 这种写法会把变量留成空串，它不会被当成
+  「显式空值」而启动失败（`--realm ""` 那种显式空值仍由 flag 校验拒绝）。
+- 解析失败 → **启动失败并指明来源**（`RSTUN_ALT_PORT: invalid value …`），不会静默忽略。
+- 启动日志会打印实际生效的变量名：`configuration defaults read from the environment variables=["RSTUN_LISTEN"]`。
+- 未映射的 `RSTUN_*`（例如构建期的 `RSTUN_BUILD_VERSION`）被忽略。
+
+### 优雅退出（drain）
+
+```
+SIGTERM → 停止收新包（UDP 停 recv、TCP 停 accept、已有连接不再读新帧）
+        → 等在途请求与发送完成（上限 --drain-timeout，默认 5s，0 = 立即）
+        → 打印统计 → 退出码 0
+```
+
+- 在途计数覆盖：UDP 的每个 datagram（含 `--max-inflight` 下 spawn 的任务）、每条 TCP 连接、
+  每个正在处理的 TCP 帧。监听任务本身也在等：它的 `recv_from`/`accept` 在 drain 时不会打断
+  手里那个请求。
+- 超时后照样退出（退出码仍为 0），并 `warn` 记下卡住的 listener 数与在途数。
+- **第二个 SIGTERM 立即退出**（运维兜底），所以 `TimeoutStopSec` 只需略大于 `--drain-timeout`。
+- drain 期间 `/metrics` 仍可抓取；`/healthz` 变 `503 draining`。
+
+### 部署清单（`contrib/`）
+
+| 文件 | 用途 |
+| --- | --- |
+| `contrib/systemd/rstun.service` | systemd 单元（非 root、`ProtectSystem=strict`、`LimitNOFILE=65536`、`TimeoutStopSec=10`） |
+| `contrib/docker/compose.yaml` | 单服务 Compose（**`network_mode: host`**：RFC 5780 必需）+ `/dev/tcp` 健康检查 |
+| `contrib/k8s/deployment.yaml` | Deployment（`hostNetwork`、UDP+TCP 3478、`readinessProbe → /healthz`、只读根文件系统；RFC 5780 的 `--alt-port 3479` 以注释形式给出，开启时同时放开该端口） |
+| `contrib/k8s/service.yaml` | `LoadBalancer` + `externalTrafficPolicy: Local`（Cluster 策略的 DNAT 会破坏 `CHANGE-REQUEST` 判据） |
+| `contrib/helm/` | 最小 chart（`listen` / `rfc5780` / `health` / `abuse` 都在 values 里），**不引第三方 chart 依赖** |
+
+清单里的参数与本文一致；校验方式见 `contrib/README.md`。
+
+### 更深一层：外部 STUN 探测
+
+`/healthz` 只说「监听还在」，不说「UDP 回程通」。要验回程：
 
 ```bash
 # 任意一台有 python3 的机器：20 字节 Binding Request，期望 0x0101
@@ -783,8 +908,14 @@ PY
 ```
 
 `script/ci/rstun-smoke.sh` 就是这条探测（带断言）的固化版本，CI 里 native 与容器各跑一次。
+镜像本身仍然**不带** `HEALTHCHECK`（镜像里没有 curl/python）；容器健康检查写在编排层
+（见 `contrib/docker/compose.yaml`）。
 
 ## systemd 样例
+
+**可直接安装的版本在 [`contrib/systemd/rstun.service`](contrib/systemd/rstun.service)**
+（含安装步骤、`EnvironmentFile=-/etc/rstun/rstun.env`、`TimeoutStopSec=10` 与一组加固项）。
+最小形态：
 
 ```ini
 # /etc/systemd/system/rstun.service
@@ -795,13 +926,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 单独的运行用户即可，不需要任何 capability
+# 单独的运行用户即可，不需要任何 capability（3478 > 1024）
 User=rstun
 Group=rstun
+# 用 `RSTUN_*` 配参数（命令行 flag 仍然优先）：
+EnvironmentFile=-/etc/rstun/rstun.env
 # 只做 RFC 5389（单地址，可用通配）：
 # ExecStart=/usr/local/bin/rstun server --listen 0.0.0.0:3478 --listen-v6 [::]:3478 --tcp
 # 启用 RFC 5780：两个公网 IP 都要写具体地址（不能是 0.0.0.0）
-ExecStart=/usr/local/bin/rstun server --listen 203.0.113.10:3478 --alt-listen 198.51.100.20:3478 --alt-port 3479 --tcp
+ExecStart=/usr/local/bin/rstun server --listen 203.0.113.10:3478 --alt-listen 198.51.100.20:3478 --alt-port 3479 --tcp --health-listen 127.0.0.1:9100
 Restart=on-failure
 RestartSec=2
 # 单实例、只读文件系统（本服务不写盘）
@@ -812,9 +945,10 @@ PrivateTmp=true
 PrivateDevices=true
 RestrictAddressFamilies=AF_INET AF_INET6
 LimitNOFILE=65536
-# SIGTERM 是缺省停止信号；服务自己会打印统计后退出
+# SIGTERM 是缺省停止信号：先 drain（--drain-timeout 默认 5s）再打印统计退出。
+# TimeoutStopSec 要留出 drain + 打印的余量；第二个 SIGTERM 会立即退出。
 KillSignal=SIGTERM
-TimeoutStopSec=5
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -831,6 +965,9 @@ nft add rule inet filter input tcp dport 3478 accept   # 仅 --tcp 时需要
 
 > 云主机注意：安全组放行 ≠ 回程可用。UDP 回程被云侧丢弃的地址要先用冒烟脚本验过再用，
 > 否则 `--alt-listen` 指到它会让 `change-ip` 永远超时（见上文「部署前先确认回程可用」）。
+
+容器 / Kubernetes / Helm 的最小清单见 `contrib/`（compose 用 `network_mode: host`，k8s 用
+`hostNetwork` + `readinessProbe → /healthz`），说明见 [`contrib/README.md`](contrib/README.md)。
 
 ## 依赖面
 
@@ -854,7 +991,7 @@ OpenSSL/libssl-dev）。引入它们的原因：鉴权要 HMAC-SHA1、HMAC-SHA25
 ## 测试
 
 ```bash
-cargo test          # 170 个单测：3 crc32 + 30 protocol + 7 rfc5780 + 82 server + 27 limit + 13 auth + 8 interop
+cargo test          # 198 个单测：3 crc32 + 30 protocol + 7 rfc5780 + 82 server + 27 limit + 13 auth + 8 interop + 28 ops
 ```
 
 覆盖：
@@ -893,6 +1030,16 @@ cargo test          # 170 个单测：3 crc32 + 30 protocol + 7 rfc5780 + 82 ser
   `[::]` 上 UDP/TCP 都只做普通 Binding 且**不会**出现 v4 的 `RESPONSE-ORIGIN`/`OTHER-ADDRESS`
   （显式断言地址族 `0x02`）；`--tcp` 在全部监听上生效，TCP 的 `CHANGE-REQUEST` 一律忽略；
   重复地址（alt socket 又写进 `--listen`）不会绑两次。
+- **运维面（`ops`）**：`RSTUN_*` 映射的要点（命令行优先 / 列表用逗号不合并 / **空字符串视为
+  未设置** / 非法值报错并指明变量名 / 连接上限可配）、开关型变量的 `1|true|yes|on` 与
+  `0|false|no|off`、未映射的名字被忽略、以及「每个映射名都必须是真实 flag」的守卫测试；
+  HTTP 解析（`GET`/`HEAD`/`405`+`Allow`/`404`/带 body 的 `400`/`Content-Length: 0` 放行/
+  畸形请求行/查询串）；**资源维度**：每 1.5s 发 1 字节的慢速客户端必须在 ≈2s 被关闭（总时限，
+  不是每次读重置）、`--health-max-connections 2` 时第 3 条连接立刻 503 且端点仍能服务、
+  请求头 8192 字节可服务 / 8193 字节 400；`/healthz` 的 200 → 503（listener 租约被 drop、
+  以及 drain 中）；`/metrics` 的 `# HELP`/`# TYPE`/固定标签集合与「随计数增长」；
+  真实 socket 上的 200 → 503 与 `405`；drain 的 `wait_idle`（等在途、到点放弃并报剩余数）
+  与 `Lifecycle` 订阅。
 - **互操作（`tests_interop`）**：RFC 5769 §2.1–§2.4 的四段**标准字节**（请求、IPv4 响应、
   IPv6 响应、长凭证请求）全部能解析/解码，且 §2.2/§2.3 的 `XOR-MAPPED-ADDRESS`
   我们能**逐字节重建**；§2.1–§2.3 的 `FINGERPRINT` 被判为合法、改一位即不匹配；
