@@ -14,7 +14,7 @@
 
 | 方法 | 行为 |
 | --- | --- |
-| `Allocate` | 按 5 元组查表；重复请求幂等返回同一 relay；`REQUESTED-TRANSPORT` 只接受 UDP；`LIFETIME` 默认 600s、上限可配 |
+| `Allocate` | 按 5 元组查表；**同一 transaction id 的重传**幂等返回同一 relay，**新 transaction id → 437**，**同一 5 元组换用户 → 441**；`REQUESTED-TRANSPORT` 只接受 UDP；`LIFETIME` 默认 600s、上限可配 |
 | `Refresh` | 续期；`LIFETIME=0` 立即释放（释放 socket + 端口）|
 | `CreatePermission` | peer IP 白名单（TTL 5 分钟）；同 IP 重复请求幂等 |
 | `ChannelBind` | 通道号 0x4000–0x7FFF ↔ peer 地址（TTL 10 分钟）；同通道重复绑定幂等 |
@@ -31,7 +31,7 @@
 
 - `--relay-ports <lo>-<hi>`（默认 49152–65535）；耗尽 → `508 Insufficient Capacity`。
 - `--max-allocations-per-user` / `--max-allocations-per-ip`（默认给保守值）；超限 → `486 Allocation Quota Reached`。
-- 每 allocation 的 permission 上限（默认 10）。
+- 每 allocation 的 permission 上限（默认 10）；超限 → `508 Insufficient Capacity`（一条请求里的 peer 全量校验，不做部分生效）。
 - 中继目标不得是本服务自身监听地址（防回环）。
 
 ### R4 观测与回收

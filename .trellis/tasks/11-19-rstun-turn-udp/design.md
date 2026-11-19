@@ -30,11 +30,11 @@ Tables {
 
 | 消息 | 处理 | 失败分支 |
 | --- | --- | --- |
-| `Allocate` | 鉴权（必须 MI）→ 配额检查 → 端口池取端口 → 绑 relay socket → 起转发任务 → 200 + `XOR-RELAYED-ADDRESS`/`LIFETIME`/`XOR-MAPPED-ADDRESS` | 401/438（鉴权）、**486**（超配额）、**508**（端口耗尽）、442（非 UDP）、440（地址族不支持）、500 |
-| 重复 `Allocate` | 同一 Key 幂等返回现有 relay（RFC 8656 §6.2） | 437（`ALLOCATION-MISMATCH`，KEY 不匹配时）|
-| `Refresh` | 续期；`LIFETIME=0` → 释放 | 437（未知 allocation）、401/438 |
-| `CreatePermission` | 校验 peer 地址族与 relay 一致；写 permissions | 403（禁止的 peer）、443（族不匹配）、401/438 |
-| `ChannelBind` | 校验通道号范围/已占用/peer；写 channels | 400（越界/重复）、403、443 |
+| `Allocate` | 鉴权（必须 MI）→ 配额检查 → 端口池取端口 → 绑 relay socket → 起转发任务 → 200 + `XOR-RELAYED-ADDRESS`/`LIFETIME`/`XOR-MAPPED-ADDRESS` + `SOFTWARE` | 401/438（鉴权）、**486**（超配额）、**508**（端口耗尽）、442（非 UDP）、440（地址族不支持）、500 |
+| 重复 `Allocate` | **同一 transaction id** 的重传幂等返回现有 relay（RFC 8656 §6.2）；**新 transaction id → 437**；**同一 5 元组、不同用户 → 441**（不得暴露/改动他人 allocation） | 437（`ALLOCATION-MISMATCH`）、441（`WRONG CREDENTIALS`）|
+| `Refresh` | 续期；**缺 `LIFETIME` → 服务端默认（600s）**；`LIFETIME=0` → 释放 | 437（未知 allocation）、**441（他人 allocation）**、401/438 |
+| `CreatePermission` | 校验 peer 地址族与 relay 一致；**先校验整条请求的 quota，再一次性写入**（不做部分生效）| **441（他人 allocation）**、403（禁止的 peer）、443（族不匹配）、**508（permission 容量超限）**、401/438 |
+| `ChannelBind` | 校验通道号范围/已占用/peer；写 channels | 400（越界/重复）、**441**、403、443、**508（隐式 permission 超限）** |
 | `Send` indication | 仅当 permission 覆盖 peer IP 时转发；无权限静默丢弃 | — |
 | `Data` indication | relay 收到 peer 数据 → 发给 client（带 `XOR-PEER-ADDRESS`）| — |
 | `ChannelData` | 命中通道 → 直接转发；UDP 上 4 字节头，TCP 上 4 字节头 + 按 4 字节对齐 | 未命中通道静默丢弃 |
@@ -60,10 +60,14 @@ Tables {
 | `--relay-ports lo-hi` | 49152–65535 | 端口耗尽 → 508；与系统 `ip_local_port_range` 重叠时文档提示 |
 | `--max-allocations-per-user` | 8 | 超限 → 486 |
 | `--max-allocations-per-ip` | 16 | 超限 → 486 |
-| `--permission-limit` | 10 | 超限 → 403 |
+| `--permission-limit` | 10 | 超限 → **508**（RFC 8656 §10.2；整条请求原子校验）|
 | `--allocation-lifetime` | 600s | 上限 3600s |
 
-> 防回环：peer 地址若解析到本进程已绑定的 relay/监听地址，拒绝（403）。
+> 防回环：peer 为 unspecified / multicast / 本进程监听地址 / 该 allocation 自身 relay → 403。
+> **loopback peer** 仅在请求到达的 socket 本身绑定在回环地址时允许（本地开发/测试）；
+> `--listen 0.0.0.0` 或公网监听下一律拒绝（否则通配地址会让「peer=127.0.0.1:<监听端口>」漏检）。
+> 同进程内**其它 allocation 的 relay 地址**允许（`turnutils_uclient -y` / 同 NAT WebRTC 的正常路径）。
+> 已知盲区：宿主自身**公网 IP** 无法在不引入接口枚举依赖的情况下判定（文档登记）。
 
 ## 7. 传输细节
 
@@ -77,7 +81,16 @@ Tables {
 - 单批 commit 可回滚；无持久化状态。
 - 与 coturn 对跑：`turnutils_uclient` 同一组参数连两个服务，中继行为一致。
 
-## 9. 观测
+## 9. 观测（`/metrics` 已上线，必须接入）
 
-- 退出统计：`turn_allocations_created/expired/quota_rejected/port_exhausted`、`turn_bytes_relayed`。
-- 若 ops 的 metrics 已上线，接入同名指标；否则先只写退出统计（避免依赖未完成任务）。
+`src/ops.rs` 的 `Counters` 已提供 `/metrics`（见 `.trellis/spec/backend/ops.md`）。T1 必须接入以下指标（与退出统计同源）：
+
+| 指标 | 类型 | 标签 |
+| --- | --- | --- |
+| `rstun_turn_allocations` | gauge | —（当前活动分配数）|
+| `rstun_turn_bytes_total` | counter | `direction=in\|out` |
+| `rstun_turn_allocations_total` | counter | `result=created\|expired` |
+| `rstun_turn_rejected_total` | counter | `reason=quota\|ports\|family\|loopback` |
+
+- 退出统计仍需打印同一组数字（便于无 `/metrics` 的部署排查）；
+- 未开启 `--turn` 时这些指标**不出现**（与 ops 的「TURN 指标省略」约定一致）。
