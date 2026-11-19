@@ -1,13 +1,18 @@
-# `script/lab/` —— 互操作矩阵（可选夹具）
+# `script/lab/` —— 互操作 / 抗滥用矩阵（可选夹具）
 
 这里的脚本**不是 CI 门禁**：CI 只跑 `cargo test` + `script/ci/rstun-smoke.sh`（三平台）。
-本目录的价值是把「第三方实现能不能读我们的包、我们能不能读它们的包」固化成可重跑的夹具，
-下次改协议照着跑，任何一项从 ok 变 FAIL 就说明行为变了。
+本目录的价值是把两类「跑起来才知道」的结论固化成可重跑的夹具：
+
+- 互操作：第三方实现能不能读我们的包、我们能不能读它们的包；
+- 抗滥用：打开限速/反射防护之后**到底拦住了什么**（关/开对照、单源 vs 多源、28/40 字节反射）。
+
+任何一项从 ok 变 FAIL 就说明行为变了。
 
 | 文件 | 作用 |
 | --- | --- |
-| [`rstun-interop.sh`](./rstun-interop.sh) | 矩阵单入口：8 个项，可单项跑也可一次跑完 |
+| [`rstun-interop.sh`](./rstun-interop.sh) | 互操作矩阵单入口：8 个项，可单项跑也可一次跑完 |
 | [`rstun-interop-probe.py`](./rstun-interop-probe.py) | 只用 python3 标准库的协议探针（逐条 `ok:` / `FAIL:` 断言） |
+| [`rstun-abuse.sh`](./rstun-abuse.sh) | 抗滥用对照：关/开限速、单源洪水、28/40 字节反射尝试、allow/deny、TCP 洪水 |
 
 结论与原始证据摘录见 [`docs/interop-matrix.md`](../../docs/interop-matrix.md)。
 
@@ -22,6 +27,24 @@ bash script/lab/rstun-interop.sh full          # all + fuzz(600s) + ci
 ```
 
 单项：`probe` / `pion` / `webrtc-stun` / `coturn` / `stun-types` / `rfc5769` / `fuzz` / `ci`。
+
+抗滥用对照（自起自停、退出码可判定、每组一个日志）：
+
+```bash
+bash script/lab/rstun-abuse.sh               # 全部 10 组
+bash script/lab/rstun-abuse.sh --only reflect # 只跑一组
+#   组名：off | rate | global | reflect | reflect-strict | reflect-reject | allow | deny | inflight | tcp
+#   未知组名直接 exit 2（不会「0 组运行 + 全部通过」）
+bash script/lab/rstun-abuse.sh --port 34881 --no-build
+```
+
+它用 `127.0.0.0/8` 里的**不同源地址**模拟多源，**不需要 root / NET_RAW**，所以能验证
+「每 IP 桶按源地址分桶 / allow 放行 / deny 拒绝 / `--max-inflight` 真的丢包」；真实公网
+**伪造源**压测不在这里（那需要 raw socket），伪造源这条防线由 `--reflect-ratio` 的算术与
+反射组的实测字节断言覆盖。反射组会断言**真实字节数**（28 → 32 / 56、40 → 76）、
+与 `max(请求 × ratio, 请求 + 32)` 的关系、`SOFTWARE` 的有无，并检查拒绝时目标口收到 0 个包；
+`reflect-reject` 组专门跑一个**确实会被拒**的用例（`CHANGE-REQUEST` + `PADDING 8` → 88 > 80）。
+日志：`$RSTUN_ABUSE_DIR`（默认 `/tmp/opencode/rstun-abuse`）。
 
 常用参数：
 
@@ -40,6 +63,7 @@ bash script/lab/rstun-interop.sh full          # all + fuzz(600s) + ci
 | 项 | 需要 | 缺依赖时 |
 | --- | --- | --- |
 | `probe` / `stun-types` / `rfc5769` / `ci` | `cargo` + `python3` | — （`ci` 的 YAML 检查另需 PyYAML） |
+| `rstun-abuse` | `cargo` + `python3`（只用标准库） | — |
 | `pion` | `go`（夹具在 `test/interop/pion/`，`go mod tidy` 在临时目录跑） | SKIP |
 | `webrtc-stun` | `cargo`（夹具在 `test/interop/webrtc-stun/`） | SKIP |
 | `coturn` | `turnserver` + `turnutils_stunclient`（Debian: `apt-get install coturn`） | SKIP |
