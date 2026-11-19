@@ -25,7 +25,8 @@
 1. **单测**：状态机与端口池（时间注入，不碰网络）。
 2. **e2e（Rust）**：本仓内起 TURN + 两个 UDP socket 作为 client/peer，跑
    `Allocate → CreatePermission → Send → Data → ChannelBind → ChannelData` 全链路（不依赖外部工具）。
-3. **互操作（外部）**：`turnutils_uclient`（coturn 套件）对跑；可选 coturn 作为对照服务。
+3. **互操作（外部）**：`turnutils_uclient`（coturn 套件）对跑；**必须**另起本地 `turnserver` 作对照服务，
+   同一客户端参数分别对两者跑，比较 allocation 生命周期/权限/通道行为；差异必须判定（我方/对手/RFC 理解）。
 
 断言点（必须）：
 - allocation 过期后 `ss -lun` 无残留 relay 端口
@@ -40,7 +41,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 bash script/lab/rstun-interop.sh all       # STUN 侧不得回归（38 项）
-bash script/lab/rstun-turn.sh              # 新增验收
+bash script/lab/rstun-turn.sh              # 新增验收（含与本地 coturn 对跑）
 cargo tree -e normal --depth 1             # 不得新增依赖（T1 阶段）
 ```
 

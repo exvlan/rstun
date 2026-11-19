@@ -13,7 +13,8 @@
 ### R1 TLS / DTLS
 
 - `--turn-tls-listen <addr>`：TLS 监听（证书/私钥从 CLI 或文件读取）；仅 TLS 特性启用时编译。
-- `--turn-dtls-listen <addr>`（可选）：DTLS 监听。
+- **DTLS 不做**（决策，2026-11-19）：`rustls` 不支持 DTLS，引入 `webrtc-dtls`/OpenSSL 会显著改变依赖与安全面；
+  浏览器经 `turns:`（TCP+TLS）已可用。需求出现时单独立项。
 - 证书热加载不做；重启生效。
 - TLS 握手失败 / 证书不匹配必须记录可诊断日志（不含私钥内容）。
 

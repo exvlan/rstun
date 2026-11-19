@@ -1,1 +1,2 @@
-{"file": ".trellis/tasks/11-19-rstun-turn-udp/prd.md", "reason": "T2 直接建立在 T1 的 allocation/permission/channel 实现上"}
+{"file": ".trellis/tasks/11-19-rstun-turn-udp/design.md", "reason": "T2 直接复用 T1 的 allocation/permission/channel 状态机"}
+{"file": ".trellis/tasks/11-19-rstun-turn-udp/implement.md", "reason": "T1 的执行顺序与验收基线（含 coturn 对照）"}
