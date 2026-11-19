@@ -18,8 +18,10 @@
 //! `XOR-MAPPED-ADDRESS` (+ `SOFTWARE`, and the legacy `MAPPED-ADDRESS` with
 //! `--mapped-address`), `420 Unknown Attribute` + `UNKNOWN-ATTRIBUTES` when the
 //! request carries an attribute this server does not implement, `400 Bad
-//! Request` for any other method, ignore indications/responses. No TURN
-//! allocate/refresh/channel, no authentication.
+//! Request` for any other method, ignore indications/responses, and (with
+//! `--auth-user` / `--realm`) RFC 5389 §10 / RFC 8489 §9.2 authentication.
+//! No TURN allocate/refresh/channel; authentication is **optional** and off by
+//! default.
 //!
 //! With `--alt-listen` the server additionally speaks RFC 5780 (§5 behaviour
 //! discovery): responses carry `RESPONSE-ORIGIN` + `OTHER-ADDRESS`, and a
@@ -41,12 +43,13 @@
 
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     process::ExitCode,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use clap::{Parser, Subcommand};
@@ -56,6 +59,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
+mod auth;
 mod crc32;
 pub mod limit;
 pub mod protocol;
@@ -229,6 +233,39 @@ struct Args {
     /// CIDR whose sources are refused outright, repeatable; wins ties with --allow
     #[arg(long = "deny", value_name = "CIDR")]
     deny: Vec<limit::IpNet>,
+
+    /// short-term credential user name (RFC 5389 §10.1); needs --auth-pass.
+    /// Short-term only applies without --realm: the key is the password itself
+    #[arg(long, value_name = "USER")]
+    auth_user: Option<String>,
+
+    /// password of --auth-user (short-term) or of the single long-term user
+    #[arg(long, value_name = "PASS")]
+    auth_pass: Option<String>,
+
+    /// file with one `user:password` per line ('#' comments and blank lines
+    /// ignored); repeatable users for long-term, or several short-term users
+    #[arg(long, value_name = "PATH")]
+    auth_file: Option<PathBuf>,
+
+    /// long-term credential realm (RFC 5389 §10.2); turns on the 401/438 flow.
+    /// Needs --auth-secret and at least one user
+    #[arg(long, value_name = "REALM")]
+    realm: Option<String>,
+
+    /// secret that signs the stateless NONCE (any string; the same value on
+    /// every instance makes nonces interchangeable). Required with --realm
+    #[arg(long, value_name = "SECRET")]
+    auth_secret: Option<String>,
+
+    /// NONCE lifetime in seconds (default 3600); only meaningful with --realm
+    #[arg(long, value_name = "SECONDS")]
+    nonce_lifetime: Option<u64>,
+
+    /// long-term only: refuse PASSWORD-ALGORITHM=MD5 (401 unless the client
+    /// uses SHA256). Needs --realm
+    #[arg(long)]
+    auth_require_sha256: bool,
 }
 
 /// What an invalid `FINGERPRINT` gets (`--fingerprint-action`).
@@ -335,6 +372,10 @@ struct ServerContext {
     /// `--alternate-server`: answer every Binding request with `300 Try
     /// Alternate` + `ALTERNATE-SERVER` pointing here.
     alternate_server: Option<SocketAddr>,
+    /// Configured credentials; `None` (the default) means the authentication
+    /// attributes are ignored exactly as before (RFC 5389 §10.2.2 allows a
+    /// client to send them unprompted).
+    auth: Option<auth::Auth>,
 }
 
 impl ServerContext {
@@ -611,6 +652,75 @@ fn alternate_server(args: &Args) -> Option<SocketAddr> {
     args.alternate_server.first().copied()
 }
 
+/// Turn the credential flags into an [`auth::Auth`], or explain why they are
+/// unusable.
+///
+/// `Ok(None)` means "no credential configured": the caller then never builds an
+/// `Auth`, never parses an integrity attribute and never answers 401/438 — the
+/// default path stays byte-for-byte the pre-auth one. Every half-configured
+/// combination is a startup error: a server that *silently* ignores the
+/// credentials an operator wrote down is worse than one that refuses to start.
+fn build_auth(args: &Args) -> Result<Option<auth::Auth>, String> {
+    let mut users = match &args.auth_file {
+        Some(path) => auth::read_users(path)?,
+        None => Vec::new(),
+    };
+    match (&args.auth_user, &args.auth_pass) {
+        (Some(username), Some(password)) => users.push(auth::User {
+            username: username.clone(),
+            password: password.clone(),
+        }),
+        (Some(_), None) => return Err("--auth-user needs --auth-pass".to_string()),
+        (None, Some(_)) => return Err("--auth-pass needs --auth-user".to_string()),
+        (None, None) => {}
+    }
+    let nonce_lifetime = match args.nonce_lifetime {
+        Some(0) => return Err("--nonce-lifetime must be at least 1 second".to_string()),
+        Some(seconds) => Duration::from_secs(seconds),
+        None => Duration::from_secs(auth::DEFAULT_NONCE_LIFETIME),
+    };
+
+    match (&args.realm, &args.auth_secret) {
+        (Some(realm), Some(secret)) => {
+            if realm.is_empty() {
+                return Err("--realm must not be empty".to_string());
+            }
+            if secret.is_empty() {
+                return Err("--auth-secret must not be empty".to_string());
+            }
+            if users.is_empty() {
+                return Err(
+                    "--realm needs at least one user (--auth-user/--auth-pass or --auth-file)"
+                        .to_string(),
+                );
+            }
+            Ok(Some(auth::Auth::long_term(
+                realm.clone(),
+                secret.as_bytes().to_vec(),
+                users,
+                nonce_lifetime,
+                args.auth_require_sha256,
+            )))
+        }
+        (Some(_), None) => Err("--realm needs --auth-secret (it signs the NONCE)".to_string()),
+        (None, Some(_)) => Err("--auth-secret only makes sense together with --realm".to_string()),
+        (None, None) => {
+            if args.auth_require_sha256 {
+                return Err(
+                    "--auth-require-sha256 needs --realm (it is a long-term concept)".to_string(),
+                );
+            }
+            if args.nonce_lifetime.is_some() {
+                return Err("--nonce-lifetime needs --realm".to_string());
+            }
+            if users.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(auth::Auth::short_term(users)))
+        }
+    }
+}
+
 /// Run the STUN Binding server until Ctrl-C (Unix: also SIGTERM).
 async fn run(args: Args) -> ExitCode {
     let (addresses, plan) = match resolve_listen(&args) {
@@ -660,6 +770,14 @@ async fn run(args: Args) -> ExitCode {
             "rstun: only the first --alternate-server is used"
         );
     }
+    // 鉴权同样「不给凭据就不改任何字节」：`None` 时下面的路径与 26.410.100 一致。
+    let auth = match build_auth(&args) {
+        Ok(auth) => auth,
+        Err(message) => {
+            tracing::error!(%message, "rstun: invalid authentication configuration");
+            return ExitCode::FAILURE;
+        }
+    };
     // Every listener shares one view of the bound sockets: that is what makes
     // `CHANGE-REQUEST` able to answer from a different one.
     let context = Arc::new(ServerContext {
@@ -669,6 +787,7 @@ async fn run(args: Args) -> ExitCode {
         admission: admission.clone(),
         fingerprint,
         alternate_server,
+        auth,
     });
     let mut tasks = Vec::new();
 
@@ -724,6 +843,24 @@ async fn run(args: Args) -> ExitCode {
     if let Some(server) = alternate_server {
         tracing::info!(%server, "rstun: answering with 300 Try Alternate (--alternate-server)");
     }
+    if let Some(auth) = &context.auth {
+        tracing::info!(
+            mode = ?auth.mode(),
+            realm = auth.realm(),
+            users = auth.user_count(),
+            require_sha256 = auth.require_sha256(),
+            "rstun: authentication enabled"
+        );
+        // A 401 is the biggest answer this server emits per request: for a
+        // 28-byte probe it is ~3.4-5.0x. Rate limiting is the documented
+        // mitigation, so say it out loud when it is missing.
+        if admission.is_none() {
+            tracing::warn!(
+                "rstun: authentication without --rate-limit/--reflect-ratio: a 401 can amplify a \
+                 small request by 3-5x; enable the abuse guard in production"
+            );
+        }
+    }
     tracing::info!(
         software = %software,
         listeners = tasks.len(),
@@ -763,6 +900,16 @@ async fn run(args: Args) -> ExitCode {
         fingerprint_rejected = stats.fingerprint_rejected(),
         "rstun: stopped"
     );
+    if let Some(auth) = &context.auth {
+        let (authenticated, unauthorized, stale_nonce, bad_request) = auth.counters().snapshot();
+        tracing::info!(
+            authenticated,
+            unauthorized,
+            stale_nonce,
+            bad_request,
+            "rstun: authentication counters"
+        );
+    }
     exit_code
 }
 
@@ -844,6 +991,21 @@ fn answer_software<'a>(
     ""
 }
 
+/// Seal an answer with the request's integrity key(s), if the request was
+/// authenticated (RFC 5389 §10.2.2: "the response MUST contain a
+/// MESSAGE-INTEGRITY attribute").
+///
+/// `None` is the unauthenticated path — and the byte-frozen default — so the
+/// helper is a no-op there. The one answer this cannot cover is `500`: it is
+/// built where the failure happens (`respond_to_datagram`), below `decide`, so
+/// no identity is available (README documents that).
+fn seal_answer(bytes: Vec<u8>, identity: Option<&auth::Identity>) -> Vec<u8> {
+    match identity {
+        Some(identity) => auth::seal(bytes, identity),
+        None => bytes,
+    }
+}
+
 /// Resolve one message into a response, or explain why it is ignored.
 ///
 /// `local` is the address of the socket / connection the message arrived on.
@@ -896,6 +1058,56 @@ fn decide(
         )));
     }
 
+    // RFC 5389 §10: authentication, when configured, comes here — after the
+    // redirect (a client that must move to another server does not need
+    // credentials for this one) and after FINGERPRINT (checked in
+    // [`decide_guarded`]: message integrity before credential integrity), but
+    // before every other attribute check, so an unauthenticated client cannot
+    // probe the 420/400 branches.
+    //
+    // The rate-limit buckets have already run in the caller (`admit` /
+    // `check_rates`), which is what keeps a 401 flood inside the guard: the
+    // answer may be bigger than the request, but not more frequent.
+    let identity = match &context.auth {
+        None => None,
+        Some(auth) => {
+            // One clock read per request: the challenge/438 nonce must be issued
+            // against the same instant that judged the request's own nonce.
+            let now = SystemTime::now();
+            // `HEADER_LEN + body.len()` is the declared frame: a UDP datagram
+            // may carry trailing junk, and the MAC covers only the frame.
+            let frame = &datagram[..protocol::HEADER_LEN + message.body.len()];
+            let outcome = auth.verify(frame, &message, peer.ip(), now);
+            auth.count(&outcome);
+            match outcome {
+                Ok(identity) => {
+                    tracing::debug!(
+                        %peer,
+                        transaction_id = %message.transaction_id,
+                        username = %identity.username,
+                        "rstun: authenticated"
+                    );
+                    Some(identity)
+                }
+                Err(rejection) => {
+                    tracing::debug!(
+                        %peer,
+                        transaction_id = %message.transaction_id,
+                        ?rejection,
+                        "rstun: authentication rejected"
+                    );
+                    return Ok(Decision::Respond(auth.rejection_response(
+                        rejection,
+                        &message.transaction_id,
+                        BINDING_METHOD,
+                        peer.ip(),
+                        now,
+                    )));
+                }
+            }
+        }
+    };
+
     // RFC 5389 §7.3.1: a request carrying an attribute we do not implement must
     // be *rejected* with 420, not answered partially — a client that sends an
     // extension we ignore cannot tell "unsupported" from "malformed answer".
@@ -908,10 +1120,13 @@ fn decide(
             ?unknown,
             "rstun: unknown comprehension-required attributes"
         );
-        return Ok(Decision::Respond(protocol::unknown_attributes_response(
-            &message.transaction_id,
-            BINDING_METHOD,
-            &unknown,
+        return Ok(Decision::Respond(seal_answer(
+            protocol::unknown_attributes_response(
+                &message.transaction_id,
+                BINDING_METHOD,
+                &unknown,
+            ),
+            identity.as_ref(),
         )));
     }
 
@@ -934,11 +1149,14 @@ fn decide(
             transaction_id = %message.transaction_id,
             "rstun: PADDING together with RESPONSE-PORT (RFC 5780 §6)"
         );
-        return Ok(Decision::Respond(protocol::error_response(
-            &message.transaction_id,
-            BINDING_METHOD,
-            protocol::ERROR_BAD_REQUEST,
-            "Bad Request",
+        return Ok(Decision::Respond(seal_answer(
+            protocol::error_response(
+                &message.transaction_id,
+                BINDING_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+            ),
+            identity.as_ref(),
         )));
     }
 
@@ -968,6 +1186,11 @@ fn decide(
         mapped_address: context.mapped_address,
         padding,
     });
+    // RFC 5389 §10.2.2 / RFC 8489 §9.2.4: *every* answer to an authenticated
+    // request (200 / 420 / 400) carries the integrity attribute(s) the request
+    // used. Added *after* the frozen default shape, so an unauthenticated
+    // deployment emits exactly the pre-auth bytes.
+    let bytes = seal_answer(bytes, identity.as_ref());
     if from == local && to == peer {
         Ok(Decision::Respond(bytes))
     } else {
@@ -1044,7 +1267,7 @@ fn decide_guarded(
         .admission
         .as_ref()
         .and_then(|admission| admission.policy().reflect);
-    if context.fingerprint.is_none() && reflect.is_none() {
+    if context.fingerprint.is_none() && reflect.is_none() && context.auth.is_none() {
         return decide(datagram, peer, local, transport, context, software);
     }
     let message = protocol::parse(datagram)?;
@@ -1215,7 +1438,7 @@ fn reflect_guard(
             inbound.transport,
             context,
         );
-        protocol::binding_success_response(&protocol::SuccessResponse {
+        let sealed = protocol::binding_success_response(&protocol::SuccessResponse {
             transaction_id: &message.transaction_id,
             peer: inbound.peer,
             software: answer_software(
@@ -1228,8 +1451,24 @@ fn reflect_guard(
             addresses,
             mapped_address: context.mapped_address,
             padding,
-        })
-        .len()
+        });
+        // With authentication on, this request's answer is *not* necessarily the
+        // success response: an unauthenticated one gets a 401 (or a 438),
+        // which is much bigger than a 50-byte success. The guard cannot know
+        // whether the credentials verify without doing the whole check twice, so
+        // it takes the **largest** of the two candidates — an upper bound, never
+        // an underestimate (abuse-guard spec §5: estimate and actual must be the
+        // same message, or every ratio boundary can be walked past).
+        let success = sealed.len()
+            + if context.auth.is_some() {
+                auth::integrity_overhead(message)
+            } else {
+                0
+            };
+        match &context.auth {
+            Some(auth) => success.max(auth.challenge_len()),
+            None => success,
+        }
     };
     if !policy.allows_response(inbound.datagram.len(), estimated) {
         return Some(reflection_refusal(
@@ -1863,6 +2102,7 @@ mod tests {
             admission: None,
             fingerprint: None,
             alternate_server: None,
+            auth: None,
         });
         tokio::spawn(serve_udp(
             socket.clone(),
@@ -1902,6 +2142,7 @@ mod tests {
             })
             .collect(),
             mapped_address: false,
+            auth: None,
         }
     }
 
@@ -1952,6 +2193,7 @@ mod tests {
                 admission: None,
                 fingerprint: None,
                 alternate_server: None,
+                auth: None,
             });
             let stats = Arc::new(ServerStats::default());
             for (local, socket) in sockets {
@@ -2071,6 +2313,7 @@ mod tests {
             admission: None,
             fingerprint: None,
             alternate_server: None,
+            auth: None,
         });
         tokio::spawn(serve_tcp(
             listener,
@@ -2374,6 +2617,7 @@ mod tests {
             admission: None,
             fingerprint: None,
             alternate_server: None,
+            auth: None,
         });
         let stats = Arc::new(ServerStats::default());
         for (_, socket) in bound.udp {
@@ -2984,6 +3228,7 @@ mod tests {
                 admission: None,
                 fingerprint: None,
                 alternate_server: None,
+                auth: None,
             };
             match decide(
                 &request,
@@ -3424,6 +3669,7 @@ mod tests {
             admission: Some(limit::Admission::new(policy).expect("policy must build")),
             fingerprint: None,
             alternate_server: None,
+            auth: None,
         }
     }
 
@@ -3991,6 +4237,7 @@ mod tests {
             admission: Some(admission.clone()),
             fingerprint: None,
             alternate_server: None,
+            auth: None,
         });
         let stats = Arc::new(ServerStats::default());
         tokio::spawn(serve_udp(
@@ -4061,6 +4308,7 @@ mod tests {
             admission: Some(admission.clone()),
             fingerprint: None,
             alternate_server: None,
+            auth: None,
         });
         let stats = Arc::new(ServerStats::default());
         tokio::spawn(serve_udp(
@@ -4123,6 +4371,7 @@ mod tests {
             ),
             fingerprint: None,
             alternate_server: None,
+            auth: None,
         });
         let stats = Arc::new(ServerStats::default());
         tokio::spawn(serve_udp(
@@ -4729,5 +4978,1041 @@ mod tests {
         };
         let error = resolve_listen(&args).unwrap_err();
         assert!(error.contains("--alt-listen"), "{error}");
+    }
+
+    // ----- authentication (RFC 5389 §10 / RFC 8489 §9.2) -----
+
+    /// A long-term context with one user `user:pass` in realm `example.org`.
+    fn long_term_auth(require_sha256: bool) -> auth::Auth {
+        auth::Auth::long_term(
+            "example.org".to_string(),
+            b"nonce-secret".to_vec(),
+            vec![auth::User {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            }],
+            Duration::from_secs(auth::DEFAULT_NONCE_LIFETIME),
+            require_sha256,
+        )
+    }
+
+    fn with_auth(auth: auth::Auth) -> ServerContext {
+        ServerContext {
+            auth: Some(auth),
+            ..ServerContext::default()
+        }
+    }
+
+    /// `(code, attributes)` of an error response, decoded once.
+    fn error_attribute_types(response: &[u8]) -> (u16, Vec<u16>) {
+        let message = protocol::parse(response).expect("error response must parse");
+        let code = protocol::attributes(message.body)
+            .find(|attribute| attribute.attr_type == protocol::ATTR_ERROR_CODE)
+            .map(|attribute| u16::from(attribute.value[2]) * 100 + u16::from(attribute.value[3]))
+            .expect("ERROR-CODE");
+        let types = protocol::attributes(message.body)
+            .map(|attribute| attribute.attr_type)
+            .collect();
+        (code, types)
+    }
+
+    fn nonce_of(response: &[u8]) -> String {
+        let message = protocol::parse(response).expect("error response must parse");
+        let nonce = protocol::attributes(message.body)
+            .find(|attribute| attribute.attr_type == protocol::ATTR_NONCE)
+            .expect("NONCE")
+            .value;
+        std::str::from_utf8(nonce).unwrap().to_string()
+    }
+
+    /// A Binding request carrying `attributes`, sealed with `algorithm` — the
+    /// same construction a real client performs (body → header length that
+    /// includes the integrity attribute → MAC).
+    fn authenticated_request(
+        transaction_id: [u8; 12],
+        attributes: &[(u16, &[u8])],
+        identity: &auth::Identity,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (attr_type, value) in attributes {
+            let padding = (4 - value.len() % 4) % 4;
+            body.extend_from_slice(&attr_type.to_be_bytes());
+            body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            body.extend_from_slice(value);
+            body.extend(std::iter::repeat_n(0_u8, padding));
+        }
+        let mut frame = Vec::with_capacity(HEADER_LEN + body.len());
+        frame.extend_from_slice(&protocol::BINDING_REQUEST.to_be_bytes());
+        frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        frame.extend_from_slice(&transaction_id);
+        frame.extend_from_slice(&body);
+        auth::seal(frame, identity)
+    }
+
+    fn long_term_identity(
+        username: &str,
+        password: &str,
+        algorithm: auth::KeyAlgorithm,
+    ) -> auth::Identity {
+        auth::Identity {
+            username: username.to_string(),
+            keys: vec![(
+                algorithm,
+                auth::long_term_key(algorithm, username, "example.org", password),
+            )],
+        }
+    }
+
+    #[test]
+    fn auth_off_keeps_the_integrity_cluster_ignored() {
+        // RFC 5389 §10.2.2: a client may send the authentication attributes
+        // unprompted. Without configured credentials they must change nothing.
+        let mut request = binding_request(TEST_TRANSACTION);
+        let attributes: &[(u16, &[u8])] = &[
+            (protocol::ATTR_USERNAME, b"user"),
+            (protocol::ATTR_REALM, b"example.org"),
+            (protocol::ATTR_NONCE, b"not a nonce"),
+            (protocol::ATTR_MESSAGE_INTEGRITY, &[0xaa; 20]),
+        ];
+        let mut body = Vec::new();
+        for (attr_type, value) in attributes {
+            body.extend_from_slice(&attr_type.to_be_bytes());
+            body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            body.extend_from_slice(value);
+            body.extend(std::iter::repeat_n(0_u8, (4 - value.len() % 4) % 4));
+        }
+        request[2..4].copy_from_slice(&(body.len() as u16).to_be_bytes());
+        request.extend_from_slice(&body);
+
+        let response = success_bytes(
+            decide(
+                &request,
+                "198.51.100.9:5000".parse().unwrap(),
+                "127.0.0.1:3478".parse().unwrap(),
+                Transport::Udp,
+                &ServerContext::default(),
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_binding_success(
+            &response,
+            TEST_TRANSACTION,
+            "198.51.100.9:5000".parse().unwrap(),
+        );
+    }
+
+    #[test]
+    fn long_term_401_carries_realm_nonce_and_algorithms_then_the_answer_is_signed() {
+        let context = with_auth(long_term_auth(false));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let request = binding_request(TEST_TRANSACTION);
+
+        let challenge = success_bytes(
+            decide(
+                &request,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        let (code, types) = error_attribute_types(&challenge);
+        assert_eq!(code, 401);
+        for expected in [
+            protocol::ATTR_REALM,
+            protocol::ATTR_NONCE,
+            auth::ATTR_PASSWORD_ALGORITHMS,
+        ] {
+            assert!(types.contains(&expected), "401 must carry 0x{expected:04x}");
+        }
+        // Not an answer about the peer: a challenge carries no mapped address.
+        assert!(!types.contains(&ATTR_XOR_MAPPED_ADDRESS));
+
+        // The client retries with USERNAME / REALM / the nonce we just issued
+        // and a MAC; the answer is a success sealed with the same key.
+        let nonce = nonce_of(&challenge);
+        let identity = long_term_identity("user", "pass", auth::KeyAlgorithm::Md5);
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ],
+            &identity,
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_binding_success(&response, TEST_TRANSACTION, peer);
+        let message = protocol::parse(&response).unwrap();
+        let mac = protocol::attributes(message.body)
+            .find(|attribute| attribute.attr_type == protocol::ATTR_MESSAGE_INTEGRITY)
+            .expect("a success answer to a signed request is signed");
+        assert!(auth::verify_integrity(
+            &response,
+            &identity.keys[0].1,
+            auth::KeyAlgorithm::Md5
+        ));
+        assert_eq!(mac.value.len(), 20);
+        // The signature is the only difference from the unsigned answer.
+        let plain = success_bytes(
+            decide(
+                &binding_request(TEST_TRANSACTION),
+                peer,
+                local,
+                Transport::Udp,
+                &ServerContext::default(),
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(response.len(), plain.len() + 24);
+    }
+
+    #[test]
+    fn wrong_password_gets_401() {
+        let context = with_auth(long_term_auth(false));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let challenge = success_bytes(
+            decide(
+                &binding_request(TEST_TRANSACTION),
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        let nonce = nonce_of(&challenge);
+        let identity = long_term_identity("user", "wrong", auth::KeyAlgorithm::Md5);
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ],
+            &identity,
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(error_attribute_types(&response).0, 401);
+        // Unknown user and a mismatching realm are 401 too, never a 420/400.
+        let unknown = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"nobody"),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ],
+            &long_term_identity("nobody", "pass", auth::KeyAlgorithm::Md5),
+        );
+        let response = success_bytes(
+            decide(
+                &unknown,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(error_attribute_types(&response).0, 401);
+        let other_realm = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"other.example"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ],
+            &long_term_identity("user", "pass", auth::KeyAlgorithm::Md5),
+        );
+        let response = success_bytes(
+            decide(
+                &other_realm,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(error_attribute_types(&response).0, 401);
+    }
+
+    #[test]
+    fn expired_nonce_gets_438_with_a_fresh_nonce() {
+        // A lifetime of 0 seconds is rejected by `build_auth`, but the `Auth`
+        // itself accepts it: the nonce is then already expired on arrival.
+        let context = with_auth(auth::Auth::long_term(
+            "example.org".to_string(),
+            b"nonce-secret".to_vec(),
+            vec![auth::User {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            }],
+            Duration::from_secs(0),
+            false,
+        ));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let nonce = context
+            .auth
+            .as_ref()
+            .unwrap()
+            .issue_nonce(peer.ip(), SystemTime::now());
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ],
+            &long_term_identity("user", "pass", auth::KeyAlgorithm::Md5),
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        let (code, types) = error_attribute_types(&response);
+        assert_eq!(code, 438);
+        assert!(types.contains(&protocol::ATTR_NONCE));
+        assert!(types.contains(&protocol::ATTR_REALM));
+        // RFC 8489 §9.2.4: 438 carries PASSWORD-ALGORITHMS too.
+        assert!(types.contains(&auth::ATTR_PASSWORD_ALGORITHMS));
+        // A forged (not ours) nonce is a 401: 438 would tell the client to
+        // refresh, which is only true for a nonce we signed.
+        let forged = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, b"f//499k954d6OL34oL9FSTvy64sA"),
+            ],
+            &long_term_identity("user", "pass", auth::KeyAlgorithm::Md5),
+        );
+        let response = success_bytes(
+            decide(
+                &forged,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(error_attribute_types(&response).0, 401);
+    }
+
+    #[test]
+    fn missing_long_term_attributes_are_400_while_wrong_values_are_401() {
+        // RFC 5389 §10.2.2 / RFC 8489 §9.2.4 split: an *incomplete* message is a
+        // bad request; only a present-but-wrong value is a failed authentication.
+        let context = with_auth(long_term_auth(false));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let nonce = context
+            .auth
+            .as_ref()
+            .unwrap()
+            .issue_nonce(peer.ip(), SystemTime::now());
+        let identity = long_term_identity("user", "pass", auth::KeyAlgorithm::Md5);
+        let code_of = |attributes: &[(u16, &[u8])]| {
+            let request = authenticated_request(TEST_TRANSACTION, attributes, &identity);
+            let response = success_bytes(
+                decide(
+                    &request,
+                    peer,
+                    local,
+                    Transport::Udp,
+                    &context,
+                    TEST_SOFTWARE,
+                )
+                .unwrap(),
+            );
+            error_attribute_types(&response).0
+        };
+
+        // Missing NONCE: the pair USERNAME + REALM is not enough.
+        assert_eq!(
+            code_of(&[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"example.org"),
+            ]),
+            400
+        );
+        // Missing REALM.
+        assert_eq!(
+            code_of(&[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ]),
+            400
+        );
+        // Missing both USERNAME and USERHASH (an empty identity is not a user).
+        assert_eq!(
+            code_of(&[
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ]),
+            400
+        );
+        // Wrong *value* of the realm: 401, not 400 — every attribute is there.
+        assert_eq!(
+            code_of(&[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"other.example"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ]),
+            401
+        );
+        // Sanity: the complete message authenticates.
+        assert_binding_success(
+            &success_bytes(
+                decide(
+                    &authenticated_request(
+                        TEST_TRANSACTION,
+                        &[
+                            (protocol::ATTR_USERNAME, b"user"),
+                            (protocol::ATTR_REALM, b"example.org"),
+                            (protocol::ATTR_NONCE, nonce.as_bytes()),
+                        ],
+                        &identity,
+                    ),
+                    peer,
+                    local,
+                    Transport::Udp,
+                    &context,
+                    TEST_SOFTWARE,
+                )
+                .unwrap(),
+            ),
+            TEST_TRANSACTION,
+            peer,
+        );
+    }
+
+    #[test]
+    fn auth_makes_the_reflection_estimate_cover_the_401() {
+        // M1: a 28-byte RESPONSE-PORT probe under ratio 2.0 allows 60 bytes.
+        // Without `--realm` the guard predicts the 56-byte success (SOFTWARE
+        // omitted, MI added) and would answer; with authentication on the
+        // actual answer to *this* (credential-less) request is the 96-byte 401,
+        // so the estimate must be the challenge, not the success.
+        let context = ServerContext {
+            auth: Some(long_term_auth(false)),
+            ..guarded_context(reflect_policy(20, limit::DEFAULT_REFLECT_RATIO))
+        };
+        let request = minimal_response_port_request(TEST_TRANSACTION, 23480);
+        match guarded(
+            &request,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &context,
+        ) {
+            Decision::Respond(bytes) => {
+                assert_eq!(
+                    error_details(&bytes).0,
+                    400,
+                    "96 > allowed(28) = 60 → refuse with a 40-byte 400"
+                );
+                assert_eq!(bytes.len(), 40);
+            }
+            other => panic!("expected a 400 refusal, got {other:?}"),
+        }
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 1);
+    }
+
+    #[test]
+    fn authenticated_420_and_400_are_signed() {
+        // RFC 5389 §10.2.2: an authenticated request gets a signed answer even
+        // when the answer is an error (420 / 400); only 500 is out of reach.
+        let context = with_auth(long_term_auth(false));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let nonce = context
+            .auth
+            .as_ref()
+            .unwrap()
+            .issue_nonce(peer.ip(), SystemTime::now());
+        let identity = long_term_identity("user", "pass", auth::KeyAlgorithm::Md5);
+        let key = identity.keys[0].1.clone();
+
+        let answer = |extra: &[(u16, &[u8])]| {
+            let mut attributes = vec![
+                (protocol::ATTR_USERNAME, b"user".as_slice()),
+                (protocol::ATTR_REALM, b"example.org".as_slice()),
+                (protocol::ATTR_NONCE, nonce.as_bytes() as &[u8]),
+            ];
+            attributes.extend_from_slice(extra);
+            let request = authenticated_request(TEST_TRANSACTION, &attributes, &identity);
+            success_bytes(
+                decide(
+                    &request,
+                    peer,
+                    local,
+                    Transport::Udp,
+                    &context,
+                    TEST_SOFTWARE,
+                )
+                .unwrap(),
+            )
+        };
+
+        // 420: an unknown comprehension-required attribute, authenticated.
+        let response = answer(&[(0x7f01, b"\xde\xad")]);
+        assert_eq!(error_attribute_types(&response).0, 420);
+        assert!(
+            auth::verify_integrity(&response, &key, auth::KeyAlgorithm::Md5),
+            "the 420 must be signed with the request's key"
+        );
+
+        // 400: PADDING together with RESPONSE-PORT, authenticated.
+        let response = answer(&[
+            (protocol::ATTR_PADDING, b"\x00\x00\x00\x00"),
+            (protocol::ATTR_RESPONSE_PORT, b"\x00\x50"),
+        ]);
+        assert_eq!(error_attribute_types(&response).0, 400);
+        assert!(
+            auth::verify_integrity(&response, &key, auth::KeyAlgorithm::Md5),
+            "the 400 must be signed with the request's key"
+        );
+    }
+
+    #[test]
+    fn sha256_algorithm_and_userhash_authenticate() {
+        let context = with_auth(long_term_auth(false));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let nonce = context
+            .auth
+            .as_ref()
+            .unwrap()
+            .issue_nonce(peer.ip(), SystemTime::now());
+
+        // 1) PASSWORD-ALGORITHM=SHA256 + MESSAGE-INTEGRITY-SHA256.
+        let identity = long_term_identity("user", "pass", auth::KeyAlgorithm::Sha256);
+        let mut algorithm = Vec::new();
+        algorithm.extend_from_slice(&auth::PASSWORD_ALGORITHM_SHA256.to_be_bytes());
+        algorithm.extend_from_slice(&0_u16.to_be_bytes());
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+                (protocol::ATTR_PASSWORD_ALGORITHM, &algorithm),
+            ],
+            &identity,
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_binding_success(&response, TEST_TRANSACTION, peer);
+        assert!(auth::verify_integrity(
+            &response,
+            &identity.keys[0].1,
+            auth::KeyAlgorithm::Sha256
+        ));
+
+        // 2) USERHASH instead of USERNAME (RFC 8489 §14.4) — same key, no
+        //    USERNAME on the wire at all. The value is the **whole** 32-byte
+        //    digest; this is the case a 16-byte prefix used to get wrong.
+        let hash = auth::userhash("user", "example.org");
+        assert_eq!(hash.len(), 32);
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERHASH, &hash),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+                (protocol::ATTR_PASSWORD_ALGORITHM, &algorithm),
+            ],
+            &identity,
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_binding_success(&response, TEST_TRANSACTION, peer);
+
+        // 3) A 16-byte USERHASH is *not* USERHASH (RFC 8489 §14.4 fixes it at
+        //    32 bytes): 401, and never a truncated-prefix match.
+        let short_hash: [u8; 16] = hash[..16].try_into().expect("first 16 bytes");
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERHASH, &short_hash),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+                (protocol::ATTR_PASSWORD_ALGORITHM, &algorithm),
+            ],
+            &identity,
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(error_attribute_types(&response).0, 401);
+
+        // 4) An unknown (but correctly sized) USERHASH is a 401, not a panic
+        //    and not a 420.
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERHASH, &[0_u8; 32]),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+                (protocol::ATTR_PASSWORD_ALGORITHM, &algorithm),
+            ],
+            &identity,
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(error_attribute_types(&response).0, 401);
+    }
+
+    #[test]
+    fn require_sha256_rejects_md5_credentials() {
+        let context = with_auth(long_term_auth(true));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let nonce = context
+            .auth
+            .as_ref()
+            .unwrap()
+            .issue_nonce(peer.ip(), SystemTime::now());
+
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ],
+            &long_term_identity("user", "pass", auth::KeyAlgorithm::Md5),
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        let (code, _) = error_attribute_types(&response);
+        assert_eq!(code, 401);
+
+        // The 401 advertises SHA256 only, so a client can renegotiate.
+        let challenge = success_bytes(
+            decide(
+                &binding_request(TEST_TRANSACTION),
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        let message = protocol::parse(&challenge).unwrap();
+        let algorithms = protocol::attributes(message.body)
+            .find(|attribute| attribute.attr_type == auth::ATTR_PASSWORD_ALGORITHMS)
+            .expect("PASSWORD-ALGORITHMS")
+            .value
+            .to_vec();
+        assert_eq!(algorithms, vec![0, 2, 0, 0]);
+
+        // SHA256 still authenticates under the same switch.
+        let identity = long_term_identity("user", "pass", auth::KeyAlgorithm::Sha256);
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ],
+            &identity,
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_binding_success(&response, TEST_TRANSACTION, peer);
+    }
+
+    #[test]
+    fn short_term_answers_400_without_credentials_and_401_for_a_bad_password() {
+        let context = with_auth(auth::Auth::short_term(vec![auth::User {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        }]));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+
+        // RFC 5389 §10.1.2: a short-term request without both USERNAME and
+        // MESSAGE-INTEGRITY is a *bad request*.
+        let response = success_bytes(
+            decide(
+                &binding_request(TEST_TRANSACTION),
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(error_attribute_types(&response).0, 400);
+        // A bare `--auth-user`-style 401 has no realm/nonce to offer.
+        let identity = auth::Identity {
+            username: "user".to_string(),
+            keys: vec![(auth::KeyAlgorithm::Md5, b"wrong".to_vec())],
+        };
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[(protocol::ATTR_USERNAME, b"user")],
+            &identity,
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        let (code, types) = error_attribute_types(&response);
+        assert_eq!(code, 401);
+        assert!(!types.contains(&protocol::ATTR_NONCE));
+
+        // The short-term key is the password itself (RFC 5389 §15.4).
+        let identity = auth::Identity {
+            username: "user".to_string(),
+            keys: vec![(auth::KeyAlgorithm::Md5, b"pass".to_vec())],
+        };
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[(protocol::ATTR_USERNAME, b"user")],
+            &identity,
+        );
+        let response = success_bytes(
+            decide(
+                &signed,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_binding_success(&response, TEST_TRANSACTION, peer);
+    }
+
+    #[test]
+    fn redirect_wins_over_authentication() {
+        // Design §5: 300 comes before credentials — a redirect needs none.
+        let context = ServerContext {
+            alternate_server: Some("192.0.2.9:3478".parse().unwrap()),
+            ..with_auth(long_term_auth(false))
+        };
+        let response = success_bytes(
+            decide(
+                &binding_request(TEST_TRANSACTION),
+                "198.51.100.9:5000".parse().unwrap(),
+                "127.0.0.1:3478".parse().unwrap(),
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(error_attribute_types(&response).0, 300);
+    }
+
+    #[test]
+    fn authentication_comes_before_the_420_branch() {
+        // An unauthenticated request must not learn which attributes this server
+        // knows: the 401 wins over the 420, the 420 still wins once signed.
+        let context = with_auth(long_term_auth(false));
+        let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let mut request = binding_request(TEST_TRANSACTION);
+        request[2..4].copy_from_slice(&4_u16.to_be_bytes());
+        request.extend_from_slice(&0x7f01_u16.to_be_bytes());
+        request.extend_from_slice(&0_u16.to_be_bytes());
+        let response = success_bytes(
+            decide(
+                &request,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                TEST_SOFTWARE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(error_attribute_types(&response).0, 401);
+    }
+
+    #[test]
+    fn invalid_authentication_configurations_fail_startup() {
+        // Each of these would otherwise be a silent no-op: refuse to start.
+        let cases: [(&str, Args); 8] = [
+            (
+                "--auth-user needs --auth-pass",
+                Args {
+                    auth_user: Some("user".to_string()),
+                    ..Args::default()
+                },
+            ),
+            (
+                "--auth-pass needs --auth-user",
+                Args {
+                    auth_pass: Some("pass".to_string()),
+                    ..Args::default()
+                },
+            ),
+            (
+                "--realm needs --auth-secret",
+                Args {
+                    realm: Some("example.org".to_string()),
+                    auth_user: Some("user".to_string()),
+                    auth_pass: Some("pass".to_string()),
+                    ..Args::default()
+                },
+            ),
+            (
+                "--auth-secret only makes sense",
+                Args {
+                    auth_secret: Some("secret".to_string()),
+                    auth_user: Some("user".to_string()),
+                    auth_pass: Some("pass".to_string()),
+                    ..Args::default()
+                },
+            ),
+            (
+                "--realm needs at least one user",
+                Args {
+                    realm: Some("example.org".to_string()),
+                    auth_secret: Some("secret".to_string()),
+                    ..Args::default()
+                },
+            ),
+            (
+                "--nonce-lifetime must be at least 1 second",
+                Args {
+                    realm: Some("example.org".to_string()),
+                    auth_secret: Some("secret".to_string()),
+                    auth_user: Some("user".to_string()),
+                    auth_pass: Some("pass".to_string()),
+                    nonce_lifetime: Some(0),
+                    ..Args::default()
+                },
+            ),
+            (
+                "--nonce-lifetime needs --realm",
+                Args {
+                    auth_user: Some("user".to_string()),
+                    auth_pass: Some("pass".to_string()),
+                    nonce_lifetime: Some(60),
+                    ..Args::default()
+                },
+            ),
+            (
+                "--auth-require-sha256 needs --realm",
+                Args {
+                    auth_user: Some("user".to_string()),
+                    auth_pass: Some("pass".to_string()),
+                    auth_require_sha256: true,
+                    ..Args::default()
+                },
+            ),
+        ];
+        for (expected, args) in cases {
+            let error = build_auth(&args).unwrap_err();
+            assert!(error.contains(expected), "{error} != {expected}");
+        }
+        // And the good configurations build the mechanism they name.
+        assert!(build_auth(&Args::default()).unwrap().is_none());
+        let short = build_auth(&Args {
+            auth_user: Some("user".to_string()),
+            auth_pass: Some("pass".to_string()),
+            ..Args::default()
+        })
+        .unwrap()
+        .expect("short-term");
+        assert_eq!(short.mode(), auth::Mode::ShortTerm);
+        let long = build_auth(&Args {
+            realm: Some("example.org".to_string()),
+            auth_secret: Some("secret".to_string()),
+            auth_user: Some("user".to_string()),
+            auth_pass: Some("pass".to_string()),
+            nonce_lifetime: Some(60),
+            auth_require_sha256: true,
+            ..Args::default()
+        })
+        .unwrap()
+        .expect("long-term");
+        assert_eq!(long.mode(), auth::Mode::LongTerm);
+        assert!(long.require_sha256());
+    }
+
+    #[tokio::test]
+    async fn a_401_flood_is_still_rate_limited() {
+        // 401 is the largest answer this server emits for a small request, so it
+        // must be the *admission* that bounds it, not the answer's shape: the
+        // permit is taken before `decide` ever looks at the credentials.
+        let admission = limit::Admission::new(limit::Policy {
+            per_ip: Some(limit::Rate::new(1.0, 3.0)),
+            ..limit::Policy::default()
+        })
+        .unwrap();
+        let socket = Arc::new(udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
+        let address = socket.local_addr().unwrap();
+        let context = Arc::new(ServerContext {
+            udp: vec![(address, socket.clone())],
+            admission: Some(admission.clone()),
+            ..with_auth(long_term_auth(false))
+        });
+        tokio::spawn(serve_udp(
+            socket,
+            context,
+            Arc::from(TEST_SOFTWARE),
+            Arc::new(ServerStats::default()),
+        ));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for _ in 0..20 {
+            client
+                .send_to(&binding_request([0x91; 12]), address)
+                .await
+                .unwrap();
+        }
+        let answered = drain(&client, Duration::from_millis(300)).await;
+        assert!(
+            (1..=6).contains(&answered),
+            "a 401 flood must be cut down to the burst size, got {answered}"
+        );
+        assert!(admission.counters().rate_limited_ip > 0);
+    }
+
+    #[tokio::test]
+    async fn auth_probe_over_udp_gets_401_then_200() {
+        // Same path as production: a real datagram through `serve_udp`.
+        let socket = Arc::new(udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
+        let address = socket.local_addr().unwrap();
+        let transport = Arc::new(ServerContext {
+            udp: vec![(address, socket.clone())],
+            ..with_auth(long_term_auth(false))
+        });
+        let stats = Arc::new(ServerStats::default());
+        tokio::spawn(serve_udp(
+            socket.clone(),
+            transport,
+            Arc::from(TEST_SOFTWARE),
+            stats.clone(),
+        ));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (challenge, from) =
+            udp_exchange(&client, address, &binding_request(TEST_TRANSACTION)).await;
+        assert_eq!(from, address);
+        let (code, types) = error_attribute_types(&challenge);
+        assert_eq!(code, 401);
+        assert!(types.contains(&auth::ATTR_PASSWORD_ALGORITHMS));
+
+        let nonce = nonce_of(&challenge);
+        let signed = authenticated_request(
+            TEST_TRANSACTION,
+            &[
+                (protocol::ATTR_USERNAME, b"user"),
+                (protocol::ATTR_REALM, b"example.org"),
+                (protocol::ATTR_NONCE, nonce.as_bytes()),
+            ],
+            &long_term_identity("user", "pass", auth::KeyAlgorithm::Md5),
+        );
+        let (response, _) = udp_exchange(&client, address, &signed).await;
+        assert_binding_success(&response, TEST_TRANSACTION, client.local_addr().unwrap());
+        assert_eq!(stats.counters(), (2, 2, 0));
     }
 }

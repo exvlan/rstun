@@ -13,9 +13,10 @@
 //! 这里验「RFC 原文字节」以及「一条完整消息里所有属性同时对得上」。
 //!
 //! 有意**不**做的事：§2.1/§2.2/§2.3 的 `MESSAGE-INTEGRITY` 只断言存在与长度 ——
-//! 本服务器不做鉴权（见 `prd.md` 非目标），所以既不校验 HMAC，也不会在自己的响应里
-//! 带这个属性。`FINGERPRINT` 不同：`--check-fingerprint` 会校验它，见
-//! `rfc5769_fingerprints_are_valid_and_our_crc32_agrees`。
+//! 那是**短凭证**签名（key = 口令），与 `--realm` 的长凭证不是同一套 key；长凭证
+//! 的 HMAC 由 `stun_types_signs_a_long_term_request_we_accept_and_can_verify_our_answer`
+//! 与 `auth::tests::rfc5769_long_term_vector_verifies` 各自覆盖。`FINGERPRINT` 不同：
+//! `--check-fingerprint` 会校验它，见 `rfc5769_fingerprints_are_valid_and_our_crc32_agrees`。
 
 use std::net::SocketAddr;
 
@@ -44,8 +45,9 @@ fn reference_transaction_id(id: [u8; 12]) -> stun_types::message::TransactionId 
 /// RFC 5769 §2.1：Sample Request（108 字节，Message Length 88）。
 ///
 /// 一条**真实 ICE 客户端**会发的请求：SOFTWARE + PRIORITY + ICE-CONTROLLED +
-/// USERNAME + MESSAGE-INTEGRITY + FINGERPRINT。我们既不支持鉴权、也不实现 ICE，
-/// 但这些属性必须「认得」——否则正常 ICE 客户端会被打成 420。
+/// USERNAME + MESSAGE-INTEGRITY + FINGERPRINT。这条消息的 HMAC 是**短凭证**签名
+/// （key = 口令），与 `--realm` 的长凭证不是同一套 key；鉴权默认关闭时这些属性必须
+/// 被「认得」（不 420），开启后则由 `auth` 模块按 RFC 5389 §10 校验。
 const RFC5769_2_1: &str = "
     000100582112a442b7e7a701bc34d686fa87dfae
     802200105354554e207465737420636c69656e74
@@ -222,11 +224,111 @@ fn rfc5769_2_4_long_term_auth_request_is_not_turned_into_420() {
         20
     );
 
-    // 长凭证请求带的是鉴权簇：我们不实现鉴权，但必须「认得」这些属性。
+    // 长凭证请求带的是鉴权簇：不开鉴权时必须「认得」这些属性（不触发 420）；
+    // 开了 `--realm` 之后同一条消息会得到 401（见 `auth` 模块的 RFC 5769 §2.4 向量测试）。
     assert!(
         protocol::unknown_attributes(message.body).is_empty(),
         "USERNAME/REALM/NONCE/MESSAGE-INTEGRITY 不得触发 420"
     );
+}
+
+#[test]
+fn stun_types_signs_a_long_term_request_we_accept_and_can_verify_our_answer() {
+    // 端到端鉴权互操作：第三方 crate（`stun-types`）按 RFC 5389 §10.2 / RFC 8489
+    // §9.2 自己算 key、自己算 HMAC 签一条请求 —— 我们接受；我们再签响应 ——
+    // 它的 `validate_integrity` 必须能验。两边的 HMAC 覆盖范围与 Length 调整
+    // 只要有一处不同，这条测试就会红。
+    use stun_types::attribute::{Nonce, Realm, Username};
+    use stun_types::message::{
+        BINDING, IntegrityAlgorithm, LongTermKeyCredentials, Message as ReferenceMessage,
+        MessageIntegrityCredentials, MessageWrite as _, MessageWriteExt as _, MessageWriteVec,
+    };
+
+    let context = crate::ServerContext {
+        auth: Some(crate::auth::Auth::long_term(
+            "example.org".to_string(),
+            b"nonce-secret".to_vec(),
+            vec![crate::auth::User {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            }],
+            std::time::Duration::from_secs(crate::auth::DEFAULT_NONCE_LIFETIME),
+            false,
+        )),
+        ..crate::ServerContext::default()
+    };
+    let peer: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+    let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+    let credentials: MessageIntegrityCredentials = LongTermKeyCredentials::new(
+        "user".to_string(),
+        "pass".to_string(),
+        "example.org".to_string(),
+    )
+    .into();
+
+    // 1) 未鉴权 → 401，从挑战里取出 NONCE。
+    let plain = ReferenceMessage::builder_request(BINDING, MessageWriteVec::new()).finish();
+    let challenge = match crate::decide(
+        &plain,
+        peer,
+        local,
+        crate::Transport::Udp,
+        &context,
+        "rstun/test",
+    )
+    .expect("a well-formed Binding request parses")
+    {
+        crate::Decision::Respond(bytes) => bytes,
+        other => panic!("unauthenticated Binding must be challenged, got {other:?}"),
+    };
+    let message = protocol::parse(&challenge).expect("our 401 must parse");
+    let nonce = attribute_of(&message, protocol::ATTR_NONCE);
+    let nonce = std::str::from_utf8(nonce).expect("the nonce is base64url text");
+
+    for algorithm in [IntegrityAlgorithm::Sha1, IntegrityAlgorithm::Sha256] {
+        let mut writer = ReferenceMessage::builder_request(BINDING, MessageWriteVec::new());
+        writer
+            .add_attribute(&Username::new("user").expect("USERNAME"))
+            .expect("write USERNAME");
+        writer
+            .add_attribute(&Realm::new("example.org").expect("REALM"))
+            .expect("write REALM");
+        writer
+            .add_attribute(&Nonce::new(nonce).expect("NONCE"))
+            .expect("write NONCE");
+        writer
+            .add_message_integrity(&credentials, algorithm)
+            .expect("stun-types computes the MAC");
+        let request = writer.finish();
+
+        let response = match crate::decide(
+            &request,
+            peer,
+            local,
+            crate::Transport::Udp,
+            &context,
+            "rstun/test",
+        )
+        .expect("a signed request parses")
+        {
+            crate::Decision::Respond(bytes) => bytes,
+            other => panic!("{algorithm:?}: a signed request must be answered, got {other:?}"),
+        };
+        let reference = ReferenceMessage::from_bytes(&response)
+            .expect("stun-types must be able to read our success answer");
+        assert_eq!(
+            reference
+                .validate_integrity(&credentials)
+                .expect("stun-types must accept our MESSAGE-INTEGRITY"),
+            algorithm,
+            "the answer must be signed with the algorithm the request used"
+        );
+        // 响应确实是 200（不是 401/438），且带 XOR-MAPPED-ADDRESS。
+        assert!(
+            protocol::message_class(protocol::parse(&response).expect("parses").msg_type)
+                == MessageClass::SuccessResponse
+        );
+    }
 }
 
 #[test]

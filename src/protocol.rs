@@ -118,7 +118,7 @@ pub const ATTR_REALM: u16 = 0x0014;
 pub const ATTR_NONCE: u16 = 0x0015;
 /// `PASSWORD-ALGORITHM` (RFC 8489 §14.12): authentication attribute.
 pub const ATTR_PASSWORD_ALGORITHM: u16 = 0x001d;
-/// `USERHASH` (RFC 8489 §14.13): authentication attribute.
+/// `USERHASH` (RFC 8489 §14.4): authentication attribute, 32 bytes.
 pub const ATTR_USERHASH: u16 = 0x001e;
 /// `PRIORITY` (RFC 8445 §16.1): carried by every ICE connectivity check.
 pub const ATTR_PRIORITY: u16 = 0x0024;
@@ -652,8 +652,27 @@ pub fn error_response(
     code: u16,
     reason: &str,
 ) -> Vec<u8> {
-    let mut body = Vec::with_capacity(8 + reason.len() + 3);
+    error_response_with(transaction_id, method, code, reason, &[])
+}
+
+/// [`error_response`] plus extra attributes, appended after `ERROR-CODE`.
+///
+/// Only the authentication path needs it (RFC 5389 §10.2.2 / RFC 8489 §9.2.4:
+/// a `401` carries `REALM` + `NONCE` + `PASSWORD-ALGORITHMS`, a `438` a fresh
+/// `NONCE`). Living next to [`error_response`] keeps exactly one implementation
+/// of the wire shape (message type, attribute order, TLV padding).
+pub fn error_response_with(
+    transaction_id: &TransactionId,
+    method: u16,
+    code: u16,
+    reason: &str,
+    attributes: &[(u16, &[u8])],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + reason.len() + attributes.len() * 32);
     push_attribute(&mut body, ATTR_ERROR_CODE, &error_code_value(code, reason));
+    for (attr_type, value) in attributes {
+        push_attribute(&mut body, *attr_type, value);
+    }
     encode_message(
         message_type(method, MessageClass::ErrorResponse),
         transaction_id,
