@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/11-19-rstun-ops/design.md", "reason": "核对端点/指标/退出行为与设计一致"}
+{"file": ".trellis/spec/backend/abuse-guard.md", "reason": "计数不得双份或漏计"}

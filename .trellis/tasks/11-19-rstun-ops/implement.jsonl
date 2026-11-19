@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/abuse-guard.md", "reason": "指标里的 rate_limited/inflight/reflect 计数口径必须与契约一致"}
+{"file": ".trellis/spec/backend/auth.md", "reason": "auth 计数与 401/438 语义决定 auth_total 标签"}
+{"file": ".trellis/spec/backend/protocol-errors.md", "reason": "requests_total 的 result 归因（400/420/500）"}
+{"file": ".trellis/tasks/11-19-rstun-ops/design.md", "reason": "HTTP 端点契约、指标名、env 优先级与 drain 语义"}
