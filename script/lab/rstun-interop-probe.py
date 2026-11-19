@@ -26,6 +26,7 @@ import os
 import socket
 import struct
 import sys
+import zlib
 
 MAGIC_COOKIE = 0x2112A442
 MSG_BINDING_REQUEST = 0x0001
@@ -46,10 +47,14 @@ ATTR_USE_CANDIDATE = 0x0025
 ATTR_PADDING = 0x0026
 ATTR_RESPONSE_PORT = 0x0027
 ATTR_SOFTWARE = 0x8022
+ATTR_ALTERNATE_SERVER = 0x8023
 ATTR_FINGERPRINT = 0x8028
 ATTR_ICE_CONTROLLING = 0x802A
 ATTR_RESPONSE_ORIGIN = 0x802B
 ATTR_OTHER_ADDRESS = 0x802C
+
+# RFC 5389 §15.5: FINGERPRINT = CRC32(prefix) XOR this constant.
+FINGERPRINT_XOR = 0x5354554E
 
 CHANGE_IP = 0x04
 CHANGE_PORT = 0x02
@@ -572,6 +577,102 @@ def probe_ipv6(args) -> None:
     )
 
 
+def add_fingerprint(transaction_id: bytes, attributes: bytes = b"") -> bytes:
+    """按 RFC 5389 §15.5 追加 FINGERPRINT（CRC 覆盖到该属性之前，Length 已含它）。"""
+    body = attributes + b"\x00" * 8  # 占位的 FINGERPRINT（之后填值）
+    header = (
+        struct.pack("!HH", MSG_BINDING_REQUEST, len(body))
+        + struct.pack("!I", MAGIC_COOKIE)
+        + transaction_id
+    )
+    value = (zlib.crc32(header + attributes) ^ FINGERPRINT_XOR).to_bytes(4, "big")
+    return header + attributes + attribute(ATTR_FINGERPRINT, value)
+
+
+def append_attribute(frame: bytes, attr_type: int, value: bytes) -> bytes:
+    """在整帧之后追加一个属性，并把头部 Length 相应调大。"""
+    extra = attribute(attr_type, value)
+    header = bytearray(frame[:20])
+    header[2:4] = struct.pack("!H", len(frame) - 20 + len(extra))
+    return bytes(header) + frame[20:] + extra
+
+
+def probe_fingerprint(args) -> None:
+    """`--check-fingerprint`：合法 → 200；错值 / 非末位 → 400（RFC 5389 §15.5）。"""
+    client = client_for(args.server_addr)
+    try:
+        transaction_id = os.urandom(12)
+        valid = add_fingerprint(transaction_id)
+        response, _ = client.udp_exchange(valid, args.server_addr)
+        expect_success(decode(response), transaction_id)
+        print("ok: 合法 FINGERPRINT 得到普通 Binding 响应")
+
+        bad = bytearray(add_fingerprint(os.urandom(12)))
+        bad[-1] ^= 0xFF
+        response, _ = client.udp_exchange(bytes(bad), args.server_addr)
+        check(error_code(decode(response)) == 400, "错值 FINGERPRINT → 400 Bad Request")
+
+        misplaced = append_attribute(add_fingerprint(os.urandom(12)), ATTR_PADDING, b"\x00")
+        response, _ = client.udp_exchange(misplaced, args.server_addr)
+        check(error_code(decode(response)) == 400, "FINGERPRINT 不在末位 → 400 Bad Request")
+    finally:
+        client.close()
+
+
+def probe_fingerprint_drop(args) -> None:
+    """`--fingerprint-action drop`：错值不回应，但服务仍然活着。"""
+    client = client_for(args.server_addr)
+    try:
+        bad = bytearray(add_fingerprint(os.urandom(12)))
+        bad[-1] ^= 0xFF
+        client.socket.sendto(bytes(bad), args.server_addr)
+        client.socket.settimeout(0.3)
+        try:
+            client.socket.recvfrom(4096)
+            raise Fail("drop 模式下错值 FINGERPRINT 不应有响应")
+        except socket.timeout:
+            print("ok: drop 模式对错值 FINGERPRINT 静默（无响应）")
+
+        # 服务没有被拖死：合法请求仍然得到 200。
+        client.socket.settimeout(3.0)
+        transaction_id = os.urandom(12)
+        response, _ = client.udp_exchange(add_fingerprint(transaction_id), args.server_addr)
+        expect_success(decode(response), transaction_id)
+        print("ok: drop 模式之后合法 FINGERPRINT 仍得到 200")
+    finally:
+        client.close()
+
+
+def probe_alternate(args) -> None:
+    """`--alternate-server`：Binding 回 300 + ALTERNATE-SERVER（RFC 5389 §15.11）。"""
+    require(args.alternate is not None, "alternate 需要 --alternate")
+    client = client_for(args.server_addr)
+    transaction_id = os.urandom(12)
+    # 带 CHANGE-REQUEST：重定向优先于 RFC 5780，仍回 300 且不换源。
+    request = build_request(
+        transaction_id, attribute(ATTR_CHANGE_REQUEST, struct.pack("!I", CHANGE_PORT))
+    )
+    try:
+        response, source = client.udp_exchange(request, args.server_addr)
+    finally:
+        client.close()
+
+    message = decode(response)
+    check(message["type"] == MSG_BINDING_ERROR, "响应类型 = 0x0111（错误响应）")
+    check(error_code(message) == 300, "ERROR-CODE = 300 Try Alternate")
+    alternate = attr(message, ATTR_ALTERNATE_SERVER)
+    check(alternate is not None, "带 ALTERNATE-SERVER")
+    check(decode_address(alternate) == args.alternate, f"ALTERNATE-SERVER = {args.alternate}")
+    check(
+        ATTR_XOR_MAPPED_ADDRESS not in message["types"],
+        "300 不带 XOR-MAPPED-ADDRESS（它是指令，不是映射答案）",
+    )
+    check(
+        (source[0], source[1]) == (args.server_addr[0], args.server_addr[1]),
+        "300 仍从入口 socket 回（重定向优先于 CHANGE-REQUEST）",
+    )
+
+
 MODES = {
     "basic": probe_basic,
     "mapped": probe_mapped,
@@ -585,6 +686,9 @@ MODES = {
     "rfc5780-attrs": probe_rfc5780_attrs,
     "tcp": probe_tcp,
     "ipv6": probe_ipv6,
+    "fingerprint": probe_fingerprint,
+    "fingerprint-drop": probe_fingerprint_drop,
+    "alternate": probe_alternate,
 }
 
 
@@ -594,6 +698,7 @@ def main() -> int:
     parser.add_argument("--server", required=True, help="被测服务 host:port")
     parser.add_argument("--alt-ip", help="RFC 5780 第二地址（change / rfc5780-attrs）")
     parser.add_argument("--alt-port", type=int, help="RFC 5780 第二端口")
+    parser.add_argument("--alternate", help="期望的 ALTERNATE-SERVER 地址（alternate 模式）")
     parser.add_argument("--change", type=lambda text: int(text, 0), default=0,
                         help="CHANGE-REQUEST 标志位（0x02 换端口 / 0x04 换 IP / 0x06 两者）")
     parser.add_argument("--size", type=int, default=128, help="padding 模式的 PADDING 长度")

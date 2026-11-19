@@ -68,17 +68,20 @@ list_items() {
   cat <<'EOF'
 可用项（--item 可重复，也可逗号分隔）：
 
-  probe        rstun 自身的协议矩阵（16 项子用例 / 12 类 mode）：basic / mapped / ice /
+  probe        rstun 自身的协议矩阵（19 项子用例 / 15 类 mode）：basic / mapped / ice /
                auth / unknown / padding(128,4000,8000) / response-port /
-               padding-response-port / change(0x02,0x04,0x06) / rfc5780-attrs / tcp / ipv6。
-               起 4 个实例（主、mapped、RFC 5780 双 IP、IPv6）。
+               padding-response-port / change(0x02,0x04,0x06) / rfc5780-attrs / tcp / ipv6 /
+               fingerprint / fingerprint-drop / alternate。
+               起 7 个实例（主、mapped、RFC 5780 双 IP、IPv6、--alternate-server、
+               --check-fingerprint、--check-fingerprint --fingerprint-action drop）。
   pion         pion/stun（Go）作为第三方编解码 + 客户端：basic / ice / unknown /
                padding / response-port / tcp / rfc5780。
   webrtc-stun  webrtc-rs `stun` 0.17 同上，另加 ipv6（共 8 个 mode）。
   coturn       turnutils_stunclient 双向：他们 → 我们（含 RFC 5780 三响应）、
                我们（探针）→ coturn；coturn 自身基线也跑一遍用于归因。
-  stun-types   `stun-types` 2.0.5 双向（cargo test：tests_interop::stun_types_bidirectional）。
-  rfc5769      RFC 5769 §2.1–§2.4 测试向量（cargo test：tests_interop::rfc5769）。
+  stun-types   `stun-types` 2.0.5 双向 + 300/500 错误响应（cargo test：tests_interop::stun_types，2 条）。
+  rfc5769      RFC 5769 §2.1–§2.4 测试向量 + §2.1–§2.3 的 FINGERPRINT CRC
+               （cargo test：tests_interop::rfc5769，5 条）。
   fuzz         `cargo +nightly fuzz run parse`，默认 600 秒，日志落 $RSTUN_INTEROP_DIR。
   ci           本地复现 CI 步骤：单测 + UDP/TCP/IPv6 冒烟 + workflow YAML 解析 +
                运行期零新增依赖（cargo tree 无 exvlan-*）。
@@ -134,6 +137,20 @@ wait_ready() {
   return 1
 }
 
+# 同 wait_ready，但用调用方给的 mode：`--alternate-server` 的实例对任何 Binding 都回
+# 300，`basic` 会把它判成失败。其余参数原样传给探针。
+wait_ready_mode() {
+  local mode="$1" address="$2" attempt
+  shift 2
+  for attempt in $(seq 1 40); do
+    if python3 "$PROBE" "$mode" --server "$address" "$@" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 # ---------- 探针 ----------
 
 # `run_probe <label> <mode> [args…]`：label 进汇总与日志名（同一 mode 会用不同参数
@@ -169,13 +186,24 @@ item_probe() {
   local alt_port=$((PORT + 3))
   local mapped="127.0.0.1:$((PORT + 4))"
   local v6="[::1]:$((PORT + 5))"
+  local alternate="127.0.0.1:$((PORT + 8))"
+  local fingerprint="127.0.0.1:$((PORT + 9))"
+  local fingerprint_drop="127.0.0.1:$((PORT + 11))"
 
   start_rstun probe-main --listen "$main" --tcp
   start_rstun probe-mapped --listen "$mapped" --mapped-address
   start_rstun probe-alt --listen "$alt" --alt-listen "127.0.0.2:$((PORT + 2))" --alt-port "$alt_port"
   start_rstun probe-v6 --listen-v6 "$v6"
+  start_rstun probe-alternate --listen "$alternate" --alternate-server 192.0.2.9:3478
+  start_rstun probe-fingerprint --listen "$fingerprint" --check-fingerprint
+  start_rstun probe-fingerprint-drop --listen "$fingerprint_drop" \
+    --check-fingerprint --fingerprint-action drop
 
-  if ! wait_ready "$main" || ! wait_ready "$mapped" || ! wait_ready "$alt"; then
+  # `--alternate-server` 对任何 Binding 都回 300，`basic` 会按 200 判定——就绪探测必须
+  # 用它自己的 mode，否则 wait_ready 永远等不到「成功响应」。
+  if ! wait_ready "$main" || ! wait_ready "$mapped" || ! wait_ready "$alt" \
+    || ! wait_ready "$fingerprint" || ! wait_ready "$fingerprint_drop" \
+    || ! wait_ready_mode alternate "$alternate" --alternate 192.0.2.9:3478; then
     fail_item "probe" "服务未就绪（看 $LOG_DIR/probe-*.log）"
     return
   fi
@@ -197,6 +225,9 @@ item_probe() {
   run_probe change-0x02 change --server "$alt" --alt-ip 127.0.0.2 --alt-port "$alt_port" --change 0x02
   run_probe change-0x04 change --server "$alt" --alt-ip 127.0.0.2 --alt-port "$alt_port" --change 0x04
   run_probe change-0x06 change --server "$alt" --alt-ip 127.0.0.2 --alt-port "$alt_port" --change 0x06
+  run_probe fingerprint fingerprint --server "$fingerprint"
+  run_probe fingerprint-drop fingerprint-drop --server "$fingerprint_drop"
+  run_probe alternate alternate --server "$alternate" --alternate 192.0.2.9:3478
 
   # IPv6 不是所有环境都有（CI 容器 / 禁 v6 的内核）：绑不上就记 SKIP，不算失败。
   if wait_ready "$v6"; then
@@ -384,13 +415,13 @@ run_filtered_tests() {
 }
 
 item_stun_types() {
-  log "== stun-types 2.0.5（双向）"
-  run_filtered_tests stun-types/bidirectional tests_interop::stun_types_bidirectional 1
+  log "== stun-types 2.0.5（双向 + 300/500 错误响应）"
+  run_filtered_tests stun-types/codec tests_interop::stun_types 2
 }
 
 item_rfc5769() {
-  log "== RFC 5769 测试向量（§2.1–§2.4）"
-  run_filtered_tests rfc5769/vectors tests_interop::rfc5769 4
+  log "== RFC 5769 测试向量（§2.1–§2.4 + FINGERPRINT CRC）"
+  run_filtered_tests rfc5769/vectors tests_interop::rfc5769 5
 }
 
 item_fuzz() {

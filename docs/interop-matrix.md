@@ -10,12 +10,13 @@
 ## 0. 结论（先说）
 
 1. **四方对手全绿**：coturn/`turnutils_stunclient`、pion/stun v3.1.7、webrtc-rs `stun` 0.17.3、
-   `stun-types` 2.0.5 —— 共 **38 项子用例 / 176 条断言**
-   （16 probe + 7 pion + 8 webrtc + 5 coturn + 1 stun-types + 1 rfc5769；
-   断言数 = 各日志 `ok:` 行合计：probe 86 + pion 40 + webrtc 44 + coturn 6）。
-   口径说明：冷复核给的「224」是**旧**口径（把解码里的结构性前置条件也当成 `ok:` 断言）；
-   本轮按 B2 把这类前置条件改成只在失败时输出，因此可复核的 `ok:` 行是 176
-   （`grep -a -h '^ok:' $RSTUN_INTEROP_DIR/logs/*.log | wc -l`），另加 1 项子用例（padding-8000）。
+   `stun-types` 2.0.5 —— 共 **41 项子用例 / 191 条断言**
+   （19 probe + 7 pion + 8 webrtc + 5 coturn + 1 stun-types + 1 rfc5769；
+   断言数 = 各日志 `ok:` 行合计：probe 101 + pion 40 + webrtc 44 + coturn 6）。
+   本轮 probe 新增 `fingerprint` / `fingerprint-drop` / `alternate` 三项（+15 条断言），
+   见 §13；口径说明：冷复核给的「224」是**旧**口径（把解码里的结构性前置条件也当成 `ok:` 断言）；
+   按 B2 把这类前置条件改成只在失败时输出后，可复核的 `ok:` 行是 191
+   （`grep -a -h '^ok:' $RSTUN_INTEROP_DIR/logs/*.log | wc -l`）。
 2. **RFC 5769 四段标准字节全部通过**（§2.1 请求 / §2.2 IPv4 响应 / §2.3 IPv6 响应 / §2.4 长凭证请求），
    并且 §2.2/§2.3 我们能**逐字节重建**同样的 `XOR-MAPPED-ADDRESS`。
 3. **fuzz 10 分钟无 panic / 无挂死**：`Done 84319569 runs in 601 second(s)`，`cov: 302 ft: 687`，
@@ -33,7 +34,7 @@
 
 ```bash
 bash script/lab/rstun-interop.sh --list          # 列项
-bash script/lab/rstun-interop.sh probe           # rstun 自身协议矩阵（16 项子用例）
+bash script/lab/rstun-interop.sh probe           # rstun 自身协议矩阵（19 项子用例）
 bash script/lab/rstun-interop.sh pion            # Go 第三方
 bash script/lab/rstun-interop.sh webrtc-stun     # Rust 第三方（webrtc-rs）
 bash script/lab/rstun-interop.sh coturn          # coturn 双向
@@ -205,9 +206,11 @@ ok: RESPONSE-ORIGIN 是换端口后的源地址 127.0.0.1:34781（回包源 127.
 | --- | --- | --- |
 | A：他们编码 → 我们解析 | `stun-types` 的 `Message::builder_request` + `Software` / `Username` / `RawAttribute(CHANGE-REQUEST 0x02)` 组包；我们 `parse` 后：无未知属性、SOFTWARE 值一致、`change_request == {ip:false, port:true}` | ✅ |
 | B：我们编码 → 他们解码 | 我们的成功响应（XOR + MAPPED + RESPONSE-ORIGIN + OTHER-ADDRESS + SOFTWARE + PADDING 32）被它解析：`XorMappedAddress` / `MappedSocketAddr`（三处地址）逐一对上、`PADDING` 原始长度为 32 | ✅ |
+| B（错误响应） | 我们的 `300` 被它解出 `ErrorCode(300) + reason "Try Alternate"` 与 `AlternateServer(192.0.2.9:3478)`；`500` 被解出 `ErrorCode(500) + reason "Server Error"`，且响应固定 40 字节 | ✅ |
 
 ```
 test tests_interop::stun_types_bidirectional ... ok
+test tests_interop::stun_types_decodes_our_300_and_500_error_responses ... ok
 ```
 
 ## 6. 1.6 RFC 5769 测试向量
@@ -227,10 +230,15 @@ test tests_interop::rfc5769_2_1_sample_request_is_understood ... ok
 test tests_interop::rfc5769_2_2_sample_ipv4_response_decodes_and_we_reencode_the_same_bytes ... ok
 test tests_interop::rfc5769_2_3_sample_ipv6_response_decodes_and_we_reencode_the_same_bytes ... ok
 test tests_interop::rfc5769_2_4_long_term_auth_request_is_not_turned_into_420 ... ok
+test tests_interop::rfc5769_fingerprints_are_valid_and_our_crc32_agrees ... ok
 ```
 
-> 有意不做的：§2.1/§2.2/§2.3 的 `MESSAGE-INTEGRITY` / `FINGERPRINT` 只断言存在与长度。
-> 本服务器不做鉴权（PRD 非目标），校验 HMAC 会给出「我们支持鉴权」的错误印象。
+FINGERPRINT 现在也被**校验**（`--check-fingerprint`）：§2.1–§2.3 的标准字节判为 `Valid`，
+改一位后判为 `Mismatch`。CRC 的覆盖范围按 RFC 5389 §15.5 包含「Length 已计入该属性」的头部
+（`crc32` 模块另用 §2.1 的 `0xe57a3bcf` 常量锁死）。
+
+> 有意不做的：`MESSAGE-INTEGRITY` 只断言存在与长度。本服务器不做鉴权（PRD 非目标），
+> 校验 HMAC 会给出「我们支持鉴权」的错误印象。
 
 ## 7. 1.7 `cargo-fuzz`（解析路径）
 
@@ -293,7 +301,7 @@ macOS / Windows 的 runner 结果只能由真实 CI 产生。本任务硬约束�
 
 ## 9. 失败项与判定
 
-**本轮没有失败项**（38/38 项子用例 ok）。但有三处「看起来像差异」的点，判定如下：
+**本轮没有失败项**（41/41 项子用例 ok）。但有三处「看起来像差异」的点，判定如下：
 
 | # | 观察 | 判定 | 依据 |
 | --- | --- | --- | --- |
@@ -323,6 +331,10 @@ macOS / Windows 的 runner 结果只能由真实 CI 产生。本任务硬约束�
    回包，而服务端抓包证明回包已从正确 socket 发出 —— 原因是客户端 NAT 非 full-cone，丢弃陌生源。
    验证 `CHANGE-REQUEST` 的判据必须取本地回环、服务端抓包（`from=`）或 DC/full-cone 客户端，
    详见任务 `research/S4-production-switch.md`。
+7. **pion / webrtc-rs 夹具不解析错误响应类型（300/500）**：两者的公共 API 面向 Binding 成功响应与
+   通用属性，没有 `ErrorCode` / `AlternateServer` 的类型化解码；因此这两类响应的第三方解码由
+   `stun-types` 覆盖（§5、§13），探针只断言字节与错误码。不要据此认为「pion/webrtc 读不了 300」——
+   它们能按通用 TLV 解析，只是本仓夹具没有断言这一点。
 
 ## 12. 复现命令（逐个可粘）
 
@@ -354,3 +366,44 @@ bash script/lab/rstun-interop.sh ci
 # 5) 日志
 ls /tmp/opencode/rstun-interop/logs
 ```
+
+## 13. 协议闭环新增项（`fingerprint` / `fingerprint-drop` / `alternate`）
+
+`item_probe` 起 7 个实例（主 / mapped / RFC 5780 双 IP / IPv6 / `--alternate-server` /
+`--check-fingerprint` / `--check-fingerprint --fingerprint-action drop`），新增 3 项子用例。
+判据都是**外部可观察行为**（响应字节、错误码、是否静默），不依赖服务端内部状态。
+
+| 子用例 | 配置 | 断言 | 结论 |
+| --- | --- | --- | --- |
+| `probe/fingerprint` | `--check-fingerprint` | 合法 FINGERPRINT（CRC 由 python `zlib.crc32` 独立算出）→ 普通 200；错一位 → `400 Bad Request`；`FINGERPRINT` 后跟 `PADDING` → `400` | ✅ |
+| `probe/fingerprint-drop` | `--check-fingerprint --fingerprint-action drop` | 错值 → 0 响应（0.3 s 静默）；随后合法请求仍得到 200（服务未被拖死） | ✅ |
+| `probe/alternate` | `--alternate-server 192.0.2.9:3478` | 响应类型 `0x0111`、`ERROR-CODE 300 Try Alternate`、`ALTERNATE-SERVER = 192.0.2.9:3478`、**不带** `XOR-MAPPED-ADDRESS`；带 `CHANGE-REQUEST 0x02` 时仍从入口 socket 回（重定向优先） | ✅ |
+
+原始输出（`$RSTUN_INTEROP_DIR/logs/probe-*.log`）：
+
+```
+# probe/fingerprint
+ok: 响应类型 0x0101 = 0x0101
+ok: transaction id 原样回显
+ok: 合法 FINGERPRINT 得到普通 Binding 响应
+ok: 错值 FINGERPRINT → 400 Bad Request
+ok: FINGERPRINT 不在末位 → 400 Bad Request
+
+# probe/fingerprint-drop
+ok: drop 模式对错值 FINGERPRINT 静默（无响应）
+ok: 响应类型 0x0101 = 0x0101
+ok: transaction id 原样回显
+ok: drop 模式之后合法 FINGERPRINT 仍得到 200
+
+# probe/alternate
+ok: 响应类型 = 0x0111（错误响应）
+ok: ERROR-CODE = 300 Try Alternate
+ok: 带 ALTERNATE-SERVER
+ok: ALTERNATE-SERVER = 192.0.2.9:3478
+ok: 300 不带 XOR-MAPPED-ADDRESS（它是指令，不是映射答案）
+ok: 300 仍从入口 socket 回（重定向优先于 CHANGE-REQUEST）
+```
+
+> 500 不在探针里：它只在「发送失败」时出现，正常路径不可达。覆盖由
+> `server_error_for` 的映射表 + Linux 上 `RESPONSE-PORT 0` 的真实 `send_to` 失败 e2e 提供
+> （`cargo test`，见 README「协议闭环」）。

@@ -20,9 +20,9 @@
 
 ```bash
 bash script/lab/rstun-interop.sh --list        # 列项 + 可选参数
-bash script/lab/rstun-interop.sh probe         # 只跑 rstun 自身协议矩阵（16 项子用例）
+bash script/lab/rstun-interop.sh probe         # 只跑 rstun 自身协议矩阵（19 项子用例）
 bash script/lab/rstun-interop.sh --item pion,webrtc-stun   # 多选
-bash script/lab/rstun-interop.sh all           # 除 fuzz/ci 外全部（38 项子用例）
+bash script/lab/rstun-interop.sh all           # 除 fuzz/ci 外全部（41 项子用例）
 bash script/lab/rstun-interop.sh full          # all + fuzz(600s) + ci
 ```
 
