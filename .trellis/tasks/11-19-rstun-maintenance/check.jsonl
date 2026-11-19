@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/release-artifacts.md", "reason": "复核发布是否满足契约（可执行位、digest、tag 一致）"}
+{"file": ".trellis/tasks/11-19-rstun-standalone/research/T1-interop-matrix.md", "reason": "长期回归对照：38 项/176 断言的互操作基线"}

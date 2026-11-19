@@ -1,8 +1,14 @@
+> 状态：**已清空**（D1/D2 均已在收尾时判定，结论见下）。
+
 # 待决策清单（rstun-standalone）
 
 > 规则：编号连续 `D1`、`D2`…；每条给选项、代价、推荐项。决策后回写到本文件与对应产物（prd/design/implement）。
 
-## D1 · `rstun_matrix` 在每次 push 都跑 macOS/Windows 是否可接受
+## D1 · `rstun_matrix` 在每次 push 都跑 macOS/Windows —— **已失效**
+
+**结论（2026-11-19）**：仓库已拆为独立 public 仓 `exvlan/rstun`，GitHub Actions 对 public 仓免费，
+「与内核共用私仓额度」的前提消失；三平台矩阵（`test`/`smoke`/`smoke-ipv6`）继续每次 push 跑，
+不需要再收紧。原选项如下（保留作历史）：
 
 **背景**（冷复核 C3）：`.github/workflows/test.yml` 新增 `rstun_matrix`（ubuntu/macos/windows）。
 `should_skip` 只对 PR 生效，push 恒为 false → **每次 push 到 `feature`（哪怕只改文档）都会跑
@@ -17,7 +23,11 @@ macos-latest（计费约 10×）+ windows-latest**。AGENTS.md 已记过「私�
 
 **推荐 A**：当前 T1 只有一次跨平台验证机会，先让它跑；等 S3 拆仓后按独立仓的额度再收敛（届时 CI 不再与内核共用配额）。
 
-## D2 · 首发 `rstun-v26.410.100` 是否先发 prerelease
+## D2 · 首发是否先发 prerelease —— **已解决**
+
+**结论（2026-11-19）**：`rstun-v26.410.100` 直接发布了**正式版**（非 prerelease），
+4 平台资产与双架构镜像均已实测可用；`R3` 的缓解改为「发布后立刻下载验证 + digest 固定」。
+原选项如下（保留作历史）：
 
 **背景**：`implement.md` 3.1 写"首发（prerelease）"；AGENTS.md 的 `rstun.yml` 部分未规定 prerelease。
 首发有四个变量同时变（workflow 名 / 资产前缀 / tag 前缀 / 镜像名），`prd.md` R3 的缓解是"首次 dispatch 只发 prerelease"。

@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/release-artifacts.md", "reason": "发布物契约：资产可执行位、tag↔资产↔digest、双架构 manifest"}
+{"file": ".trellis/tasks/11-19-rstun-standalone/research/S3-release-prep.md", "reason": "发版预检缺口：crates.io 名称/arm64 镜像/版本一致性/拆仓"}
