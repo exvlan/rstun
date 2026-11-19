@@ -1004,12 +1004,12 @@ async fn permission_limit_and_per_ip_quota_are_enforced() {
     let mut client = Client::connect(harness.server).await;
     client.challenge().await;
     assert_eq!(error_code(&client.allocate().await), None);
-    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    // Permissions are keyed by peer IP: a second socket on 127.0.0.1 would be
-    // the same permission, so use another loopback address for the second.
-    let second = UdpSocket::bind("127.0.0.2:0").await.unwrap();
-    let first = first.local_addr().unwrap();
-    let second = second.local_addr().unwrap();
+    // Permissions are keyed by peer IP, so the two peers only need distinct
+    // addresses — nothing is ever sent to them. Do not bind sockets here:
+    // `127.0.0.2` is only available on Linux (macOS needs an explicit lo0
+    // alias), and binding would make this test platform-dependent.
+    let first: SocketAddr = "198.51.100.10:9000".parse().unwrap();
+    let second: SocketAddr = "198.51.100.11:9000".parse().unwrap();
 
     // B3: one request carrying more peers than the quota must install
     // **nothing** (the whole request is rejected atomically with 508).
