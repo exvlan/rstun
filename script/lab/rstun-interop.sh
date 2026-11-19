@@ -56,7 +56,7 @@ FAILED_ITEMS=()
 BLOCKED_ITEMS=()
 PASSED_ITEMS=()
 
-ALL_ITEMS=(probe pion webrtc-stun coturn stun-types rfc5769)
+ALL_ITEMS=(probe pion webrtc-stun coturn stun-types rfc5769 auth)
 # fuzz 与 ci 单独算：前者要 10 分钟，后者是「本地复现 CI 步骤」，都容易被误当成必跑项。
 FULL_ITEMS=("${ALL_ITEMS[@]}" fuzz ci)
 
@@ -82,10 +82,13 @@ list_items() {
   stun-types   `stun-types` 2.0.5 双向 + 300/500 错误响应（cargo test：tests_interop::stun_types，2 条）。
   rfc5769      RFC 5769 §2.1–§2.4 测试向量 + §2.1–§2.3 的 FINGERPRINT CRC
                （cargo test：tests_interop::rfc5769，5 条）。
+  auth         鉴权（RFC 5389 §10.2 / RFC 8489 §9.2）长期凭据全流程：无凭据 → 401
+               （REALM/NONCE/PASSWORD-ALGORITHMS）、带独立算出的 MESSAGE-INTEGRITY →
+               200 且响应可被探针验签、错口令 → 401。起一个 `--realm` 实例。
   fuzz         `cargo +nightly fuzz run parse`，默认 600 秒，日志落 $RSTUN_INTEROP_DIR。
   ci           本地复现 CI 步骤：单测 + UDP/TCP/IPv6 冒烟 + workflow YAML 解析 +
                运行期零新增依赖（cargo tree 无 exvlan-*）。
-  all          probe + pion + webrtc-stun + coturn + stun-types + rfc5769
+  all          probe + pion + webrtc-stun + coturn + stun-types + rfc5769 + auth
   full         all + fuzz + ci
 
 可选参数：
@@ -329,6 +332,29 @@ item_webrtc_stun() {
   fi
 }
 
+item_auth() {
+  log "== auth：长期凭据（401 挑战 → MESSAGE-INTEGRITY → 200，RFC 5389 §10.2 / RFC 8489 §9.2）"
+  local address="127.0.0.1:$((PORT + 12))"
+  local users="$WORK/auth-users"
+  mkdir -p "$WORK"
+  printf 'user:pass\n' >"$users"
+  # `--rate-limit` 不是为了这条测试，而是照 README 的要求演示「开鉴权必配限速」：
+  # 401 是唯一比请求大 3-5 倍的响应。
+  start_rstun probe-auth --listen "$address" --realm example.org \
+    --auth-secret interop-secret --auth-file "$users" --rate-limit
+  # 就绪探测用 auth-long-term 自己：`basic` 会拿到 401，永远等不到「成功响应」。
+  if ! wait_ready_mode auth-long-term "$address"; then
+    fail_item "auth/长期凭据" "服务未就绪（看 $LOG_DIR/probe-auth.log）"
+    return
+  fi
+  if python3 "$PROBE" auth-long-term --server "$address" >"$LOG_DIR/probe-auth-long-term.log" 2>&1; then
+    cat "$LOG_DIR/probe-auth-long-term.log"
+    ok_item "auth/长期凭据（401 → MI → 200 + 响应可验签）"
+  else
+    fail_item "auth/长期凭据" "见 $LOG_DIR/probe-auth-long-term.log"
+  fi
+}
+
 item_coturn() {
   log "== coturn / turnutils_stunclient（双向）"
   command -v turnserver >/dev/null || { blocked_item "coturn" "没有 turnserver（apt-get install coturn）"; return; }
@@ -559,6 +585,7 @@ for item in "${ITEMS[@]}"; do
     pion) item_pion ;;
     webrtc-stun) item_webrtc_stun ;;
     coturn) item_coturn ;;
+    auth) item_auth ;;
     stun-types) item_stun_types ;;
     rfc5769) item_rfc5769 ;;
     fuzz) item_fuzz ;;

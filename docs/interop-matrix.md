@@ -10,12 +10,13 @@
 ## 0. 结论（先说）
 
 1. **四方对手全绿**：coturn/`turnutils_stunclient`、pion/stun v3.1.7、webrtc-rs `stun` 0.17.3、
-   `stun-types` 2.0.5 —— 共 **41 项子用例 / 191 条断言**
-   （19 probe + 7 pion + 8 webrtc + 5 coturn + 1 stun-types + 1 rfc5769；
-   断言数 = 各日志 `ok:` 行合计：probe 101 + pion 40 + webrtc 44 + coturn 6）。
-   本轮 probe 新增 `fingerprint` / `fingerprint-drop` / `alternate` 三项（+15 条断言），
-   见 §13；口径说明：冷复核给的「224」是**旧**口径（把解码里的结构性前置条件也当成 `ok:` 断言）；
-   按 B2 把这类前置条件改成只在失败时输出后，可复核的 `ok:` 行是 191
+   `stun-types` 2.0.5，加自研探针的鉴权全流程 —— 共 **42 项子用例 / 203 条断言**
+   （19 probe + 7 pion + 8 webrtc + 5 coturn + 1 stun-types + 1 rfc5769 + 1 auth；
+   断言数 = 各日志 `ok:` 行合计：probe 113【含 `auth` 项 15 条】+ pion 40 + webrtc 44 + coturn 6）。
+   本轮 probe 新增 `fingerprint` / `fingerprint-drop` / `alternate` 三项，见 §13；
+   `auth` 项（长期凭据 401 → MESSAGE-INTEGRITY → 200，独立实现算 key/MAC）见 §14。
+   口径说明：冷复核给的「224」是**旧**口径（把解码里的结构性前置条件也当成 `ok:` 断言）；
+   按 B2 把这类前置条件改成只在失败时输出后，可复核的 `ok:` 行是 203
    （`grep -a -h '^ok:' $RSTUN_INTEROP_DIR/logs/*.log | wc -l`）。
 2. **RFC 5769 四段标准字节全部通过**（§2.1 请求 / §2.2 IPv4 响应 / §2.3 IPv6 响应 / §2.4 长凭证请求），
    并且 §2.2/§2.3 我们能**逐字节重建**同样的 `XOR-MAPPED-ADDRESS`。
@@ -237,8 +238,9 @@ FINGERPRINT 现在也被**校验**（`--check-fingerprint`）：§2.1–§2.3 �
 改一位后判为 `Mismatch`。CRC 的覆盖范围按 RFC 5389 §15.5 包含「Length 已计入该属性」的头部
 （`crc32` 模块另用 §2.1 的 `0xe57a3bcf` 常量锁死）。
 
-> 有意不做的：`MESSAGE-INTEGRITY` 只断言存在与长度。本服务器不做鉴权（PRD 非目标），
-> 校验 HMAC 会给出「我们支持鉴权」的错误印象。
+> 有意不做的：§2.1/§2.2/§2.3 的 `MESSAGE-INTEGRITY` 只断言存在与长度 —— 那是**短凭证**
+> 签名（key = 口令），与 `--realm` 的长凭证不是同一套 key。长凭证的 HMAC 由 §14 的
+> `auth` 项、`stun-types` 双向用例与 RFC 5769 §2.4 向量各自覆盖。
 
 ## 7. 1.7 `cargo-fuzz`（解析路径）
 
@@ -301,7 +303,7 @@ macOS / Windows 的 runner 结果只能由真实 CI 产生。本任务硬约束�
 
 ## 9. 失败项与判定
 
-**本轮没有失败项**（41/41 项子用例 ok）。但有三处「看起来像差异」的点，判定如下：
+**本轮没有失败项**（42/42 项子用例 ok）。但有三处「看起来像差异」的点，判定如下：
 
 | # | 观察 | 判定 | 依据 |
 | --- | --- | --- | --- |
@@ -407,3 +409,53 @@ ok: 300 仍从入口 socket 回（重定向优先于 CHANGE-REQUEST）
 > 500 不在探针里：它只在「发送失败」时出现，正常路径不可达。覆盖由
 > `server_error_for` 的映射表 + Linux 上 `RESPONSE-PORT 0` 的真实 `send_to` 失败 e2e 提供
 > （`cargo test`，见 README「协议闭环」）。
+
+## 14. 鉴权新增项（`auth`：长期凭据 401 → MESSAGE-INTEGRITY → 200）
+
+任务 `.trellis/tasks/11-19-rstun-auth`。探针**自己**用 `hashlib` / `hmac` 算
+`MD5(user:realm:pass)` 与 HMAC-SHA1（不调用被测实现的任何代码），所以「服务端接受了它」
+与「它能验服务端的响应」是两条独立断言。
+
+```bash
+bash script/lab/rstun-interop.sh --item auth
+# rstun --listen 127.0.0.1:34792 --realm example.org --auth-secret interop-secret \
+#       --auth-file <(echo user:pass) --rate-limit
+```
+
+```text
+[probe] mode=auth-long-term server=127.0.0.1:34792
+ok: 无凭据 → 0x0111 = 0x0111
+ok: ERROR-CODE = 401 Unauthorized
+ok: 401 带 REALM = example.org
+ok: 401 带 22 字符的无状态 NONCE
+ok: 401 带 PASSWORD-ALGORITHMS（MD5 + SHA256）
+ok: 响应类型 0x0101 = 0x0101
+ok: transaction id 原样回显
+ok: 200 带 MESSAGE-INTEGRITY（§10.2.2）
+ok: 响应的 HMAC-SHA1 可被独立实现验证
+ok: 错口令 → 401
+ok: USERHASH = 完整 SHA-256（32 字节）
+ok: 响应类型 0x0101 = 0x0101
+ok: transaction id 原样回显
+ok: USERHASH（32 字节）请求 → 200，且响应可被独立验签
+ok: 16 字节 USERHASH → 401（长度不是 32）
+info: 401 挑战 = 96 字节；错口令的重试得到 96 字节的 401
+```
+
+`USERHASH` 两行覆盖复核 B1：32 字节（RFC 8489 §14.4）→ 200；16 字节截断值 → 401
+（服务端不再自洽于「截断前缀」这一错误约定）。
+
+**`stun-types` 方向（`cargo test`，`tests_interop`）**：第三方 crate 用
+`LongTermKeyCredentials::make_key()` + `add_message_integrity()` 签一条请求 → 我们的服务端
+认证通过；我们的 200 再由它的 `validate_integrity()` 验签，SHA1 与 SHA256 各一条。
+这条比探针更硬：key 派生、HMAC 覆盖范围、Length 调整三处只要有一处不同就会红。
+
+**RFC 5769 §2.4 向量**（`auth::tests::rfc5769_long_term_vector_verifies`）：
+RFC 原文的 116 字节长凭证请求，`MESSAGE-INTEGRITY = f6702465…`，用它锁死**校验侧**公式。
+
+**为什么不是 `turnutils_stunclient -u/-w/-r`**：本机 coturn 4.6.1-2 的
+`turnutils_stunclient` 是**无鉴权选项**的构建（`turnutils_stunclient --help` 只列
+`-p` / `-L` / `-f`，`-u test` 直接报 `invalid option -- 'u'`），所以这条命令在本环境
+**不可执行**。而且 coturn 的 STUN Binding 本身**不要求**鉴权（`--lt-cred-mech` 下裸 Binding
+仍回 200，实测），因此也无法用它当服务端 oracle。替代证据是上面三条：独立 Python 客户端、
+`stun-types` 的签/验双向、RFC 5769 §2.4 原文向量。

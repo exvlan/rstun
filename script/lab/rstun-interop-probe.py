@@ -22,6 +22,8 @@ RESPONSE-PORT 的目的端口、RFC 5780 四条 change 路径的**回包源地�
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import os
 import socket
 import struct
@@ -42,6 +44,10 @@ ATTR_UNKNOWN_ATTRIBUTES = 0x000A
 ATTR_REALM = 0x0014
 ATTR_NONCE = 0x0015
 ATTR_XOR_MAPPED_ADDRESS = 0x0020
+ATTR_MESSAGE_INTEGRITY_SHA256 = 0x001C
+ATTR_PASSWORD_ALGORITHM = 0x001D
+ATTR_USERHASH = 0x001E
+ATTR_PASSWORD_ALGORITHMS = 0x8002
 ATTR_PRIORITY = 0x0024
 ATTR_USE_CANDIDATE = 0x0025
 ATTR_PADDING = 0x0026
@@ -274,6 +280,133 @@ class Client:
 
 
 # ---------- 各 mode ----------
+
+
+# ---------- 鉴权（RFC 5389 §10 / RFC 8489 §9.2） ----------
+
+
+def long_term_key(algorithm: str, user: str, realm: str, password: str) -> bytes:
+    """key = MD5/SHA256(username:realm:password)（RFC 5389 §15.4 / RFC 8489 §9.2.2）。"""
+    material = f"{user}:{realm}:{password}".encode()
+    return hashlib.sha256(material).digest() if algorithm == "sha256" else hashlib.md5(material).digest()
+
+
+def sign(frame: bytes, algorithm: str, key: bytes) -> bytes:
+    """追加 MESSAGE-INTEGRITY(-SHA256)：HMAC 覆盖到该属性之前，Length 指向其末尾。"""
+    size = 24 if algorithm == "md5" else 36
+    body_len = len(frame) - 20
+    prefix = bytearray(frame)
+    prefix[2:4] = struct.pack("!H", body_len + size)
+    if algorithm == "md5":
+        mac = hmac.new(key, bytes(prefix), hashlib.sha1).digest()
+        attr_type = ATTR_MESSAGE_INTEGRITY
+    else:
+        mac = hmac.new(key, bytes(prefix), hashlib.sha256).digest()
+        attr_type = ATTR_MESSAGE_INTEGRITY_SHA256
+    frame = bytearray(frame)
+    frame[2:4] = struct.pack("!H", body_len + size)
+    return bytes(frame) + struct.pack("!HH", attr_type, len(mac)) + mac
+
+
+def verify_integrity(response: bytes, algorithm: str, key: bytes) -> bool:
+    """独立验证响应里的 MESSAGE-INTEGRITY（同一个公式，反方向）。"""
+    size = 24 if algorithm == "md5" else 36
+    attr_type = ATTR_MESSAGE_INTEGRITY if algorithm == "md5" else ATTR_MESSAGE_INTEGRITY_SHA256
+    message = decode(response)
+    offset = 20
+    for kind, value in message["attributes"]:
+        if kind == attr_type:
+            prefix = bytearray(response[:offset])
+            prefix[2:4] = struct.pack("!H", offset - 20 + size)
+            expected = (
+                hmac.new(key, bytes(prefix), hashlib.sha1).digest()
+                if algorithm == "md5"
+                else hmac.new(key, bytes(prefix), hashlib.sha256).digest()
+            )
+            return hmac.compare_digest(expected, value)
+        offset += 4 + len(value) + ((-len(value)) % 4)
+    return False
+
+
+def probe_auth_long_term(args) -> None:
+    """长期凭据全流程：无凭据 → 401（REALM/NONCE/PASSWORD-ALGORITHMS），
+    带 MESSAGE-INTEGRITY 重试 → 200 且响应可独立验签，错口令 → 401。
+
+    这是探针**自己**算的 key 与 HMAC（hashlib/hmac），不是把服务端的结果再喂回去。
+    """
+    user, password, realm = args.auth_user, args.auth_password, args.auth_realm
+    client = client_for(args.server_addr)
+    try:
+        transaction_id = os.urandom(12)
+        response, _ = client.udp_exchange(build_request(transaction_id), args.server_addr)
+        message = decode(response)
+        check(message["type"] == MSG_BINDING_ERROR, f"无凭据 → 0x{message['type']:04x} = 0x0111")
+        check(error_code(message) == 401, "ERROR-CODE = 401 Unauthorized")
+        check(attr(message, ATTR_REALM) == realm.encode(), f"401 带 REALM = {realm}")
+        nonce = attr(message, ATTR_NONCE)
+        check(nonce is not None and len(nonce) == 22, "401 带 22 字符的无状态 NONCE")
+        algorithms = attr(message, ATTR_PASSWORD_ALGORITHMS)
+        check(
+            algorithms is not None and b"\x00\x01" in algorithms and b"\x00\x02" in algorithms,
+            "401 带 PASSWORD-ALGORITHMS（MD5 + SHA256）",
+        )
+        challenge_size = len(response)
+
+        credentials = (
+            attribute(ATTR_USERNAME, user.encode())
+            + attribute(ATTR_REALM, realm.encode())
+            + attribute(ATTR_NONCE, nonce)
+        )
+        key = long_term_key("md5", user, realm, password)
+        transaction_id = os.urandom(12)
+        request = sign(build_request(transaction_id, credentials), "md5", key)
+        response, _ = client.udp_exchange(request, args.server_addr)
+        message = decode(response)
+        expect_success(message, transaction_id)
+        check(attr(message, ATTR_MESSAGE_INTEGRITY) is not None, "200 带 MESSAGE-INTEGRITY（§10.2.2）")
+        check(verify_integrity(response, "md5", key), "响应的 HMAC-SHA1 可被独立实现验证")
+
+        transaction_id = os.urandom(12)
+        wrong = sign(
+            build_request(transaction_id, credentials),
+            "md5",
+            long_term_key("md5", user, realm, password + "-wrong"),
+        )
+        response, _ = client.udp_exchange(wrong, args.server_addr)
+        check(error_code(decode(response)) == 401, "错口令 → 401")
+
+        # USERHASH（RFC 8489 §14.4）：完整 SHA-256（32 字节），请求里没有 USERNAME。
+        sha_key = long_term_key("sha256", user, realm, password)
+        digest = hashlib.sha256(f"{user}:{realm}".encode()).digest()
+        check(len(digest) == 32, "USERHASH = 完整 SHA-256（32 字节）")
+        userhash_request = (
+            attribute(ATTR_USERHASH, digest)
+            + attribute(ATTR_REALM, realm.encode())
+            + attribute(ATTR_NONCE, nonce)
+            + attribute(ATTR_PASSWORD_ALGORITHM, struct.pack("!HH", 0x0002, 0))
+        )
+        transaction_id = os.urandom(12)
+        request = sign(build_request(transaction_id, userhash_request), "sha256", sha_key)
+        response, _ = client.udp_exchange(request, args.server_addr)
+        expect_success(decode(response), transaction_id)
+        check(
+            verify_integrity(response, "sha256", sha_key),
+            "USERHASH（32 字节）请求 → 200，且响应可被独立验签",
+        )
+        # 16 字节的截断值不是 USERHASH（RFC 8489 §14.4 定长 32）。
+        truncated = (
+            attribute(ATTR_USERHASH, digest[:16])
+            + attribute(ATTR_REALM, realm.encode())
+            + attribute(ATTR_NONCE, nonce)
+            + attribute(ATTR_PASSWORD_ALGORITHM, struct.pack("!HH", 0x0002, 0))
+        )
+        transaction_id = os.urandom(12)
+        request = sign(build_request(transaction_id, truncated), "sha256", sha_key)
+        response, _ = client.udp_exchange(request, args.server_addr)
+        check(error_code(decode(response)) == 401, "16 字节 USERHASH → 401（长度不是 32）")
+        print(f"info: 401 挑战 = {challenge_size} 字节；错口令的重试得到 {len(response)} 字节的 401")
+    finally:
+        client.close()
 
 
 def probe_basic(args) -> None:
@@ -678,6 +811,7 @@ MODES = {
     "mapped": probe_mapped,
     "ice": probe_ice,
     "auth": probe_auth,
+    "auth-long-term": probe_auth_long_term,
     "unknown": probe_unknown,
     "padding": probe_padding,
     "response-port": probe_response_port,
@@ -702,6 +836,9 @@ def main() -> int:
     parser.add_argument("--change", type=lambda text: int(text, 0), default=0,
                         help="CHANGE-REQUEST 标志位（0x02 换端口 / 0x04 换 IP / 0x06 两者）")
     parser.add_argument("--size", type=int, default=128, help="padding 模式的 PADDING 长度")
+    parser.add_argument("--auth-user", default="user", help="auth-long-term 模式的用户名")
+    parser.add_argument("--auth-password", default="pass", help="auth-long-term 模式的口令")
+    parser.add_argument("--auth-realm", default="example.org", help="auth-long-term 模式的 realm")
     args = parser.parse_args()
 
     args.server_addr = parse_addr(args.server)
