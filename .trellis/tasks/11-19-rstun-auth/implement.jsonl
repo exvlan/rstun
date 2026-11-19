@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/protocol-errors.md", "reason": "401/438/300 的判定顺序与错误码矩阵必须一致"}
+{"file": ".trellis/spec/backend/abuse-guard.md", "reason": "401/438 必须计入限速桶；放大面登记"}
+{"file": ".trellis/tasks/11-19-rstun-auth/design.md", "reason": "nonce 无状态格式、key 派生、判定顺序"}
+{"file": ".trellis/tasks/11-19-rstun-turn-udp/design.md", "reason": "T1 复用本任务的长期凭据与 nonce 接口"}
