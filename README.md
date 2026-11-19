@@ -34,24 +34,91 @@ Serve STUN Binding over UDP (and TCP with --tcp)
 Usage: rstun server [OPTIONS]
 
 Options:
-      --listen <ADDR>      address to bind over UDP (and TCP with --tcp), repeatable; defaults to
-                           0.0.0.0:3478. With --alt-listen the first IPv4 address here is the RFC
-                           5780 primary; every other address (and all --listen-v6) only serves plain
-                           Binding
-      --listen-v6 <ADDR>   IPv6 address to bind, repeatable; bound v6-only so it can coexist with
-                           --listen. Never part of RFC 5780: these sockets only serve plain Binding
-      --alt-listen <ADDR>  second public IP (RFC 5780 "other address"); enables CHANGE-REQUEST,
-                           RESPONSE-ORIGIN and OTHER-ADDRESS. Only the IP is used: the port comes
-                           from --alt-port. Primary = the first IPv4 --listen address; other
-                           addresses (including --listen-v6) stay plain Binding
-      --alt-port <PORT>    RFC 5780 "other port"; defaults to the --listen port + 1. Used as the
-                           source port of a `CHANGE-REQUEST` answer and as half of `OTHER-ADDRESS`.
-                           (`RESPONSE-PORT` names a *destination* port and never refers to this.)
-      --tcp                also answer STUN Binding over TCP on every listen address
-      --mapped-address     also emit the legacy MAPPED-ADDRESS (0x0001) next to XOR-MAPPED-ADDRESS,
-                           for RFC 3489-era clients; off by default (response bytes stay unchanged)
-      --verbose            log every Binding request with its source and mapped address
-  -h, --help               Print help
+      --listen <ADDR>
+          address to bind over UDP (and TCP with --tcp), repeatable; defaults to 0.0.0.0:3478. With
+          --alt-listen the first IPv4 address here is the RFC 5780 primary; every other address (and
+          all --listen-v6) only serves plain Binding
+
+      --listen-v6 <ADDR>
+          IPv6 address to bind, repeatable; bound v6-only so it can coexist with --listen. Never
+          part of RFC 5780: these sockets only serve plain Binding
+
+      --alt-listen <ADDR>
+          second public IP (RFC 5780 "other address"); enables CHANGE-REQUEST, RESPONSE-ORIGIN and
+          OTHER-ADDRESS. Only the IP is used: the port comes from --alt-port. Primary = the first
+          IPv4 --listen address; other addresses (including --listen-v6) stay plain Binding
+
+      --alt-port <PORT>
+          RFC 5780 "other port"; defaults to the --listen port + 1. Used as the source port of a
+          `CHANGE-REQUEST` answer and as half of `OTHER-ADDRESS`. (`RESPONSE-PORT` names a
+          *destination* port and never refers to this.)
+
+      --tcp
+          also answer STUN Binding over TCP on every listen address
+
+      --mapped-address
+          also emit the legacy MAPPED-ADDRESS (0x0001) next to XOR-MAPPED-ADDRESS, for RFC 3489-era
+          clients; off by default (response bytes stay unchanged)
+
+      --check-fingerprint
+          validate FINGERPRINT (RFC 5389 §15.5) when a request carries one: it must be the last
+          attribute and its CRC must match. Off by default, so a request without FINGERPRINT is
+          answered exactly as before
+
+      --fingerprint-action <ACTION>
+          what a FINGERPRINT with a wrong CRC gets: `answer` = 400 Bad Request (the default), `drop`
+          = no response. `drop` needs --check-fingerprint
+
+          Possible values:
+          - answer: `400 Bad Request` (RFC 5389 §15.5 makes a bad fingerprint a bad message)
+          - drop:   No response at all — for deployments that do not want to answer probes with a
+            broken fingerprint (still counted, see `ServerStats`)
+
+          [default: answer]
+
+      --alternate-server <ADDR>
+          answer every Binding request with `300 Try Alternate` + ALTERNATE-SERVER (RFC 5389
+          §15.11), pointing at this instance; repeatable, only the first address is used. Redirect
+          wins over RFC 5780
+
+      --verbose
+          log every Binding request with its source and mapped address
+
+      --rate-limit [<REQ/S>]
+          per-source-IP token bucket (req/s), UDP and TCP; bare flag = 200. Sources named by --allow
+          skip this bucket; off by default
+
+      --rate-burst <N>
+          burst size of the --rate-limit bucket; defaults to 2x its rate
+
+      --rate-limit-port [<REQ/S>]
+          per source IP+port token bucket (req/s); bare flag = 20
+
+      --global-rate <REQ/S>
+          server-wide token bucket (req/s): the last line before the sockets
+
+      --max-inflight <N>
+          cap on work held at once: one slot per UDP datagram (until answered) and per TCP
+          connection (until closed). Over the cap, datagrams are dropped and connections refused
+
+      --reflect-min-request <BYTES>
+          refuse RESPONSE-PORT / CHANGE-REQUEST requests shorter than BYTES (default 20 = the STUN
+          header; a 28-byte RFC 5780 probe must pass). Raising it trades RFC 5780 compatibility for
+          a stricter floor
+
+      --reflect-ratio <RATIO>
+          refuse RESPONSE-PORT / CHANGE-REQUEST requests whose answer would exceed `max(request x
+          RATIO, request + 32)` (default 2.0; the 32 bytes are the fixed XOR + RFC 5780 address
+          attributes, SOFTWARE is omitted for small probes). Enables the guard
+
+      --allow <CIDR>
+          CIDR whose sources bypass the per-source rate limits and the reflection guard, repeatable
+
+      --deny <CIDR>
+          CIDR whose sources are refused outright, repeatable; wins ties with --allow
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 - 裸 `rstun`（无子命令）**打印帮助并以退出码 2 结束**：不给参数属于用法错误，
@@ -74,6 +141,9 @@ Options:
 | `Binding Request` + `RESPONSE-PORT` + `PADDING`                                                     | `400 Bad Request`（RFC 5780 §6："the server MUST return an error response of type 400"；§7.5 `MUST NOT process` 与 §10 `are rejected` 同指这条）                                            |
 | `Binding Request` + 未知的 **comprehension-required** 属性（如 `0x0033`）                           | `420 Unknown Attribute`（`0x0111`）+ `ERROR-CODE 420` + `UNKNOWN-ATTRIBUTES`（`0x000A`，每个类型 2 字节，值长度恰为 `2×N`；不足 4 字节的由通用 TLV padding 补齐且**不计入** Length，§15.9） |
 | 其它 method 的 **request**（如 TURN `Allocate` `0x003`）                                            | 该 method **自己的** `4xx` 错误响应 + `ERROR-CODE 400 Bad Request`（RFC 5389 §7.3.1）                                                                                                       |
+| `Binding Request` + `FINGERPRINT`（**`--check-fingerprint` 开启**）                                  | 合法 → 普通 200；CRC 不符 → `400`（`--fingerprint-action drop` 时静默丢弃并计数）；**不在末位 → 一律 `400`**。默认关闭：不开开关时 `FINGERPRINT` 照旧被忽略，字节与 `26.410.100` 一致 |
+| **任意** `Binding Request`（配置了 `--alternate-server <ip:port>`）                                  | `300 Try Alternate` + `ALTERNATE-SERVER`（`0x8023`，明文地址布局），从收到请求的 socket 回；**重定向优先于 RFC 5780**（带 `CHANGE-REQUEST`/`RESPONSE-PORT` 也回 300）；非 Binding 方法仍是 400 |
+| 内部失败（`send_to` 失败，且错误不属于客户端地址问题）                                              | `500 Server Error`（固定文案、固定 **40 字节**），`io::Error` 细节只进日志                                                                                                                  |
 | indication / response                                                                               | 静默丢弃（服务端不是客户端）                                                                                                                                                                |
 | 畸形包（短于头部、magic cookie 错、长度不对齐、属性越界）                                            | 丢弃并计数，**不 panic、不打挂监听**                                                                                                                                                        |
 
@@ -92,6 +162,28 @@ Options:
   `received / answered / dropped` 统计；开了抗滥用时前面还有一行 `abuse guard counters`。
 - 日志只走 stdout/stderr（`tracing`）：`RUST_LOG` 优先，否则 `--verbose` → `debug`，
   默认 `info`。**不写滚动文件**（容器/systemd 自己采集）。
+
+### RFC 支持子集
+
+| RFC | 覆盖 | 说明 |
+| --- | --- | --- |
+| **RFC 5389** | 服务端全行为 | Binding、`XOR-MAPPED-ADDRESS`、`SOFTWARE`、`MAPPED-ADDRESS`（可选）、`ERROR-CODE`（300/400/420/500）、`UNKNOWN-ATTRIBUTES`、`FINGERPRINT`（`--check-fingerprint` 校验）、`ALTERNATE-SERVER`（`--alternate-server`） |
+| **RFC 5780** | 全量 | `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`（四条 change 路径，见下文） |
+| **RFC 8489** | 属性处理 | `MESSAGE-INTEGRITY-SHA256` / `PASSWORD-ALGORITHM` / `USERHASH` 在「已知属性」表内（不触发 420）；`PASSWORD-ALGORITHMS`（`0x8002` 类）属 comprehension-optional，按 §7.3.1 直接忽略。鉴权本身属独立任务（`rstun-auth`），本服务**不发** 401/438 |
+| **RFC 8445（ICE）** | 属性容忍 | `PRIORITY` / `USE-CANDIDATE` / `ICE-CONTROLLING` / `ICE-CONTROLLED` 不触发 420 |
+
+### 错误码矩阵
+
+| 码 | 触发 | 备注 |
+| --- | --- | --- |
+| `300` | 配置了 `--alternate-server`（每个 Binding 请求） | 带 `ALTERNATE-SERVER`；**不带** `XOR-MAPPED-ADDRESS`；优先于 RFC 5780 与 420 |
+| `400` | 非 Binding 方法；`PADDING` + `RESPONSE-PORT`；`FINGERPRINT` 不在末位 / 值不匹配（默认） | 不带 `UNKNOWN-ATTRIBUTES` |
+| `420` | 请求带未知 comprehension-required 属性 | 带 `2N` 字节的 `UNKNOWN-ATTRIBUTES` |
+| `438` | nonce 过期 | **未实现**（属 `rstun-auth`）；本服务不会发出 |
+| `500` | 响应编码不变量被破坏、`send_to` 失败、内部不可恢复错误 | 固定文案 `Server Error`，固定 **40 字节**，不泄露 `io::Error` |
+
+`--check-fingerprint` / `--alternate-server` 两个开关**默认关闭**：不给它们时，任何请求的响应字节与
+`26.410.100` 完全一致（`plain_response_bytes_are_frozen` 与 27 组「旧二进制 vs 新二进制」逐字节对照）。
 
 ### 420 与「已知属性」表
 
@@ -116,9 +208,51 @@ RFC 5389 §7.3.1 要求：请求里出现**服务端没实现的 comprehension-r
 **默认关闭**：开启会让每个响应多 12 字节，对现代客户端毫无意义。开启后属性顺序为
 `XOR-MAPPED-ADDRESS` → `MAPPED-ADDRESS` → （RFC 5780 两个）→ `SOFTWARE` → （`PADDING`）。
 
+### 协议闭环：`--check-fingerprint` / `--alternate-server`
+
+两个开关都**默认关闭**；关闭时既不二次解析、也不改任何字节（27 组「旧二进制 vs 新二进制」逐字节
+对照覆盖普通 Binding / SOFTWARE / FINGERPRINT / 420 / PADDING / RESPONSE-PORT / CHANGE-REQUEST / 400
+× 默认 / `--mapped-address` / `--alt-listen`）。
+
+**`--check-fingerprint`**（RFC 5389 §15.5）
+
+- 只校验**请求**（indication / response 本来就不回）。`FINGERPRINT` 必须**是最后一个属性**、值恰好
+  4 字节，且等于 `CRC32(消息中该属性之前的字节) XOR 0x5354554e`。
+  CRC 的覆盖范围**包含**「Length 已计入 FINGERPRINT」的头部——这是 §15.5 的原意
+  （"this value must be correct and include the CRC attribute as part of the message length"），
+  与 RFC 5769 §2.1–§2.3 的标准字节一致。
+- 不匹配 → `400`；`--fingerprint-action drop` 时静默丢弃并计入 `fingerprint_rejected`（同时 +1 `dropped`）。
+- **结构错误**（`FINGERPRINT` 后面还有属性、或值不是 4 字节）永远 `400`：客户端连消息边界都算错了，
+  静默丢弃只会让它以为路径不通。
+- TCP 上同样校验；drop 模式下该帧不回包，连接保持（后续帧照常处理）。
+
+**`--alternate-server <ip:port>`**（RFC 5389 §15.11）
+
+- 可重复，**只取第一个**（其余在启动日志里告警）。配置后**所有** Binding 请求都得到
+  `300 Try Alternate` + `ALTERNATE-SERVER`；`CHANGE-REQUEST` / `RESPONSE-PORT` **被忽略**（重定向优先），
+  回包始终从收到请求的 socket 发往请求源。
+- 响应大小：IPv4 **56 字节**（20 头 + 24 `ERROR-CODE` + 12 地址），IPv6 68 字节。
+  它**不受**反射防护的比例规则约束：那条规则只管带 `RESPONSE-PORT` / `CHANGE-REQUEST` 的请求，
+  而配置了 `--alternate-server` 时防护**估算的就是这个 300**（不会拿一个永远不发的成功响应去估）。
+  但 20 字节普通 Binding → 56 字节 = 2.80×，与其它「非重定向应答」属同一类已知放大面，
+  靠每源 IP 令牌桶兜底（见「反射防护」的边界与已知项）。
+
+**`500 Server Error`**（RFC 5389 §15.6）
+
+- 只在「请求已解析、原本要回包，但发送/编码失败」时出现：`server_error_for` 对
+  `ConnectionRefused` / `NetworkUnreachable` / `AddrNotAvailable` **不映射**（那是客户端地址问题，
+  回 500 既不准也没用），其余错误映射为 500。
+- 固定 `Server Error` 文案、固定 **40 字节**（20 头 + 20 `ERROR-CODE`）；`io::Error` 只进 `warn` 日志。
+  `RESPONSE-PORT 0` 触发 500 时最大 `40/28 ≈ 1.43×`，仍低于既有普通 Binding `2.60×` 基线。
+- 发送 500 本身失败时只记 `debug`，不会重试成环。
+- UDP 的 `send_to` 失败会回 500；TCP 上「写失败」意味着连接已不可用（没有可回包的信道），
+  只有**编码不变量**失败才会在同一条连接上回 500。
+
 ### 未实现（有意）
 
-- TURN（`Allocate`/`Refresh`/`Channel`）、鉴权。
+- TURN（`Allocate`/`Refresh`/`Channel`）、鉴权（401/438）。
+- `FINGERPRINT` 默认**不校验**（保持字节兼容），需要显式 `--check-fingerprint`。
+- `ALTERNATE-SERVER` 只接受 `ip:port` 形式，且只用一个目标（RFC 也允许 domain 形式）。
 - `RESPONSE-PORT` 在 **TCP** 上忽略（回包只能沿原连接返回；§5 的这套机制只定义在 UDP 上）。
 
 ## RFC 5780（NAT 行为发现）
@@ -288,9 +422,10 @@ datagram 的**目的地址**。那是平台相关代码（Linux/Windows/BSD 各�
 recv → 名单（deny 优先 → 直接拒；allow 命中 → 跳过每源桶与反射防护）
      → 在途上限（Semaphore，满则丢）
      → 全局限速 → 每源 IP → 每源 IP+端口
+     → FINGERPRINT 校验（--check-fingerprint：结构错误 400，不匹配 400 或丢弃）
      → 反射防护（仅 UDP；带 RESPONSE-PORT，或带 CHANGE-REQUEST 且启用了 --alt-listen）
        └ PADDING + RESPONSE-PORT 的 §6 400 也走这条「拒绝不许放大」的路径
-     → decide() → 发送
+     → decide()（300 / 420 / 400 / 200）→ 发送（send_to 失败按映射回 500）
 ```
 
 顺序与代码一致（`Admission::admit` = 名单 → 在途 → 速率）：运维的 `--deny` 不该被报成
@@ -365,6 +500,11 @@ recv → 名单（deny 优先 → 直接拒；allow 命中 → 跳过每源桶�
   20 字节普通 Binding 在 `--alt-listen` 下得到 **76 字节 = 3.80×**（无 alt-listen 52 字节 = 2.60×）；
   24 字节未知属性得到 `420` **56 字节 = 2.33×**（28 字节请求则是 2.00×）。
   这正是每源 IP 令牌桶存在的理由：无属性放大面靠限速兜底，不靠本条防护。
+- **`--alternate-server` 的 300 也在这条规则之外**：20 字节普通 Binding → **56 字节（2.80×）**，
+  与 `420`（2.33×）/ 普通 Binding（3.80×）同属「无重定向属性的应答」。带 `RESPONSE-PORT` /
+  `CHANGE-REQUEST` 的请求仍受本防护管辖，且估算的是**实发的 300**（56 字节），不是成功响应。
+- **`500 Server Error` 固定 40 字节**（`ERROR-CODE` 只有一句固定文案），且只在原本「回不了包」的
+  路径出现；请求 < 20 字节根本不会被解析，所以它不构成新的放大面。
 - 不带 `--alt-listen` 时 `CHANGE-REQUEST` 无法换源（我们没有第二个地址），因此**不触发**本防护；
   否则 28 字节的普通探针会被白拒。
 - **兼容 coturn**：`turnutils_stunclient` 打 `--alt-listen` 且开启防护（不调参）时，
@@ -377,6 +517,8 @@ recv → 名单（deny 优先 → 直接拒；allow 命中 → 跳过每源桶�
 
 - 退出（Ctrl-C / `SIGTERM`）时多打印一行：
   `rstun: abuse guard counters rate_limited_ip=… rate_limited_port=… rate_limited_global=… inflight_dropped=… denied=… reflect_rejected=… allowlisted=…`；
+  随后的 `rstun: stopped` 行里另有 `fingerprint_rejected=`（`--check-fingerprint` 的拒绝数，
+  drop 模式下同样计数、并额外 +1 `dropped`）。
 - `--verbose`（`debug`）下，每个被拒请求打印 `reason=`（`denied (CIDR)` / `in-flight cap` /
   `global rate` / `per-source-IP rate` / `per-source-port rate`）与对应 `counter=` 字段。
 - 反射拒绝会**同时** +1 到 `reflect_rejected` 与 `dropped`；如果那条 400 真的发出去了，
@@ -413,7 +555,7 @@ recv → 名单（deny 优先 → 直接拒；allow 命中 → 跳过每源桶�
 |      | `rstun`                                                                                                                                                                                         | coturn                                        |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
 | 定位 | 只做 STUN，Binding + **NAT 行为发现**的**最小服务**                                                                                                                                             | 完整 STUN/TURN（中继）+ 鉴权 + 多租户         |
-| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`（无 TURN） | RFC 5389 / 5780 全量 / TURN（5766、turns 等） |
+| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`（无 TURN） | RFC 5389 / 5780 全量 / TURN（5766、turns 等） |
 | 配置 | 纯命令行参数（无配置文件）                                                                                                                                                                      | 上百行 `turnserver.conf`、数据库/鉴权后端     |
 | 依赖 | 纯 Rust，无 OpenSSL/libevent                                                                                                                                                                    | 依赖 libevent/OpenSSL + 系统配置              |
 | 部署 | 单二进制 / 一个几十 MB 的镜像                                                                                                                                                                   | 发行版包 / 官方镜像 + 配置卷                  |
@@ -584,7 +726,7 @@ clap  socket2  tokio  tracing  tracing-subscriber
 ## 测试
 
 ```bash
-cargo test          # 121 个单测：25 protocol + 7 rfc5780 + 57 server + 27 limit + 5 interop
+cargo test          # 141 个单测：3 crc32 + 30 protocol + 7 rfc5780 + 67 server + 27 limit + 7 interop
 ```
 
 覆盖：
@@ -625,8 +767,16 @@ cargo test          # 121 个单测：25 protocol + 7 rfc5780 + 57 server + 27 l
   重复地址（alt socket 又写进 `--listen`）不会绑两次。
 - **互操作（`tests_interop`）**：RFC 5769 §2.1–§2.4 的四段**标准字节**（请求、IPv4 响应、
   IPv6 响应、长凭证请求）全部能解析/解码，且 §2.2/§2.3 的 `XOR-MAPPED-ADDRESS`
-  我们能**逐字节重建**；`stun-types` 2.0.5 双向（它编的请求我们解、我们编的响应它解，
-  含 `MAPPED-ADDRESS` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `PADDING`）。
+  我们能**逐字节重建**；§2.1–§2.3 的 `FINGERPRINT` 被判为合法、改一位即不匹配；
+  `stun-types` 2.0.5 双向（它编的请求我们解、我们编的响应它解，
+  含 `MAPPED-ADDRESS` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `PADDING`），
+  并能解出我们的 `300`（`ErrorCode 300` + `AlternateServer`）与 `500`（`ErrorCode 500`）。
+- **协议闭环**：`crc32` 用 RFC 5769 §2.1 的 FINGERPRINT 常量锁死（`crc32(prefix)^0x5354554e
+  == 0xe57a3bcf`）；`check_fingerprint` 覆盖 absent / 合法 / 错值 / 非末位 / 重复 / 长度非 4；
+  UDP e2e 五态（合法 200、错值 400、非末位 400、drop 无响应且有计数、默认关闭时字节不变）；
+  `300` 的IPv4/IPv6 编码与 `stun-types` 解码、重定向优先于 `CHANGE-REQUEST`、
+  非 Binding 仍 400；`500` 的映射表（三种地址错误不映射、其余映射）与 40 字节响应，
+  以及 Linux 上真实 `send_to` 失败（`RESPONSE-PORT 0`）触发 500 的 e2e。
 - **抗滥用（`limit`）**：令牌桶速率/突发边界、空闲超 TTL 重置、**时钟回退不多发令牌**、
   条目上限与「回收到最久未用」、64 分片分散、CIDR 最长前缀 + deny 赢平局 + IPv6 +
   v4-mapped 归一化、`--allow` 只跳过每源桶（全局限速/在途上限不跳过）、
@@ -653,7 +803,8 @@ cargo test          # 121 个单测：25 protocol + 7 rfc5780 + 57 server + 27 l
 | webrtc-rs `stun` 0.17               | Rust 生态的编解码 + 客户端（含 IPv6）                         |
 | `stun-types` 2.0.5                  | 编解码 oracle（`[dev-dependencies]`，不进运行时）             |
 
-结论：四方**双向**全绿（38 项子用例 / 176 条断言），RFC 5769 四段标准字节全通过，
+结论：四方**双向**全绿（41 项子用例 / 191 条断言，`probe` 新增 `fingerprint` /
+`fingerprint-drop` / `alternate` 三项），RFC 5769 四段标准字节全通过，
 `cargo-fuzz` 解析路径 600 s 零 panic / 零挂死。
 
 `test/interop/` 里是第三方客户端夹具（Go module 与 webrtc-stun 工程源码），

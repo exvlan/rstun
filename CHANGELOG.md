@@ -5,6 +5,35 @@
 
 ## Unreleased
 
+### 协议闭环（`500` / `FINGERPRINT` / `ALTERNATE-SERVER` / RFC 8489 语义）
+
+- **`500 Server Error`**（RFC 5389 §15.6）：`send_to` 失败（除 `ConnectionRefused` /
+  `NetworkUnreachable` / `AddrNotAvailable` 这类客户端地址问题）与内部不变量失败时回 `500`，
+  不再是只写日志。响应固定 **40 字节**、固定文案 `Server Error`；`io::Error` 只进日志，
+  不泄露路径/errno，也不构成放大面。
+- **`FINGERPRINT` 校验**（RFC 5389 §15.5）：`--check-fingerprint`（默认关闭）。存在时必须
+  **是最后一个属性**且值恰好 4 字节；值 = `CRC32(消息中该属性之前的字节) XOR 0x5354554e`，
+  CRC 覆盖范围**包含「Length 已计入该属性」的头部**（§15.5 原文，与 RFC 5769 §2.1–§2.3 的
+  标准字节一致）。不匹配 → `400`；`--fingerprint-action drop` 时静默丢弃并计数
+  （`fingerprint_rejected`，同时 +1 `dropped`）；结构错误（非末位 / 长度非 4）永远 `400`。
+  关闭时 `FINGERPRINT` 照旧被忽略，字节不变。
+- **`ALTERNATE-SERVER` / `300 Try Alternate`**（RFC 5389 §15.11）：`--alternate-server <ip:port>`
+  （可重复，只取第一个）。配置后**所有** Binding 请求回 `300` + `ALTERNATE-SERVER`
+  （明文 `0|family|port|address` 布局），**重定向优先于 RFC 5780**（带 `CHANGE-REQUEST` /
+  `RESPONSE-PORT` 也回 300，且从入口 socket 回）；非 Binding 方法仍是 400。
+  IPv4 响应 56 字节 / IPv6 68 字节；**裸 Binding 的 300 不在反射防护域**，带 `RESPONSE-PORT` /
+  `CHANGE-REQUEST` 的请求仍受防护管辖，且估算的是实发的 300（不是不会被发送的成功响应）。
+- **RFC 8489 属性语义**：未开鉴权时 `MESSAGE-INTEGRITY-SHA256` / `PASSWORD-ALGORITHM` /
+  `USERHASH` 按「理解但不用」忽略（不触发 420）；鉴权（401/438）仍属 `rstun-auth`。
+- **CRC-32 自实现**：新增 `src/crc32.rs`（IEEE 查表，`const fn` 建表），零新依赖
+  （`cargo tree -e normal --depth 1` 仍是 5 个）；RFC 5769 §2.1 的 `0xe57a3bcf` 作为向量锁死。
+- **兼容性**：两个开关都不给时行为/字节与 `26.410.100` 完全一致
+  （`plain_response_bytes_are_frozen` + 27 组「旧二进制 vs 新二进制」逐字节对照：
+  9 类请求 × 默认 / `--mapped-address` / `--alt-listen`）。
+- **互操作**：`tests_interop` 新增 `300` / `500` 的 `stun-types` 解码与 RFC 5769 FINGERPRINT
+  校验；互操作矩阵 `probe` 新增 `fingerprint` / `fingerprint-drop` / `alternate` 三项，
+  共 **41 项子用例 / 191 条断言**。
+
 ### 抗滥用（默认全关）
 
 - **每源限速**：`--rate-limit [REQ/S]`（裸写 200，突发 `2×rate`，`--rate-burst` 覆盖）、
