@@ -52,7 +52,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -62,6 +62,8 @@ use tokio::{
 mod auth;
 mod crc32;
 pub mod limit;
+/// 运维面：可选的 `/healthz` + `/metrics`、drain 信号、`RSTUN_*` 映射。
+mod ops;
 pub mod protocol;
 pub mod rfc5780;
 /// T1 互操作证据：RFC 5769 向量 + `stun-types` 双向（只在测试构建里编译）。
@@ -100,6 +102,9 @@ const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 /// How long a TCP peer may take to deliver one STUN frame.
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_LISTEN_BACKLOG: i32 = 1024;
+/// Default `--drain-timeout`: how long SIGTERM may take to finish in-flight
+/// work before the process exits anyway (design §5).
+const DEFAULT_DRAIN_TIMEOUT_SECONDS: u64 = 5;
 /// `Binding` method, the only one this server implements.
 const BINDING_METHOD: u16 = 0x0001;
 
@@ -266,6 +271,24 @@ struct Args {
     /// uses SHA256). Needs --realm
     #[arg(long)]
     auth_require_sha256: bool,
+
+    /// serve `GET /healthz` (readiness) and `GET /metrics` (Prometheus text) on
+    /// this TCP address, e.g. 127.0.0.1:9100. Off by default: without it no
+    /// HTTP listener, no extra task and no change to the STUN paths
+    #[arg(long, value_name = "ADDR")]
+    health_listen: Option<SocketAddr>,
+
+    /// cap on concurrent connections to the ops endpoint (default 64). A
+    /// connection over the cap gets an immediate 503 and is closed, never
+    /// queued — queueing would keep the fd the flood is trying to exhaust.
+    /// Only meaningful with --health-listen
+    #[arg(long, value_name = "N")]
+    health_max_connections: Option<usize>,
+
+    /// how long a SIGTERM may take to drain in-flight work before exiting
+    /// anyway (seconds, default 5; 0 = stop immediately). The exit code stays 0
+    #[arg(long, value_name = "SECONDS")]
+    drain_timeout: Option<u64>,
 }
 
 /// What an invalid `FINGERPRINT` gets (`--fingerprint-action`).
@@ -280,6 +303,11 @@ enum FingerprintAction {
 }
 
 /// Counters reported when the server stops; also what `--verbose` helps debug.
+///
+/// It also carries the [`ops::Lifecycle`] (drain signal + in-flight count). That
+/// is deliberate: every listener already holds `Arc<ServerStats>`, so putting it
+/// here keeps `serve_udp` / `serve_tcp` signatures — and therefore the default,
+/// byte-frozen path — untouched.
 #[derive(Debug, Default)]
 pub struct ServerStats {
     received: AtomicU64,
@@ -287,6 +315,58 @@ pub struct ServerStats {
     dropped: AtomicU64,
     /// Requests rejected because of a bad `FINGERPRINT` (`--check-fingerprint`).
     fingerprint_rejected: AtomicU64,
+    /// `recv_from` / `accept` failures (one listener read, one metric label).
+    udp: TransportCounts,
+    tcp: TransportCounts,
+    /// Connections refused by the ops endpoint's `--health-max-connections`.
+    /// Kept apart from the STUN counters on purpose: it says nothing about STUN
+    /// traffic (and never fires without `--health-listen`).
+    ops_rejected: AtomicU64,
+    lifecycle: ops::Lifecycle,
+}
+
+/// Per-transport outcome buckets for `rstun_requests_total`.
+///
+/// Every message is counted **once** per bucket, so `ok + error + ignored +
+/// dropped` is the number of messages the transport saw — except that a
+/// `--fingerprint-action drop` request is counted in `dropped` (the guard's
+/// bucket) *and* in `ignored` (the decision). The rows are independent
+/// counters; the exit log's `received/answered/dropped` triple keeps its
+/// existing meaning, including the documented `received != answered + dropped`
+/// cases (`.trellis/spec/backend/abuse-guard.md` §4).
+#[derive(Debug, Default)]
+struct TransportCounts {
+    ok: AtomicU64,
+    error: AtomicU64,
+    ignored: AtomicU64,
+    dropped: AtomicU64,
+    socket_errors: AtomicU64,
+}
+
+/// A snapshot of one transport's buckets (`/metrics`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Buckets {
+    pub ok: u64,
+    pub error: u64,
+    pub ignored: u64,
+    pub dropped: u64,
+    pub socket_errors: u64,
+}
+
+impl TransportCounts {
+    fn bump(&self, counter: &AtomicU64) -> u64 {
+        counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn snapshot(&self) -> Buckets {
+        Buckets {
+            ok: self.ok.load(Ordering::Relaxed),
+            error: self.error.load(Ordering::Relaxed),
+            ignored: self.ignored.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            socket_errors: self.socket_errors.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl ServerStats {
@@ -304,20 +384,99 @@ impl ServerStats {
         self.fingerprint_rejected.load(Ordering::Relaxed)
     }
 
-    fn count_received(&self) {
+    /// `ok/error/ignored/dropped` (+ socket errors) for one transport.
+    pub(crate) fn buckets(&self, transport: Transport) -> Buckets {
+        self.buckets_of(transport).snapshot()
+    }
+
+    fn buckets_of(&self, transport: Transport) -> &TransportCounts {
+        match transport {
+            Transport::Udp => &self.udp,
+            Transport::Tcp => &self.tcp,
+        }
+    }
+
+    /// The drain signal every listener selects on.
+    pub fn lifecycle(&self) -> &ops::Lifecycle {
+        &self.lifecycle
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.lifecycle.is_draining()
+    }
+
+    pub fn begin_drain(&self) {
+        self.lifecycle.begin();
+    }
+
+    pub fn subscribe_drain(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.lifecycle.subscribe()
+    }
+
+    /// One unit of in-flight work; see [`ops::Lifecycle::enter`].
+    pub fn enter(&self) -> ops::InFlight {
+        self.lifecycle.enter()
+    }
+
+    pub async fn wait_idle(&self, deadline: tokio::time::Instant) -> u64 {
+        self.lifecycle.wait_idle(deadline).await
+    }
+
+    fn transport(&self, transport: Transport) -> &TransportCounts {
+        self.buckets_of(transport)
+    }
+
+    fn count_received(&self, _transport: Transport) {
         self.received.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn count_answered(&self) {
+    /// A response was sent.
+    fn count_answered(&self, transport: Transport) {
         self.answered.fetch_add(1, Ordering::Relaxed);
+        let counts = self.transport(transport);
+        counts.bump(&counts.ok);
     }
 
-    fn count_dropped(&self) {
+    /// Refused by policy (rate limit, in-flight cap, reflection guard, unframable
+    /// payload). Part of the legacy `dropped` total.
+    fn count_dropped(&self, transport: Transport) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+        let counts = self.transport(transport);
+        counts.bump(&counts.dropped);
+    }
+
+    /// malformed / internal failure: also a `dropped` in the legacy total, but
+    /// its own bucket so `/metrics` can tell "we refused it" from "we could not
+    /// read it".
+    fn count_error(&self, transport: Transport) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        let counts = self.transport(transport);
+        counts.bump(&counts.error);
+    }
+
+    /// Well-formed message we deliberately stay silent about.
+    fn count_ignored(&self, transport: Transport) {
+        let counts = self.transport(transport);
+        counts.bump(&counts.ignored);
+    }
+
+    /// A socket read/accept failure (not a message: no request is counted).
+    fn count_socket_error(&self, transport: Transport) {
+        let counts = self.transport(transport);
+        counts.bump(&counts.socket_errors);
     }
 
     fn count_fingerprint_rejected(&self) {
         self.fingerprint_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `/metrics`: connections the ops endpoint refused over its cap.
+    pub fn ops_rejected(&self) -> u64 {
+        self.ops_rejected.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn count_ops_rejected(&self) {
+        self.ops_rejected.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -437,16 +596,41 @@ impl ServerContext {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Two-phase parse: the `ArgMatches` are what tell [`ops::apply_env`] which
+    // flags the operator actually wrote (as opposed to clap's defaults), so the
+    // command line can win over `RSTUN_*` without a second, divergent parser.
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(error) => error.exit(),
+    };
+    let server_matches = matches
+        .subcommand_matches("server")
+        .cloned()
+        .unwrap_or_else(|| unreachable!("clap requires a subcommand"));
 
     match cli.command {
-        Command::Server(args) => {
+        Command::Server(mut args) => {
+            // `RSTUN_*` 必须在日志初始化**之前**应用：`RSTUN_VERBOSE=1` 要和
+            // `--verbose` 一样把过滤器调到 debug，晚一步就只影响服务而不影响日志。
+            // （`apply_env` 只在成功时才改 `args`，所以失败路径仍能用命令行值初始化日志。）
+            let applied =
+                ops::apply_env(&mut args, &server_matches, &|name| std::env::var(name).ok());
+
             // 日志初始化失败不阻断服务：与内核主路径一致，没有日志也好过起不来。
             if let Err(error) = init_logging(args.verbose) {
                 eprintln!("[rstun] failed to initialize logging: {error:#}");
             }
 
-            run(args).await
+            let applied = match applied {
+                Ok(applied) => applied,
+                Err(message) => {
+                    tracing::error!(%message, "rstun: invalid environment configuration");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            run(args, applied).await
         }
     }
 }
@@ -722,7 +906,45 @@ fn build_auth(args: &Args) -> Result<Option<auth::Auth>, String> {
 }
 
 /// Run the STUN Binding server until Ctrl-C (Unix: also SIGTERM).
-async fn run(args: Args) -> ExitCode {
+///
+/// `applied_env` is what `main` already merged from `RSTUN_*` (it has to happen
+/// there, before logging is initialized — see `main`), and is only used for the
+/// startup log.
+async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
+    if !applied_env.is_empty() {
+        tracing::info!(
+            variables = ?applied_env,
+            "rstun: configuration defaults read from the environment"
+        );
+    }
+    // 运维端点的两个参数都要在起任何 socket 之前校验完：
+    // 「给了 `--health-max-connections` 却没给 `--health-listen`」是半配置，
+    // 静默忽略会让运维以为上限生效了（本项目一贯：宁可拒绝启动）。
+    if args.health_max_connections.is_some() && args.health_listen.is_none() {
+        tracing::error!("rstun: --health-max-connections needs --health-listen");
+        return ExitCode::FAILURE;
+    }
+    let health_max_connections = match args.health_max_connections {
+        Some(0) => {
+            tracing::error!("rstun: --health-max-connections must be at least 1");
+            return ExitCode::FAILURE;
+        }
+        Some(connections) => connections,
+        None => ops::DEFAULT_MAX_CONNECTIONS,
+    };
+    let drain_timeout = match args.drain_timeout {
+        // 0 = 立即停（不等在途），显式允许；上限防手滑写出「一天」。
+        Some(seconds) if seconds <= 3600 => Duration::from_secs(seconds),
+        Some(seconds) => {
+            tracing::error!(
+                seconds,
+                "rstun: --drain-timeout must be between 0 and 3600 seconds"
+            );
+            return ExitCode::FAILURE;
+        }
+        None => Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECONDS),
+    };
+
     let (addresses, plan) = match resolve_listen(&args) {
         Ok(resolved) => resolved,
         Err(message) => {
@@ -790,24 +1012,52 @@ async fn run(args: Args) -> ExitCode {
         auth,
     });
     let mut tasks = Vec::new();
+    let mut listeners = Vec::new();
+
+    // 运维端点：只有给了 `--health-listen` 才绑定（默认零新增）。先绑再起任何任务：
+    // 与 STUN socket 同样的「要么全起、要么全不起」，不要起了一半还说自己健康。
+    let ops_listener = match args.health_listen {
+        None => None,
+        Some(address) => match tcp_listener(address) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing::error!(%address, %error, "rstun: failed to bind --health-listen");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
 
     for (local, socket) in udp {
-        tasks.push(spawn_listener(
+        let (task, health) = spawn_listener(
             format!("udp {local}"),
             serve_udp(socket, context.clone(), software.clone(), stats.clone()),
-        ));
+        );
+        tasks.push(task);
+        listeners.push(health);
     }
     for (local, listener) in tcp {
-        tasks.push(spawn_listener(
+        let (task, health) = spawn_listener(
             format!("tcp {local}"),
             serve_tcp(listener, context.clone(), software.clone(), stats.clone()),
-        ));
+        );
+        tasks.push(task);
+        listeners.push(health);
     }
     // Only a per-key table needs sweeping; a guard that is only a Semaphore or
-    // a CIDR list must not start a task it never uses.
-    if let Some(sweeper) = admission.as_ref().and_then(limit::start_sweeper) {
-        tasks.push(sweeper);
-    }
+    // a CIDR list must not start a task it never uses. Kept **out of `tasks`**:
+    // the sweeper lives until the process ends, so waiting for it would make
+    // every SIGTERM block until `--drain-timeout`.
+    let sweeper = admission.as_ref().and_then(limit::start_sweeper);
+    let listener_count = listeners.len();
+
+    let ops_task = ops_listener.map(|listener| {
+        let state = Arc::new(ops::OpsState::new(
+            listeners.clone(),
+            stats.clone(),
+            context.clone(),
+        ));
+        tokio::spawn(ops::serve_http(listener, state, health_max_connections))
+    });
 
     if let Some(admission) = &admission {
         let policy = admission.policy();
@@ -863,7 +1113,7 @@ async fn run(args: Args) -> ExitCode {
     }
     tracing::info!(
         software = %software,
-        listeners = tasks.len(),
+        listeners = listener_count,
         "rstun: started, Ctrl-C to stop"
     );
 
@@ -875,7 +1125,42 @@ async fn run(args: Args) -> ExitCode {
         }
     };
 
+    // 优雅退出（design §5）：先停「收新活」，再等在途，最后才 abort。
+    // 第二次信号立刻退出（运维兜底：drain 卡住时不必等超时）。
+    stats.begin_drain();
+    tokio::spawn(async move {
+        if wait_for_shutdown().await.is_ok() {
+            tracing::warn!("rstun: second shutdown signal, exiting without draining");
+            std::process::exit(0);
+        }
+    });
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    let mut unfinished = 0_u32;
+    for task in &mut tasks {
+        // `timeout_at` 用同一个截止时间：一个 listener 卡住不会把后面的等待翻倍。
+        if tokio::time::timeout_at(deadline, &mut *task).await.is_err() {
+            unfinished += 1;
+        }
+    }
+    let in_flight = stats.wait_idle(deadline).await;
+    if unfinished > 0 || in_flight > 0 {
+        tracing::warn!(
+            drain_timeout_ms = drain_timeout.as_millis() as u64,
+            unfinished_listeners = unfinished,
+            in_flight,
+            "rstun: drain timed out, exiting with work still pending"
+        );
+    } else {
+        tracing::info!("rstun: drained, no work in flight");
+    }
     for task in tasks {
+        task.abort();
+    }
+    if let Some(task) = sweeper {
+        task.abort();
+    }
+    if let Some(task) = ops_task {
+        // 健康端点留到最后一刻：drain 期间仍可抓取最终指标。
         task.abort();
     }
     // 被拒的请求数与协议统计分开报：前者只有开了抗滥用才非零。
@@ -915,15 +1200,26 @@ async fn run(args: Args) -> ExitCode {
 
 /// Spawn one listener task, logging if it ever stops (a dead listener must not
 /// leave the process quietly serving with fewer sockets than it announced).
-fn spawn_listener<F>(name: String, listener: F) -> tokio::task::JoinHandle<()>
+///
+/// The returned [`ops::ListenerHealth`] is what `/healthz` reads: the task holds
+/// the lease for its whole life, so *any* way of ending (error return, normal
+/// return while draining, abort) marks that listener stale.
+fn spawn_listener<F>(
+    name: String,
+    listener: F,
+) -> (tokio::task::JoinHandle<()>, ops::ListenerHealth)
 where
     F: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
 {
-    tokio::spawn(async move {
+    let health = ops::ListenerHealth::new(name.clone());
+    let lease = health.lease();
+    let task = tokio::spawn(async move {
+        let _lease = lease;
         if let Err(error) = listener.await {
             tracing::error!(listener = %name, %error, "rstun: listener stopped");
         }
-    })
+    });
+    (task, health)
 }
 
 /// Requests below this size get an answer without the optional `SOFTWARE`
@@ -1272,7 +1568,7 @@ fn decide_guarded(
     }
     let message = protocol::parse(datagram)?;
     if let Some(action) = context.fingerprint
-        && let Some(decision) = fingerprint_guard(datagram, &message, action, stats)
+        && let Some(decision) = fingerprint_guard(datagram, &message, action, transport, stats)
     {
         return Ok(decision);
     }
@@ -1306,6 +1602,7 @@ fn fingerprint_guard(
     datagram: &[u8],
     message: &protocol::Message<'_>,
     action: FingerprintAction,
+    transport: Transport,
     stats: &ServerStats,
 ) -> Option<Decision> {
     if protocol::message_class(message.msg_type) != MessageClass::Request {
@@ -1338,7 +1635,7 @@ fn fingerprint_guard(
         (_, FingerprintAction::Drop) => {
             // Counted twice on purpose: `dropped` keeps `received = answered +
             // dropped` readable for this path, `fingerprint_rejected` says *why*.
-            stats.count_dropped();
+            stats.count_dropped(transport);
             Some(Decision::Ignore("fingerprint mismatch"))
         }
     }
@@ -1495,7 +1792,7 @@ fn reflection_refusal(
     stats: &ServerStats,
 ) -> Decision {
     admission.count_reflect_rejected();
-    stats.count_dropped();
+    stats.count_dropped(inbound.transport);
     let bad_request = protocol::error_response(
         &message.transaction_id,
         BINDING_METHOD,
@@ -1509,7 +1806,7 @@ fn reflection_refusal(
     }
 }
 
-/// Serve one UDP socket until the task is aborted.
+/// Serve one UDP socket until draining starts (or the task is aborted).
 ///
 /// Two shapes, chosen once at startup:
 ///
@@ -1519,6 +1816,10 @@ fn reflection_refusal(
 ///   the in-flight cap can actually be reached. In the serial loop one listener
 ///   holds at most one permit, so a cap above 1 could never trigger and
 ///   `--max-inflight 1` would silently do nothing.
+///
+/// Draining only stops the *read*: the datagram in this task's hands finishes
+/// (including its send) before the loop exits, and the spawned shape is counted
+/// by [`ServerStats::enter`] so the shutdown path can wait for it.
 async fn serve_udp(
     socket: Arc<UdpSocket>,
     context: Arc<ServerContext>,
@@ -1531,25 +1832,36 @@ async fn serve_udp(
         .admission
         .as_ref()
         .is_some_and(|admission| admission.policy().max_inflight.is_some());
+    let mut drain = stats.subscribe_drain();
+    if stats.is_draining() {
+        return Ok(());
+    }
     let mut buffer = vec![0_u8; UDP_RECV_BUFFER];
     loop {
-        let (len, peer) = match socket.recv_from(&mut buffer).await {
+        let received = tokio::select! {
+            biased;
+            // SIGTERM: stop taking new datagrams; the socket stays bound.
+            _ = drain.changed() => break,
+            received = socket.recv_from(&mut buffer) => received,
+        };
+        let (len, peer) = match received {
             Ok(received) => received,
             Err(error) => {
                 // 单个 datagram 的读错误（瞬时 ICMP 等）不该打死监听。
+                stats.count_socket_error(Transport::Udp);
                 tracing::warn!(%local, %error, "rstun: UDP recv_from failed");
                 tokio::time::sleep(RECV_ERROR_BACKOFF).await;
                 continue;
             }
         };
-        stats.count_received();
+        stats.count_received(Transport::Udp);
         // 抗滥用准入：在解析/判定之前只做「能不能处理」的判定，不改协议语义。
         // permit 必须活到响应发出之后 —— 在途上限统计的就是「正在处理的请求」。
         let permit = match context.admit(peer) {
             None => None,
             Some(Ok(permit)) => Some(permit),
             Some(Err(refusal)) => {
-                stats.count_dropped();
+                stats.count_dropped(Transport::Udp);
                 tracing::debug!(
                     %local,
                     %peer,
@@ -1566,13 +1878,18 @@ async fn serve_udp(
             let software = software.clone();
             let stats = stats.clone();
             let datagram = buffer[..len].to_vec();
+            // Counted *before* the spawn: otherwise a SIGTERM landing in the gap
+            // could see an empty in-flight set and abort this datagram.
+            let in_flight = stats.enter();
             tokio::spawn(async move {
                 respond_to_datagram(&socket, &context, &software, &stats, local, peer, &datagram)
                     .await;
+                drop(in_flight);
                 // Releasing the permit last is what the cap counts.
                 drop(permit);
             });
         } else {
+            let in_flight = stats.enter();
             respond_to_datagram(
                 &socket,
                 &context,
@@ -1583,9 +1900,12 @@ async fn serve_udp(
                 &buffer[..len],
             )
             .await;
+            drop(in_flight);
             drop(permit);
         }
     }
+    tracing::info!(%local, "rstun: UDP listener stopped (draining)");
+    Ok(())
 }
 
 /// Map a failed `send_to` to a STUN error code, or `None` when the failure is the
@@ -1636,6 +1956,9 @@ fn server_error_bytes(frame: &[u8], code: u16) -> Option<Vec<u8>> {
 
 /// Best-effort `500 Server Error` for an internal failure (design §2).
 ///
+/// UDP-only by construction (it writes through the receiving socket); the TCP
+/// path writes its 500 in-band in `serve_tcp_connection`.
+///
 /// The reason text is fixed and the `io::Error` only goes to the log, so the
 /// response can neither leak internal detail nor grow: it is always 40 bytes
 /// (20 header + 20 `ERROR-CODE`), which also means it cannot become an
@@ -1653,7 +1976,7 @@ async fn send_server_error(
         return;
     };
     match socket.send_to(&response, peer).await {
-        Ok(_) => stats.count_answered(),
+        Ok(_) => stats.count_answered(Transport::Udp),
         Err(error) => {
             tracing::debug!(%local, %peer, %error, "rstun: 500 Server Error could not be sent")
         }
@@ -1686,7 +2009,7 @@ async fn respond_to_datagram(
     match decision {
         Ok(Decision::Respond(response)) => {
             if !response_is_encodable(&response) {
-                stats.count_dropped();
+                stats.count_dropped(Transport::Udp);
                 tracing::error!(%local, %peer, "rstun: response violates STUN wire invariants");
                 send_server_error(
                     socket,
@@ -1700,7 +2023,7 @@ async fn respond_to_datagram(
                 return;
             }
             match socket.send_to(&response, peer).await {
-                Ok(_) => stats.count_answered(),
+                Ok(_) => stats.count_answered(Transport::Udp),
                 Err(error) => {
                     tracing::warn!(%local, %peer, %error, "rstun: UDP send_to failed");
                     if let Some(code) = server_error_for(&error) {
@@ -1711,7 +2034,7 @@ async fn respond_to_datagram(
         }
         Ok(Decision::RespondFrom { from, to, bytes }) => {
             if !response_is_encodable(&bytes) {
-                stats.count_dropped();
+                stats.count_dropped(Transport::Udp);
                 tracing::error!(%local, %peer, %from, "rstun: response violates STUN wire invariants");
                 send_server_error(
                     socket,
@@ -1732,7 +2055,7 @@ async fn respond_to_datagram(
                 // Internal invariant violation: the plan only ever names sockets
                 // this process bound, so this is a bug, not a client error.
                 // Answer 500 (best effort) rather than leave the client waiting.
-                stats.count_dropped();
+                stats.count_dropped(Transport::Udp);
                 tracing::error!(
                     %local,
                     %peer,
@@ -1751,7 +2074,7 @@ async fn respond_to_datagram(
                 return;
             };
             match target.send_to(&bytes, to).await {
-                Ok(_) => stats.count_answered(),
+                Ok(_) => stats.count_answered(Transport::Udp),
                 Err(error) => {
                     tracing::warn!(
                         %local,
@@ -1767,16 +2090,18 @@ async fn respond_to_datagram(
             }
         }
         Ok(Decision::Ignore(reason)) => {
+            stats.count_ignored(Transport::Udp);
             tracing::debug!(%local, %peer, reason, "rstun: ignored message")
         }
         Err(error) => {
-            stats.count_dropped();
+            stats.count_error(Transport::Udp);
             tracing::debug!(%local, %peer, %error, "rstun: dropped malformed datagram")
         }
     }
 }
 
-/// Accept STUN-over-TCP connections until the task is aborted.
+/// Accept STUN-over-TCP connections until draining starts (or the task is
+/// aborted by the shutdown timeout).
 async fn serve_tcp(
     listener: TcpListener,
     context: Arc<ServerContext>,
@@ -1785,10 +2110,21 @@ async fn serve_tcp(
 ) -> std::io::Result<()> {
     let local = listener.local_addr()?;
     tracing::info!(%local, "rstun: TCP listener ready");
+    let mut drain = stats.subscribe_drain();
+    if stats.is_draining() {
+        return Ok(());
+    }
     loop {
-        let (stream, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            // SIGTERM: stop accepting; established connections keep draining.
+            _ = drain.changed() => break,
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
             Err(error) => {
+                stats.count_socket_error(Transport::Tcp);
                 tracing::warn!(%local, %error, "rstun: TCP accept failed");
                 tokio::time::sleep(RECV_ERROR_BACKOFF).await;
                 continue;
@@ -1800,7 +2136,7 @@ async fn serve_tcp(
             None => None,
             Some(Ok(permit)) => Some(permit),
             Some(Err(refusal)) => {
-                stats.count_dropped();
+                stats.count_dropped(Transport::Tcp);
                 tracing::debug!(
                     %local,
                     %peer,
@@ -1815,14 +2151,21 @@ async fn serve_tcp(
         let software = software.clone();
         let stats = stats.clone();
         let context = context.clone();
+        // A connection counts as in-flight work: it holds an fd and may be
+        // mid-answer when SIGTERM arrives. Counted before the spawn so the
+        // shutdown path cannot miss it.
+        let in_flight = stats.enter();
         tokio::spawn(async move {
             if let Err(error) =
                 serve_tcp_connection(stream, peer, context, &software, &stats, permit).await
             {
                 tracing::debug!(%local, %peer, %error, "rstun: TCP connection closed")
             }
+            drop(in_flight);
         });
     }
+    tracing::info!(%local, "rstun: TCP listener stopped (draining)");
+    Ok(())
 }
 
 /// One TCP connection; RFC 5389 §7.2.2 frames messages by the header length.
@@ -1836,9 +2179,21 @@ async fn serve_tcp_connection(
     _inflight: Option<limit::Permit>,
 ) -> std::io::Result<()> {
     let local = stream.local_addr()?;
+    let mut drain = stats.subscribe_drain();
+    if stats.is_draining() {
+        return Ok(());
+    }
     loop {
         let mut header = [0_u8; protocol::HEADER_LEN];
-        if !read_exact_with_timeout(&mut stream, &mut header).await? {
+        // Draining stops *reading new frames*; the frame in hand is finished
+        // below. `read_exact_with_timeout` is cancel-safe enough here: we are
+        // closing the connection, so a half-read frame is discarded.
+        let header_read = tokio::select! {
+            biased;
+            _ = drain.changed() => return Ok(()),
+            read = read_exact_with_timeout(&mut stream, &mut header) => read,
+        };
+        if !header_read? {
             // 对端正常关闭。
             return Ok(());
         }
@@ -1846,17 +2201,17 @@ async fn serve_tcp_connection(
             Ok(frame_len) => frame_len,
             Err(error) => {
                 // Header gives us no frame boundary any more: the stream is unusable.
-                stats.count_dropped();
+                stats.count_error(Transport::Tcp);
                 tracing::debug!(%peer, %error, "rstun: malformed TCP STUN header");
                 return Ok(());
             }
         };
-        stats.count_received();
+        stats.count_received(Transport::Tcp);
 
         let mut frame = vec![0_u8; frame_len];
         frame[..protocol::HEADER_LEN].copy_from_slice(&header);
         if !read_exact_with_timeout(&mut stream, &mut frame[protocol::HEADER_LEN..]).await? {
-            stats.count_dropped();
+            stats.count_error(Transport::Tcp);
             tracing::debug!(%peer, "rstun: truncated TCP STUN message");
             return Ok(());
         }
@@ -1865,7 +2220,7 @@ async fn serve_tcp_connection(
         // —— 与「不放大 / 不回 486」的设计一致（design §3）。在途槽位由连接持有，
         // 这里只查名单与速率桶。
         if let Some(Err(refusal)) = context.check_rates(peer) {
-            stats.count_dropped();
+            stats.count_dropped(Transport::Tcp);
             tracing::debug!(
                 %peer,
                 reason = refusal.reason(),
@@ -1875,6 +2230,8 @@ async fn serve_tcp_connection(
             return Ok(());
         }
 
+        // One frame in hand is the unit of work the drain waits for.
+        let in_flight = stats.enter();
         match decide_guarded(
             &frame,
             peer,
@@ -1888,16 +2245,17 @@ async fn serve_tcp_connection(
                 if !response_is_encodable(&response) {
                     // Same internal-invariant path as UDP: answer 500 in-band
                     // instead of writing a malformed frame.
-                    stats.count_dropped();
+                    stats.count_error(Transport::Tcp);
                     tracing::error!(%peer, "rstun: response violates STUN wire invariants");
                     if let Some(error) = server_error_bytes(&frame, protocol::ERROR_SERVER_ERROR) {
                         stream.write_all(&error).await?;
-                        stats.count_answered();
+                        stats.count_answered(Transport::Tcp);
                     }
+                    drop(in_flight);
                     continue;
                 }
                 stream.write_all(&response).await?;
-                stats.count_answered();
+                stats.count_answered(Transport::Tcp);
             }
             Ok(Decision::RespondFrom { from, to, bytes }) => {
                 // Cannot happen: `decide` never asks for another socket or
@@ -1911,26 +2269,29 @@ async fn serve_tcp_connection(
                     "rstun: CHANGE-REQUEST / RESPONSE-PORT are UDP-only, answering on the same connection"
                 );
                 if !response_is_encodable(&bytes) {
-                    stats.count_dropped();
+                    stats.count_error(Transport::Tcp);
                     tracing::error!(%peer, "rstun: response violates STUN wire invariants");
                     if let Some(error) = server_error_bytes(&frame, protocol::ERROR_SERVER_ERROR) {
                         stream.write_all(&error).await?;
-                        stats.count_answered();
+                        stats.count_answered(Transport::Tcp);
                     }
+                    drop(in_flight);
                     continue;
                 }
                 stream.write_all(&bytes).await?;
-                stats.count_answered();
+                stats.count_answered(Transport::Tcp);
             }
             Ok(Decision::Ignore(reason)) => {
+                stats.count_ignored(Transport::Tcp);
                 tracing::debug!(%peer, reason, "rstun: ignored message")
             }
             Err(error) => {
-                stats.count_dropped();
+                stats.count_error(Transport::Tcp);
                 tracing::debug!(%peer, %error, "rstun: malformed TCP STUN message");
                 return Ok(());
             }
         }
+        drop(in_flight);
     }
 }
 
