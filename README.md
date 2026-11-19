@@ -1,12 +1,15 @@
 # rstun
 
-独立 STUN 服务器：RFC 5389 Binding，加可选的 RFC 5780 NAT 行为发现。
+独立 STUN/TURN 服务器：RFC 5389 Binding，加可选的 RFC 5780 NAT 行为发现，以及
+可选的 RFC 8656 UDP 中继（`--turn`，强制长期凭据）。
 一个 crate、一个二进制、一个镜像，`cargo install` 就能跑，不依赖任何宿主项目。
 
-**范围声明（先读）**：本服务**只做 STUN** —— RFC 5389 Binding（+ 可选的 RFC 5780 NAT 行为
-发现），加**可选的**鉴权（RFC 5389 §10 短期/长期凭据 + RFC 8489 §9.2 的 SHA256/USERHASH，
-**默认关闭**）。**不做 TURN**（`Allocate` / `Refresh` / `Channel` 一律 `400`），没有租户、
-配置文件或数据库。需要 TURN 中继时请用 coturn，不要往这里加。
+**范围声明（先读）**：本服务只做**小规模、静态用户**的 STUN/TURN —— RFC 5389 Binding
+（+ 可选的 RFC 5780 NAT 行为发现）+ **可选的**鉴权（RFC 5389 §10 短期/长期凭据 +
+RFC 8489 §9.2 的 SHA256/USERHASH，**默认关闭**）+ **可选的 RFC 8656 UDP 中继**
+（`--turn`，**默认关闭、缺长期凭据拒绝启动**）。TURN 的 T2 范围（TLS/DTLS、REST 临时凭据、
+带宽配额、TCP allocation/RFC 6062）**不做**；需要这些能力时请用 coturn。没有租户、
+配置文件或数据库。
 
 **命名**：crate 与二进制都叫 `rstun`。**绝对不能改叫 `stun`** —— Debian 的 `stun-client`
 包已经占用 `/usr/bin/stun`，同名会直接撞包/覆盖。
@@ -17,12 +20,12 @@ CLI 分两级：`rstun server [flags]` 起服务（flag 语义自首个版本起
 
 ```
 $ rstun --help
-Standalone STUN Binding server (RFC 5389; RFC 5780 with --alt-listen; TCP with --tcp)
+Standalone STUN/TURN server (RFC 5389 Binding; RFC 5780 with --alt-listen; RFC 8656 UDP relay with --turn)
 
 Usage: rstun <COMMAND>
 
 Commands:
-  server  Serve STUN Binding over UDP (and TCP with --tcp)
+  server  Serve STUN Binding over UDP (and TCP with --tcp); TURN UDP relay with --turn
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -30,7 +33,7 @@ Options:
   -V, --version  Print version
 
 $ rstun server --help
-Serve STUN Binding over UDP (and TCP with --tcp)
+Serve STUN Binding over UDP (and TCP with --tcp); TURN UDP relay with --turn
 
 Usage: rstun server [OPTIONS]
 
@@ -144,6 +147,27 @@ Options:
           long-term only: refuse PASSWORD-ALGORITHM=MD5 (401 unless the client uses SHA256). Needs
           --realm
 
+      --turn
+          enable the TURN (RFC 8656) UDP relay on the STUN sockets. Requires long-term credentials:
+          --realm, --auth-secret and at least one user
+
+      --relay-ports <LO-HI>
+          TURN relay port range, inclusive (default 49152-65535). Choose a range outside
+          net.ipv4.ip_local_port_range
+
+      --max-allocations-per-user <N>
+          cap on concurrent TURN allocations per authenticated user (default 8)
+
+      --max-allocations-per-ip <N>
+          cap on concurrent TURN allocations per client IP (default 16)
+
+      --permission-limit <N>
+          cap on TURN permissions per allocation (default 10)
+
+      --allocation-lifetime <SECONDS>
+          TURN allocation lifetime in seconds (default 600, max 3600). Also caps whatever LIFETIME a
+          client asks for
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -170,7 +194,7 @@ Options:
 | `Binding Request` + `PADDING`（RFC 5780 §7.6）                                                      | 响应**带同样长度**的 `PADDING`（永远不超过请求长度），用于 MTU / 分片探测；`PADDING` 恒为最后一个属性                                                                                       |
 | `Binding Request` + `RESPONSE-PORT` + `PADDING`                                                     | `400 Bad Request`（RFC 5780 §6："the server MUST return an error response of type 400"；§7.5 `MUST NOT process` 与 §10 `are rejected` 同指这条）                                            |
 | `Binding Request` + 未知的 **comprehension-required** 属性（如 `0x0033`）                           | `420 Unknown Attribute`（`0x0111`）+ `ERROR-CODE 420` + `UNKNOWN-ATTRIBUTES`（`0x000A`，每个类型 2 字节，值长度恰为 `2×N`；不足 4 字节的由通用 TLV padding 补齐且**不计入** Length，§15.9） |
-| 其它 method 的 **request**（如 TURN `Allocate` `0x003`）                                            | 该 method **自己的** `4xx` 错误响应 + `ERROR-CODE 400 Bad Request`（RFC 5389 §7.3.1）                                                                                                       |
+| 其它 method 的 **request**（如 TURN `Allocate` `0x003`，且**未开** `--turn`）                                         | 该 method **自己的** `4xx` 错误响应 + `ERROR-CODE 400 Bad Request`（RFC 5389 §7.3.1）。开 `--turn` 时 TURN 方法由 TURN 状态机处理（见「[TURN](#turnudp-中继turn)」）                            |
 | `Binding Request` + `FINGERPRINT`（**`--check-fingerprint` 开启**）                                  | 合法 → 普通 200；CRC 不符 → `400`（`--fingerprint-action drop` 时静默丢弃并计数）；**不在末位 → 一律 `400`**。默认关闭：不开开关时 `FINGERPRINT` 照旧被忽略，字节与 `26.410.100` 一致 |
 | **任意** `Binding Request`（配置了 `--alternate-server <ip:port>`）                                  | `300 Try Alternate` + `ALTERNATE-SERVER`（`0x8023`，明文地址布局），从收到请求的 socket 回；**重定向优先于 RFC 5780**（带 `CHANGE-REQUEST`/`RESPONSE-PORT` 也回 300）；非 Binding 方法仍是 400 |
 | 内部失败（`send_to` 失败，且错误不属于客户端地址问题）                                              | `500 Server Error`（固定文案、固定 **40 字节**），`io::Error` 细节只进日志                                                                                                                  |
@@ -359,7 +383,9 @@ SOFTWARE、FINGERPRINT、ICE 簇、鉴权簇、420、`PADDING`、`RESPONSE-PORT`
 
 ### 未实现（有意）
 
-- TURN（`Allocate`/`Refresh`/`Channel`）。
+- TURN 的 **T2 范围**：TLS/DTLS 监听、REST 临时凭据、带宽配额、TCP allocation（RFC 6062）。
+  T1 已实现 UDP 中继（见「[TURN](#turnudp-中继turn)」）：`Allocate`/`Refresh`/
+  `CreatePermission`/`ChannelBind`/`ChannelData`，强制长期凭据，默认关闭。
 - 鉴权的**服务端状态**部分：没有用户数据库、没有按 realm 路由、没有 nonce 黑名单
   （nonce 无状态，靠 HMAC + 过期时间；要吊销就换 `--auth-secret`）。
 - **nonce 的绑定范围**：只有 `HMAC(secret, expiry|client_ip)`，**不绑源端口**、不含
@@ -671,21 +697,81 @@ recv → 名单（deny 优先 → 直接拒；allow 命中 → 跳过每源桶�
   满了回收最久未用的条目，所以**不能**用它做长期审计。
 - 不做内容 DPI，也不按协议模式封禁。
 
+## TURN（UDP 中继，`--turn`）
+
+> `--allocation-lifetime` 同时是**默认授予值**与**上限**：客户端不带 `LIFETIME`、或给的值小于 600 时得到 600，
+> 超过上限时得到上限（`--allocation-lifetime 2` 正是回收测试用的形状）。
+> TURN 的**成功**响应带 `SOFTWARE`，失败响应（401/437/441/486/508）不带——RFC 8656 §6.1 对失败响应是 SHOULD，
+> 这里按「与 STUN 共享 401/438 编码、保持默认关闭字节冻结」取舍。
+
+T1 范围：RFC 8656 的 **UDP 中继闭环**。TURN **默认关闭**；开启即强制长期凭据 —— 缺
+`--realm` / `--auth-secret` / 用户时**启动失败（exit 1）**，不存在「匿名开放中继」形态。
+
+```bash
+rstun server \
+  --listen 203.0.113.10:3478 \
+  --turn --realm example.org --auth-secret "$SECRET" \
+  --auth-file /etc/rstun/users.txt \
+  --relay-ports 49152-65535 \
+  --max-allocations-per-user 8 --max-allocations-per-ip 16 --permission-limit 10 \
+  --health-listen 127.0.0.1:9100
+```
+
+| 项 | 行为 |
+| --- | --- |
+| 方法 | `Allocate` / `Refresh` / `CreatePermission` / `ChannelBind`；`Send`/`Data` indication；`ChannelData`（UDP 与 TCP 客户端传输，relay 本身恒为 UDP）|
+| 鉴权 | 四个 request 方法都必须带 `MESSAGE-INTEGRITY`（长期凭据，复用 STUN 的 realm/nonce 实现）：无 MI → `401` + `REALM`/`NONCE`；nonce 过期 → `438` + 新 `NONCE`；错口令/未知用户 → `401`。**401/438 同样计入限速桶** |
+| 生命周期 | `Allocate` 默认授予 **600s**（`LIFETIME=0`/缺省都按默认）；请求值低于默认时按 RFC 8656 §7.2 取默认，高于 `--allocation-lifetime` 上限被截断；`REFRESH LIFETIME=0` 立即释放；**`Refresh` 缺 `LIFETIME` 也按默认续期**（§8.2）；permission TTL **5 分钟**、channel TTL **10 分钟**；到期由 1s 扫描任务回收 |
+| 5 元组 | `(client addr, client transport, server addr)`；**同一 transaction id** 的重传 `Allocate` 幂等返回同一 relay；**新 transaction id → `437`**；**同一 5 元组换用户 → `441 Wrong Credentials`**（不得暴露/改动他人 allocation，`LIFETIME=0` 也不删）；释放后再 `Refresh` → `437` |
+| 端口与配额 | `--relay-ports` 耗尽 → `508`；每用户 `--max-allocations-per-user`（默认 8）/ 每 IP `--max-allocations-per-ip`（默认 16）超限 → `486`；每 allocation permission 超 `--permission-limit`（默认 10）→ **`508`**（RFC 8656 §10.2；一条请求带多个 peer 时**整条原子校验**，不做部分生效） |
+| 响应属性 | 成功响应带 `SOFTWARE`（RFC 8656 §14.10 SHOULD），401/438 挑战不带；`ChannelBind` 隐式创建的 permission 与 `CreatePermission` 共用同一个上限 |
+| 数据面 | `Send` 仅在 permission 覆盖 peer 时转发（否则静默丢弃）；relay 收到 peer 数据时，命中 channel → `ChannelData`，否则 → `Data` indication；`ChannelData` 不解析 STUN；**UDP 上声明长度大于实际报文的 `ChannelData` 静默丢弃**（不转发截断内容）；TCP 客户端写队列有界（64 帧，溢出丢 relayed 数据）|
+| 其它 transport | `REQUESTED-TRANSPORT=6`（TCP allocation / RFC 6062）→ `442`；`EVEN-PORT`（含 R=1 reservation token）支持；`DONT-FRAGMENT` 等未实现的可理解属性 → `420` |
+| 防回环 | 拒绝：`unspecified` / `multicast` / 本进程**监听地址** / 该 allocation 自己的 relay / **loopback peer**（仅当请求到达的 socket 本身绑定在回环地址时放行，供本地开发与 `-y` 矩阵）→ `403`。`--listen 0.0.0.0` 或公网监听下回环 peer 一律拒绝（否则「peer=127.0.0.1:<监听端口>」漏检）。同一进程内**其它 allocation 的 relay 地址允许** —— `turnutils_uclient -y` / 同 NAT WebRTC 的正常路径。**已知盲区**：宿主自身公网 IP 无法在不引入接口枚举依赖的情况下判定 |
+| 回收 | allocation 过期 / `LIFETIME=0` → abort relay 读任务 → 关闭 socket → 端口归还池；测试断言过期后 `ss -lun` 在 relay 段内无监听 |
+| 观测 | `/metrics`：`rstun_turn_allocations`（gauge）、`rstun_turn_bytes_total{direction=in\|out}`、`rstun_turn_allocations_total{result=created\|expired}`、`rstun_turn_rejected_total{reason=quota\|ports\|family\|loopback}`；退出日志打印同一组数字。**未开 `--turn` 时这些指标不出现** |
+
+部署注意：
+
+- **防火墙**：客户端 → `--listen` 的 UDP 要放行；relay 端口段也要放行 **UDP 双向**（与 coturn 同理），
+  否则 `Allocate` 能成功但中继数据收不到。
+- **临时端口冲突**：Linux 默认 `net.ipv4.ip_local_port_range`（常见 `32768 60999`）与默认
+  relay 段 `49152-65535` 重叠。生产建议显式给一个不重叠的 `--relay-ports`（或调整内核范围），
+  否则内核可能先占用 relay 段里的端口，表现为偶发 `508`。
+- **多实例**：同一 `--auth-secret` 的实例互认 nonce；allocation 状态**不共享**（客户端会被
+  `401` 后的重试带到同一实例，靠 LB 一致性哈希/源地址亲和）。T1 不做 REST 临时凭据。
+- **通道号范围**：接受 `0x4000–0x7FFF`。RFC 8656 §12.1 定义到 `0x7FFE`；`0x7FFF` 是为 coturn
+  兼容而放行（其解析器接受该值）。
+- **指标口径**：`rstun_turn_bytes_total` 只计 relay payload（不含 STUN / ChannelData 头），
+  `direction=in` 为 client→peer、`out` 为 peer→client；`rstun_requests_total` 也计 TURN 报文
+  （同一 transport 循环），TURN 专用口径请看 `rstun_turn_*`。
+- **配额抖动**：过期但尚未被 1s 扫描移除的 allocation 仍计入 per-user/per-IP 配额，
+  高 churn 下可能多拒绝一次 `486`，下一次扫描恢复。
+- **防回环已知盲区**：不枚举宿主接口，故「peer = 宿主自身公网 IP:端口」无法识别；
+  需要该能力时应改用 coturn 或引入接口枚举（T2 评估，新增依赖需单独立项）。
+- 不支持（T2 或更晚）：TLS/DTLS、REST 临时凭据、带宽配额、TCP allocation（RFC 6062）、
+  `DONT-FRAGMENT`、`REQUESTED-ADDRESS-FAMILY`。
+
+验收：
+
+```bash
+bash script/lab/rstun-turn.sh            # 12 项：启动失败/中继/401+438/生命周期/441/通配回环/permission 508/486/端口 508/回收/字节冻结/coturn 对照
+```
+
 ## 与 coturn 的差异
 
 |      | `rstun`                                                                                                                                                                                         | coturn                                        |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| 定位 | 只做 STUN，Binding + **NAT 行为发现**的**最小服务**                                                                                                                                             | 完整 STUN/TURN（中继）+ 鉴权 + 多租户         |
-| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）+ 鉴权（短期/长期，默认关闭）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`（无 TURN） | RFC 5389 / 5780 全量 / TURN（5766、turns 等） |
-| 配置 | 纯命令行参数（无配置文件）                                                                                                                                                                      | 上百行 `turnserver.conf`、数据库/鉴权后端     |
-| 鉴权 | 短期 / 长期凭据 + RFC 8489 SHA256、USERHASH；用户来自 `--auth-user` 或 `--auth-file`，**无数据库**                                                                                              | 长期凭据 + 数据库/Redis/文件后端，TURN 也受保护 |
-| 依赖 | 纯 Rust，无 OpenSSL/libevent                                                                                                                                                                    | 依赖 libevent/OpenSSL + 系统配置              |
-| 部署 | 单二进制 / 一个几十 MB 的镜像                                                                                                                                                                   | 发行版包 / 官方镜像 + 配置卷                  |
-| 用途 | 需要「公网 STUN 映射 + NAT 行为发现」、不需要中继的场景                                                                                                                                         | 需要 TURN 中继、按用户鉴权的通用基础设施      |
+| 定位 | 只做 STUN/TURN 的**最小服务**：Binding + **NAT 行为发现** + TURN UDP 中继（`--turn`，强制长期凭据） | 完整 STUN/TURN（中继）+ 鉴权 + 多租户 |
+| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）+ 鉴权（短期/长期，默认关闭）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`；RFC 8656 UDP 中继（T1：无 TLS/DTLS、无 REST 凭据、无 TCP allocation） | RFC 5389 / 5780 全量 / TURN（5766、turns 等） |
+| 配置 | 纯命令行参数（无配置文件） | 上百行 `turnserver.conf`、数据库/鉴权后端 |
+| 鉴权 | 短期 / 长期凭据 + RFC 8489 SHA256、USERHASH；用户来自 `--auth-user` 或 `--auth-file`，**无数据库**；TURN 复用同一套长期凭据 | 长期凭据 + 数据库/Redis/文件后端，TURN 也受保护 |
+| 依赖 | 纯 Rust，无 OpenSSL/libevent | 依赖 libevent/OpenSSL + 系统配置 |
+| 部署 | 单二进制 / 一个几十 MB 的镜像 | 发行版包 / 官方镜像 + 配置卷 |
+| 用途 | 需要「公网 STUN 映射 + NAT 行为发现」，以及**小规模、静态用户**的 UDP 中继 | 需要完整 TURN（TLS/DTLS、REST 凭据、多租户）的基础设施 |
 
-结论：**需要 TURN 中继时仍然用 coturn**。本服务负责「公网 STUN 映射 + NAT 行为发现」这一段，
-把它部署到 UDP 回程可用的地址上即可。鉴权只覆盖 STUN Binding 这一层，且用户清单是静态文件 /
-单个 flag —— 需要多租户、动态配额或 TURN 侧鉴权时，coturn 仍是唯一选择。
+结论：**需要 TLS/DTLS、REST 临时凭据、带宽配额或 TCP allocation 时仍然用 coturn**。
+本服务的 TURN 只覆盖 RFC 8656 的 UDP 中继最小闭环，用户清单是静态文件 / 单个 flag。
 
 ## 构建与运行
 
@@ -823,6 +909,10 @@ curl -s http://127.0.0.1:9100/metrics | grep -E '^# TYPE|^rstun_requests_total'
 | `rstun_fingerprint_rejected_total` | counter | — |
 | `rstun_socket_errors_total` | counter | `transport=udp/tcp`（`recv_from`/`accept` 失败）|
 | `rstun_auth_total` | counter | `result=ok/unauthorized/stale_nonce/bad_request` |
+| `rstun_turn_allocations` | gauge | —（仅 `--turn`；活动 allocation 数）|
+| `rstun_turn_bytes_total` | counter | `direction=in`（client→peer）/ `out`（peer→client）；仅 `--turn` |
+| `rstun_turn_allocations_total` | counter | `result=created/expired`；仅 `--turn` |
+| `rstun_turn_rejected_total` | counter | `reason=quota/ports/family/loopback`；仅 `--turn` |
 | `rstun_ops_rejected_total` | counter | —（运维端点因 `--health-max-connections` 拒绝的连接）|
 | `rstun_build_info` | gauge = 1 | `version`（编译期常量）|
 | `rstun_start_time_seconds` / `rstun_uptime_seconds` | gauge | — |
@@ -836,8 +926,9 @@ curl -s http://127.0.0.1:9100/metrics | grep -E '^# TYPE|^rstun_requests_total'
   `error` = 读不懂或内部不变量失败；`ignored` = 有意不作答（indication、`--fingerprint-action drop`）。
   后两者与退出日志的 `dropped` 总量**有意重叠**（退出日志的 `received/answered/dropped` 语义
   未变，见 `.trellis/spec/backend/abuse-guard.md` §4）。
-- **TURN 指标暂缺**：`rstun_turn_allocations` / `rstun_turn_bytes_total` 在 TURN 落地前
-  **不输出**（而不是恒为 0 —— 0 会被读成「TURN 开着但空闲」）。
+- **TURN 指标只在 `--turn` 时出现**：未开启时 `rstun_turn_*` 四条指标**不输出**
+  （而不是恒为 0 —— 0 会被读成「TURN 开着但空闲」）；开启后与退出日志的
+  `rstun: TURN counters` 同源（同一组原子计数）。
 - 安全：端点只做 `GET`/`HEAD`、一个连接只答一个请求（无 keep-alive）、**整条连接 2 秒总时限**、
   请求头（含终止空行）上限 **8192 字节**、并发连接上限（`--health-max-connections`）、不读 body；
   响应里没有路径、配置值或证书信息。**默认示例都绑 127.0.0.1**，

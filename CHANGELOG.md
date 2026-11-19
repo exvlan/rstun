@@ -5,6 +5,59 @@
 
 ## Unreleased
 
+### TURN（RFC 8656 UDP 中继，`--turn`，T1）
+
+- **`--turn`（默认关闭）**：在现有 STUN socket 上启用 RFC 8656 的 UDP 中继。
+  `Allocate` / `Refresh` / `CreatePermission` / `ChannelBind` + `Send`/`Data` indication +
+  `ChannelData`（UDP 与 TCP 客户端传输；relay 恒为 UDP）。**强制长期凭据**：缺
+  `--realm` / `--auth-secret` / 用户时**启动失败（exit 1）**，不会有匿名开放中继；
+  短期凭据同样拒绝。
+- **鉴权复用**：TURN 与 Binding 共用同一套 realm/nonce/MESSAGE-INTEGRITY 实现。无 MI → `401` +
+  `REALM`/`NONCE`；nonce 过期 → `438` + 新 `NONCE`；错口令/未知用户 → `401`；`401/438` 计入
+  同一限速桶。成功响应按请求所用算法签名。
+- **生命周期**：默认 **600s**；低于默认的请求按 RFC 8656 §7.2 取默认，高于
+  `--allocation-lifetime`（上限 3600s）被截断；`Allocate` 的 `LIFETIME=0` 按默认；**`Refresh`
+  缺 `LIFETIME` 按默认续期（§8.2，不再 400）**；`REFRESH LIFETIME=0` 立即释放；permission 5 分钟、
+  channel 10 分钟。**同一 transaction id** 的 `Allocate` 重传幂等（同一 relay），**新
+  transaction id → 437**；释放后再 `Refresh` → `437`。
+- **441 Wrong Credentials**：同一 5 元组、不同用户名 → `441`（RFC 8656 §5/§6.2），三个方法
+  （`Refresh` / `CreatePermission` / `ChannelBind`）都拒绝；他人发来的 `LIFETIME=0` 不会删除
+  allocation。
+- **端口与配额**：`--relay-ports`（默认 49152–65535）耗尽 → `508`；每用户（默认 8）/每 IP
+  （默认 16）超限 → `486`；permission 超 `--permission-limit`（默认 10）→ **`508`**（RFC 8656
+  §10.2；一条请求带多个 peer 时先校验整条请求，**不做部分生效**）；`ChannelBind` 的隐式
+  permission 同样计入；`REQUESTED-TRANSPORT=6` → `442`；族不匹配 → `440`/`443`。
+- **`EVEN-PORT`（含 R=1 reservation token）**：coturn 的 `turnutils_uclient` 在每次 Allocate
+  都带 `EVEN-PORT`，T1 实现「偶数端口 + 下一个端口保留（30s，`RESERVATION-TOKEN`）」，
+  否则标准客户端第一步就 420。`DONT-FRAGMENT` 等未实现的可理解属性仍按 RFC 回 `420`。
+- **数据面**：`Send` 只在 permission 覆盖 peer 时转发（否则静默丢弃）；relay 收到 peer 数据时
+  命中 channel → `ChannelData`，否则 → `Data` indication；`ChannelData` 不解析 STUN；
+  TCP 上的 `ChannelData` 按 4 字节对齐填充。**UDP `ChannelData` 声明长度大于报文 → 静默丢弃**
+  （不转发截断内容）；TCP 客户端写队列改为**有界**（64 帧）+ `try_send`，溢出丢 relayed 数据，
+  防止已认证客户端用不读连接撑大内存。
+- **成功响应带 `SOFTWARE`**（RFC 8656 §14.10 SHOULD，coturn 同样有）；401/438 挑战不带。
+- **防护**：拒绝 unspecified / multicast / 本进程监听地址 / 该 allocation 自身 relay /
+  **loopback peer**（仅当请求到达的 socket 本身是回环地址时放行，供本地开发与 `-y` 矩阵）→
+  `403`（`reason=loopback`）。`--listen 0.0.0.0` 下这条规则才真正堵住
+  「peer = 127.0.0.1:<监听端口>」的漏检。同一进程内其它 allocation 的 relay 地址**允许** ——
+  这是 `turnutils_uclient -y` 与同 NAT WebRTC 的正常路径。**已知盲区**：宿主自身公网 IP
+  需接口枚举才能判定，T1 不引入该依赖，README 已登记。
+- **回收**：单一定时扫描任务（1s）清理 allocation/permission/channel；allocation 移除时 abort
+  relay 读任务、关闭 socket、端口归还池。验收断言过期后 `ss -lun` 在 relay 段内无监听。
+- **观测**：`/metrics` 新增 `rstun_turn_allocations`（gauge）、
+  `rstun_turn_bytes_total{direction=in|out}`、`rstun_turn_allocations_total{result=created|expired}`、
+  `rstun_turn_rejected_total{reason=quota|ports|family|loopback}`；退出日志打印同一组数字。
+  **未开 `--turn` 时这些指标不出现**（与既有的「不输出恒 0」约定一致）。
+- **默认关闭零差异**：`--turn` 不在时 TURN 模块不解析、不建表、不生成指标；验收脚本用
+  `git archive HEAD` 构建旧二进制，3 组配置 × 17 请求逐字节对照。
+- **验收与对照**：新增 `script/lab/rstun-turn.sh`（12 项：启动失败 / uclient 中继 / 401+438 /
+  生命周期 / 441 / 通配监听回环 / permission 508 / 486 / 端口 508 / 回收 / 字节冻结 /
+  coturn 对照）与 `script/lab/rstun-turn-probe.py`
+  （标准库最小 TURN 客户端，同一步骤可对 coturn 与 rstun 各跑一次再 diff）。
+  与 coturn 的差异：`LIFETIME=0` 之后再 `Refresh`，本服务按 RFC 8656 §7.2 回 `437`，
+  coturn 会「复活」该 allocation（宽松实现）；其余中继步骤逐行一致。
+- **无新增运行期依赖**：`cargo tree -e normal --depth 1` 仍是 9 个。
+
 ### 运维面（readiness / metrics / `RSTUN_*` / 优雅 drain / 部署清单）
 
 - **`--health-listen <addr>`（默认关闭）**：可选的最小 HTTP/1.1 端点（**手写，未引入
@@ -26,7 +79,8 @@
   `rstun_fingerprint_rejected_total`、`rstun_socket_errors_total{transport}`、
   `rstun_auth_total{result}`、`rstun_build_info{version}`、`rstun_start_time_seconds`、
   `rstun_uptime_seconds`、`rstun_health`。与退出统计**同一组 `Counters`**（不双份计数）；
-  标签集合固定（三个枚举维度）。TURN 未落地，`rstun_turn_*` **不输出**（不是恒 0）。
+  标签集合固定（三个枚举维度）。`rstun_turn_*` 只在 `--turn` 时输出（见上方 TURN 小节；
+  未开启时不是恒 0）。
   为此 `ServerStats` 新增 transport × outcome 桶（`ok/error/ignored/dropped`），退出日志的
   `received/answered/dropped` 语义**未变**（含既有的「反射拒绝会同时记 answered 与 dropped」）。
 - **`RSTUN_*` 环境变量映射**：每个 flag 一个同名变量（大写、`-` → `_`），列表用逗号分隔。
