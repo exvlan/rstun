@@ -29,7 +29,7 @@ RFC 8489 全量需要 `HMAC-SHA1`（5389 MI）、`HMAC-SHA256`（MI-SHA256）、
 | 短期 | `--auth-user` + `--auth-pass` | `password`（SASLprep 后） | `MESSAGE-INTEGRITY`（HMAC-SHA1） |
 | 长期 · MD5 | `--realm` + `--auth-secret` + 用户口令（文件） | `MD5(username:realm:password)` | `MESSAGE-INTEGRITY` |
 | 长期 · SHA256 | 同上 + `PASSWORD-ALGORITHM=0x0002` | `SHA256(username:realm:password)` | `MESSAGE-INTEGRITY-SHA256` |
-| 长期 · USERHASH | 同上，无 `USERNAME` | 同上 | `USERHASH = SHA256(username:realm)[..16]` 定位用户 |
+| 长期 · USERHASH | 同上，无 `USERNAME` | 同上 | `USERHASH = SHA256(username:realm)`（**完整 32 字节**，§14.4）定位用户 |
 
 - **用户名来源**：`--auth-file <path>`（每行 `user:password`，`#` 注释）；单用户模式用 `--auth-user/--auth-pass`。
 - 口令比较一律**常量时间**（自写 `ct_eq`，不引入 `subtle`）。
@@ -41,10 +41,14 @@ RFC 8489 全量需要 `HMAC-SHA1`（5389 MI）、`HMAC-SHA256`（MI-SHA256）、
 nonce = base64url( expiry(5B) | HMAC-SHA256(secret, expiry | client_ip)[..11] )
 ```
 
-- 默认有效期 `--nonce-lifetime 3600s`，允许 `±5min` 时钟偏差；
+- 默认有效期 `--nonce-lifetime 3600s`；
 - 校验：解码 → 检查 `client_ip` 与过期 → 重算 HMAC（常量时间比较）；
 - 多实例一致：只要共享 `--auth-secret`，任一实例签发的 nonce 都可用（无共享状态）；
-- 过期 → **438 Stale Nonce** + 新 `NONCE`；缺失/错误 → **401 Unauthorized**。
+- 过期 → **438 Stale Nonce** + 新 `NONCE` + `REALM` + `PASSWORD-ALGORITHMS`（RFC 8489 §9.2.4
+  对 401/438 同样要求后两个）；缺失/错误 → **401 Unauthorized**；
+- **已决偏差（复核 B4）**：nonce **只绑 `client_ip`**（不绑源端口），不含 nonce cookie，
+  也不实现 §9.2.3 的 `SECURITY-FEATURE` 位；±5min 时钟宽限**不实现**（会把每个
+  `--nonce-lifetime` 拉长 5 分钟，破坏「短 TTL → 438」的验收），需要容忍偏差就调大 lifetime。
 
 ## 5. 判定顺序（与现有错误路径的关系）
 
@@ -76,9 +80,9 @@ nonce = base64url( expiry(5B) | HMAC-SHA256(secret, expiry | client_ip)[..11] )
 
 | 响应 | 约字节 | 对 28B 请求的放大 |
 | --- | --- | --- |
-| 401（REALM + NONCE + PASSWORD-ALGORITHMS）| ~120–140 | **4.3–5.0×** |
-| 438（NONCE）| ~60 | 2.1× |
-| 200（成功，无 5780）| 52 | 1.9× |
+| 401（REALM + NONCE + PASSWORD-ALGORITHMS）| **96**（实测，realm `example.org`；原估 120–140 是更长 realm） | **3.43×** |
+| 438（REALM + NONCE + PASSWORD-ALGORITHMS）| **96**（实测）| 3.43× |
+| 200（成功，无 5780，带 MI）| 76 | 2.71× |
 
 结论：**开鉴权必须配合限速**；这是安全换取的代价，文档不得省略。
 
@@ -88,7 +92,7 @@ nonce = base64url( expiry(5B) | HMAC-SHA256(secret, expiry | client_ip)[..11] )
 | --- | --- |
 | 不配凭据（默认）| 无差异（冻结测试 + 51 组字节对照）|
 | 配短期凭据 | 无 `MESSAGE-INTEGRITY` 的 Binding → 401 |
-| 配长期凭据 | 同上；多出 REALM/NONCE/438 |
+| 配长期凭据 | 同上；多出 REALM/NONCE/438；缺必需属性 → 400、值错 → 401 |
 | `--auth-require-sha256` | 拒绝 `PASSWORD-ALGORITHM=MD5` |
 
 回滚：去掉凭据配置即恢复；代码单批 commit 可整体 revert。

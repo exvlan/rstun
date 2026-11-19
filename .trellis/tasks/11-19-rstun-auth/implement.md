@@ -18,6 +18,19 @@
 | 10 | 互操作：`turnutils_stunclient -u/-w/-r`；`rstun-interop.sh` 新增 `auth` 组（可选，计入 41→N 并同步文档）| 矩阵全绿 | 小 commit |
 | 11 | 文档：README 鉴权节（配置/体积放大面/ICE 影响）、CHANGELOG、`docs/interop-matrix.md` | 人工评审 | 文档 commit |
 
+## 复核修订（2026-11-19，冷复核后）
+
+| # | 事项 | 处理 |
+| --- | --- | --- |
+| **B1** | `USERHASH` 必须是 **32 字节**（RFC 8489 §14.4） | `USERHASH_LEN = 32`、`userhash()` 返回完整摘要、`find_user` 接受 32 字节；16 字节截断值 → 401；单测钉 32 字节向量 + e2e（`cargo test` 与 interop probe 各一条）；文档 `[..16]` / `§14.13` 全改 |
+| **B2** | `438` 必须带 `PASSWORD-ALGORITHMS`（RFC 8489 §9.2.4） | `stale_nonce` 追加该属性；实测 438 = 96 字节 |
+| **B3** | 长凭据「有 MI 但缺必需属性」→ **400**（不是 401） | `verify_long_term` 先做缺失判定（`USERNAME`/`USERHASH` 至少一个 + `REALM` + `NONCE`）→ 400；值错仍 401 |
+| **B5** | 认证后的 **420 / 400（PADDING+RESPONSE-PORT）** 也要签名 | `decide` 里三处（200/420/400）共用 `seal_answer`；`500` 在更低层拿不到 identity → README 登记「不签名」 |
+| **B4** | nonce 只绑 client IP、无 cookie/security-feature | 记账：README「未实现（有意）」+ `design.md §4` + 本文件；PRD 的「8489 全量」改为「SHA256 / PASSWORD-ALGORITHM(S) / USERHASH」 |
+| **M1** | 反射防护估算在未认证时低估（96B 401 vs 76B 成功） | 实现：开启鉴权时估算取 `max(签名成功响应, auth.challenge_len())` |
+| **M2** | `turnutils_stunclient -u/-w/-r` 验收不成立（Debian 构建无该选项） | 改为「独立 hashlib/hmac 客户端 + `stun-types` 双向验签」，PRD 已改并注明工具版本 |
+| 小 | Debug 脱敏、用户名 `ct_eq`、`--auth-file` 只 trim 行尾、probe 文案、注释/依赖数、README 反射措辞 | 全部改完 |
+
 ## 门禁
 
 ```bash
