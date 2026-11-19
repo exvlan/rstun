@@ -486,7 +486,12 @@ impl Auth {
             .ok_or(Rejection::Unauthorized)
     }
 
-    /// Record the outcome; the caller answers with [`Auth::rejection_response`].
+    /// Record the authentication outcome.
+    ///
+    /// This only updates the auth counters (`rstun_auth_total` / the exit log);
+    /// it does **not** rate limit. The admission buckets (`limit::Admission`)
+    /// run in the transport loop *before* verification, which is what keeps a
+    /// 401/438 flood inside the guard — counting here would be too late.
     pub fn count(&self, outcome: &Result<Identity, Rejection>) {
         match outcome {
             Ok(_) => self.counters.authenticated.fetch_add(1, Ordering::Relaxed),

@@ -246,8 +246,8 @@ impl OpsState {
     /// the enums `transport × result`, `scope` and `direction`, which is the
     /// design's mitigation for metric blow-up.
     ///
-    /// TURN is not implemented yet, so `rstun_turn_allocations` and
-    /// `rstun_turn_bytes_total` are **omitted** rather than reported as a
+    /// TURN is only reported once `--turn` is on. Without it the four
+    /// `rstun_turn_*` families are **omitted** rather than reported as a
     /// permanent zero (a zero would look like "TURN is on and idle"); README's
     /// ops section says so explicitly.
     pub fn metrics(&self) -> String {
@@ -409,6 +409,77 @@ impl OpsState {
             ("bad_request", bad_request),
         ] {
             sample(&mut out, "rstun_auth_total", &[("result", result)], value);
+        }
+
+        // TURN: only when the relay is actually enabled (same rule as the auth
+        // counters: no permanent zeros that look like "on but idle").
+        if let Some(turn) = self.stats.turn() {
+            let counts = turn.snapshot();
+            header(
+                &mut out,
+                "rstun_turn_allocations",
+                "Live TURN allocations.",
+                "gauge",
+            );
+            sample(&mut out, "rstun_turn_allocations", &[], counts.active);
+
+            header(
+                &mut out,
+                "rstun_turn_bytes_total",
+                "Relayed payload bytes; direction=in is client→peer, out is peer→client.",
+                "counter",
+            );
+            sample(
+                &mut out,
+                "rstun_turn_bytes_total",
+                &[("direction", "in")],
+                counts.bytes_in,
+            );
+            sample(
+                &mut out,
+                "rstun_turn_bytes_total",
+                &[("direction", "out")],
+                counts.bytes_out,
+            );
+
+            header(
+                &mut out,
+                "rstun_turn_allocations_total",
+                "TURN allocation lifecycle events, by result.",
+                "counter",
+            );
+            sample(
+                &mut out,
+                "rstun_turn_allocations_total",
+                &[("result", "created")],
+                counts.created,
+            );
+            sample(
+                &mut out,
+                "rstun_turn_allocations_total",
+                &[("result", "expired")],
+                counts.expired,
+            );
+
+            header(
+                &mut out,
+                "rstun_turn_rejected_total",
+                "TURN requests refused, by reason.",
+                "counter",
+            );
+            for (reason, value) in [
+                ("quota", counts.rejected_quota),
+                ("ports", counts.rejected_ports),
+                ("family", counts.rejected_family),
+                ("loopback", counts.rejected_loopback),
+            ] {
+                sample(
+                    &mut out,
+                    "rstun_turn_rejected_total",
+                    &[("reason", reason)],
+                    value,
+                );
+            }
         }
 
         header(
@@ -936,6 +1007,12 @@ const ENV_FLAGS: &[(&str, EnvKind)] = &[
     ("health_listen", EnvKind::Value),
     ("health_max_connections", EnvKind::Value),
     ("drain_timeout", EnvKind::Value),
+    ("turn", EnvKind::Switch),
+    ("relay_ports", EnvKind::Value),
+    ("max_allocations_per_user", EnvKind::Value),
+    ("max_allocations_per_ip", EnvKind::Value),
+    ("permission_limit", EnvKind::Value),
+    ("allocation_lifetime", EnvKind::Value),
 ];
 
 /// `RSTUN_<FLAG>`: uppercase, `-` → `_`.
@@ -1089,6 +1166,12 @@ fn overlay(args: &mut Args, from_env: &mut Args, matches: &ArgMatches) {
         health_listen,
         health_max_connections,
         drain_timeout,
+        turn,
+        relay_ports,
+        max_allocations_per_user,
+        max_allocations_per_ip,
+        permission_limit,
+        allocation_lifetime,
     );
 }
 

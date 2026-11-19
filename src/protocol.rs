@@ -878,7 +878,11 @@ pub fn unknown_attributes_response(
     )
 }
 
-fn encode_message(msg_type: u16, transaction_id: &TransactionId, body: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_message(
+    msg_type: u16,
+    transaction_id: &TransactionId,
+    body: &[u8],
+) -> Vec<u8> {
     debug_assert!(body.len().is_multiple_of(4), "body must be padded");
     let mut bytes = Vec::with_capacity(HEADER_LEN + body.len());
     bytes.extend_from_slice(&msg_type.to_be_bytes());
@@ -889,7 +893,7 @@ fn encode_message(msg_type: u16, transaction_id: &TransactionId, body: &[u8]) ->
     bytes
 }
 
-fn push_attribute(out: &mut Vec<u8>, attr_type: u16, value: &[u8]) {
+pub(crate) fn push_attribute(out: &mut Vec<u8>, attr_type: u16, value: &[u8]) {
     debug_assert!(value.len() <= u16::MAX as usize);
     out.extend_from_slice(&attr_type.to_be_bytes());
     out.extend_from_slice(&(value.len() as u16).to_be_bytes());
@@ -899,7 +903,10 @@ fn push_attribute(out: &mut Vec<u8>, attr_type: u16, value: &[u8]) {
 }
 
 /// Value of an `XOR-MAPPED-ADDRESS` attribute for `peer`.
-fn xor_mapped_address_value(peer: SocketAddr, transaction_id: &TransactionId) -> Vec<u8> {
+pub(crate) fn xor_mapped_address_value(
+    peer: SocketAddr,
+    transaction_id: &TransactionId,
+) -> Vec<u8> {
     let is_v4 = peer.is_ipv4();
     let mut value = Vec::with_capacity(if is_v4 { 8 } else { 20 });
     value.push(0);

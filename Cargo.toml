@@ -1,6 +1,6 @@
 [package]
 name = "rstun"
-description = "Standalone STUN server (RFC 5389 Binding with optional short/long-term authentication; RFC 5780 NAT behaviour discovery with `--alt-listen`). No TURN."
+description = "Standalone STUN/TURN server (RFC 5389 Binding with optional short/long-term authentication; RFC 5780 NAT behaviour discovery with `--alt-listen`; RFC 8656 UDP relay with `--turn`)."
 homepage = "https://github.com/exvlan/rstun"
 repository = "https://github.com/exvlan/rstun"
 version = "26.410.100"

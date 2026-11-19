@@ -14,14 +14,16 @@
 //! copyleft: changes to these source files stay MPL-2.0, but linking the binary
 //! into a larger product does not relicense that product.
 //!
-//! Scope is Binding-only: `Binding Request` → `Binding Success` with
-//! `XOR-MAPPED-ADDRESS` (+ `SOFTWARE`, and the legacy `MAPPED-ADDRESS` with
-//! `--mapped-address`), `420 Unknown Attribute` + `UNKNOWN-ATTRIBUTES` when the
-//! request carries an attribute this server does not implement, `400 Bad
-//! Request` for any other method, ignore indications/responses, and (with
+//! Scope: `Binding Request` → `Binding Success` with `XOR-MAPPED-ADDRESS`
+//! (+ `SOFTWARE`, and the legacy `MAPPED-ADDRESS` with `--mapped-address`),
+//! `420 Unknown Attribute` + `UNKNOWN-ATTRIBUTES` when the request carries an
+//! attribute this server does not implement, `400 Bad Request` for any other
+//! method (unless `--turn` handles it), ignore indications/responses, and (with
 //! `--auth-user` / `--realm`) RFC 5389 §10 / RFC 8489 §9.2 authentication.
-//! No TURN allocate/refresh/channel; authentication is **optional** and off by
-//! default.
+//! With `--turn` the RFC 8656 UDP relay is enabled ([`turn`]): Allocate /
+//! Refresh / CreatePermission / ChannelBind + Send/Data + ChannelData, always
+//! behind long-term credentials (startup fails without them). Without `--turn`
+//! nothing TURN-related is parsed, allocated or emitted.
 //!
 //! With `--alt-listen` the server additionally speaks RFC 5780 (§5 behaviour
 //! discovery): responses carry `RESPONSE-ORIGIN` + `OTHER-ADDRESS`, and a
@@ -69,6 +71,8 @@ pub mod rfc5780;
 /// T1 互操作证据：RFC 5769 向量 + `stun-types` 双向（只在测试构建里编译）。
 #[cfg(test)]
 mod tests_interop;
+/// TURN（RFC 8656）UDP 中继：`--turn` 显式开启，强制长期凭据。
+mod turn;
 
 use protocol::MessageClass;
 
@@ -121,7 +125,7 @@ const BINDING_METHOD: u16 = 0x0001;
 #[command(
     name = "rstun",
     version = BUILD_VERSION,
-    about = "Standalone STUN Binding server (RFC 5389; RFC 5780 with --alt-listen; TCP with --tcp)",
+    about = "Standalone STUN/TURN server (RFC 5389 Binding; RFC 5780 with --alt-listen; RFC 8656 UDP relay with --turn)",
     long_about = None,
     arg_required_else_help = true,
     subcommand_required = true,
@@ -133,7 +137,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Command {
-    /// Serve STUN Binding over UDP (and TCP with --tcp)
+    /// Serve STUN Binding over UDP (and TCP with --tcp); TURN UDP relay with --turn
     Server(Args),
 }
 
@@ -289,6 +293,33 @@ struct Args {
     /// anyway (seconds, default 5; 0 = stop immediately). The exit code stays 0
     #[arg(long, value_name = "SECONDS")]
     drain_timeout: Option<u64>,
+
+    /// enable the TURN (RFC 8656) UDP relay on the STUN sockets. Requires
+    /// long-term credentials: --realm, --auth-secret and at least one user
+    #[arg(long)]
+    turn: bool,
+
+    /// TURN relay port range, inclusive (`LO-HI`, default 49152-65535).
+    /// Choose a range outside `net.ipv4.ip_local_port_range`
+    #[arg(long, value_name = "LO-HI")]
+    relay_ports: Option<String>,
+
+    /// TURN: cap on concurrent allocations per authenticated user (default 8)
+    #[arg(long, value_name = "N")]
+    max_allocations_per_user: Option<usize>,
+
+    /// TURN: cap on concurrent allocations per client IP (default 16)
+    #[arg(long, value_name = "N")]
+    max_allocations_per_ip: Option<usize>,
+
+    /// TURN: cap on permissions per allocation (default 10)
+    #[arg(long, value_name = "N")]
+    permission_limit: Option<usize>,
+
+    /// TURN: allocation lifetime in seconds (default 600, max 3600). Also caps
+    /// whatever LIFETIME a client asks for
+    #[arg(long, value_name = "SECONDS")]
+    allocation_lifetime: Option<u64>,
 }
 
 /// What an invalid `FINGERPRINT` gets (`--fingerprint-action`).
@@ -323,6 +354,10 @@ pub struct ServerStats {
     /// traffic (and never fires without `--health-listen`).
     ops_rejected: AtomicU64,
     lifecycle: ops::Lifecycle,
+    /// TURN table, set once at startup when `--turn` is on. `None` (the
+    /// default) means the whole TURN path is skipped: no parse, no table, no
+    /// `/metrics` lines — the pre-TURN bytes stay frozen.
+    turn: std::sync::OnceLock<Arc<turn::Turn>>,
 }
 
 /// Per-transport outcome buckets for `rstun_requests_total`.
@@ -477,6 +512,17 @@ impl ServerStats {
 
     pub(crate) fn count_ops_rejected(&self) {
         self.ops_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The TURN table, when `--turn` was given. `None` keeps every TURN path —
+    /// request dispatch, relay tasks and `/metrics` — out of the process.
+    pub(crate) fn turn(&self) -> Option<&Arc<turn::Turn>> {
+        self.turn.get()
+    }
+
+    /// Install the TURN table once, at startup.
+    pub(crate) fn set_turn(&self, turn: Arc<turn::Turn>) {
+        let _ = self.turn.set(turn);
     }
 }
 
@@ -905,6 +951,62 @@ fn build_auth(args: &Args) -> Result<Option<auth::Auth>, String> {
     }
 }
 
+/// Turn the TURN flags into a validated configuration, or explain why they are
+/// unusable.
+///
+/// TURN is **not** a STUN feature that can run anonymously: `--turn` without
+/// long-term credentials (`--realm` + `--auth-secret` + a user) is a startup
+/// error, not a warning. That is the whole anti-open-relay baseline (prd R2).
+fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Config>, String> {
+    let any_turn_flag = args.relay_ports.is_some()
+        || args.max_allocations_per_user.is_some()
+        || args.max_allocations_per_ip.is_some()
+        || args.permission_limit.is_some()
+        || args.allocation_lifetime.is_some();
+    if !args.turn {
+        if any_turn_flag {
+            return Err(
+                "--relay-ports / --max-allocations-* / --permission-limit / \
+                 --allocation-lifetime need --turn"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+    let Some(auth) = auth else {
+        return Err(
+            "--turn needs long-term credentials: --realm, --auth-secret and at least one user \
+             (--auth-user/--auth-pass or --auth-file)"
+                .to_string(),
+        );
+    };
+    if auth.mode() != auth::Mode::LongTerm {
+        return Err(
+            "--turn needs long-term credentials (--realm + --auth-secret); short-term \
+             --auth-user/--auth-pass is not enough"
+                .to_string(),
+        );
+    }
+    let mut config = turn::Config::default();
+    if let Some(text) = &args.relay_ports {
+        config.relay_ports = turn::parse_port_range(text)?;
+    }
+    if let Some(count) = args.max_allocations_per_user {
+        config.max_allocations_per_user = count;
+    }
+    if let Some(count) = args.max_allocations_per_ip {
+        config.max_allocations_per_ip = count;
+    }
+    if let Some(count) = args.permission_limit {
+        config.permission_limit = count;
+    }
+    if let Some(seconds) = args.allocation_lifetime {
+        config.lifetime = Duration::from_secs(seconds);
+    }
+    config.validate()?;
+    Ok(Some(config))
+}
+
 /// Run the STUN Binding server until Ctrl-C (Unix: also SIGTERM).
 ///
 /// `applied_env` is what `main` already merged from `RSTUN_*` (it has to happen
@@ -1000,6 +1102,23 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // TURN：`--turn` 显式开启，且**必须**有长期凭据（prd R2）。关闭时零表、零任务、
+    // 零指标行，STUN 路径与 26.410.100 一致。
+    let turn = match build_turn(&args, auth.as_ref()) {
+        Ok(Some(config)) => Some(Arc::new(turn::Turn::new(
+            config,
+            format!("rstun/{BUILD_VERSION}"),
+        ))),
+        Ok(None) => None,
+        Err(message) => {
+            tracing::error!(%message, "rstun: invalid TURN configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(turn) = &turn {
+        // `OnceLock` only accepts the first value; startup is the only writer.
+        stats.set_turn(turn.clone());
+    }
     // Every listener shares one view of the bound sockets: that is what makes
     // `CHANGE-REQUEST` able to answer from a different one.
     let context = Arc::new(ServerContext {
@@ -1048,6 +1167,8 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
     // the sweeper lives until the process ends, so waiting for it would make
     // every SIGTERM block until `--drain-timeout`.
     let sweeper = admission.as_ref().and_then(limit::start_sweeper);
+    // TURN 的 1s 扫描任务同样常驻、不参与 drain（与限速 sweeper 同一条规则）。
+    let turn_sweeper = turn.as_ref().map(turn::Turn::start_sweeper);
     let listener_count = listeners.len();
 
     let ops_task = ops_listener.map(|listener| {
@@ -1111,6 +1232,17 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
             );
         }
     }
+    if let Some(turn) = &turn {
+        let config = turn.config();
+        tracing::info!(
+            relay_ports = ?config.relay_ports,
+            max_allocations_per_user = config.max_allocations_per_user,
+            max_allocations_per_ip = config.max_allocations_per_ip,
+            permission_limit = config.permission_limit,
+            lifetime_seconds = config.lifetime.as_secs(),
+            "rstun: TURN UDP relay enabled (long-term credentials required)"
+        );
+    }
     tracing::info!(
         software = %software,
         listeners = listener_count,
@@ -1159,6 +1291,9 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
     if let Some(task) = sweeper {
         task.abort();
     }
+    if let Some(task) = turn_sweeper {
+        task.abort();
+    }
     if let Some(task) = ops_task {
         // 健康端点留到最后一刻：drain 期间仍可抓取最终指标。
         task.abort();
@@ -1193,6 +1328,21 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
             stale_nonce,
             bad_request,
             "rstun: authentication counters"
+        );
+    }
+    if let Some(turn) = &turn {
+        let counts = turn.snapshot();
+        tracing::info!(
+            active_allocations = counts.active,
+            created = counts.created,
+            expired = counts.expired,
+            bytes_in = counts.bytes_in,
+            bytes_out = counts.bytes_out,
+            rejected_quota = counts.rejected_quota,
+            rejected_ports = counts.rejected_ports,
+            rejected_family = counts.rejected_family,
+            rejected_loopback = counts.rejected_loopback,
+            "rstun: TURN counters"
         );
     }
     exit_code
@@ -1997,15 +2147,23 @@ async fn respond_to_datagram(
     peer: SocketAddr,
     datagram: &[u8],
 ) {
-    let decision = decide_guarded(
-        datagram,
-        peer,
-        local,
-        Transport::Udp,
-        context,
-        software,
-        stats,
-    );
+    // TURN 先于 STUN：`--turn` 关闭时 `handle` 不会被调用（`None`），字节与
+    // 26.410.100 一致。开启后 ChannelData / TURN method 在此分流，Binding 仍走原路。
+    let decision = match stats
+        .turn()
+        .and_then(|turn| turn.handle(datagram, peer, local, Transport::Udp, context, None))
+    {
+        Some(decision) => decision,
+        None => decide_guarded(
+            datagram,
+            peer,
+            local,
+            Transport::Udp,
+            context,
+            software,
+            stats,
+        ),
+    };
     match decision {
         Ok(Decision::Respond(response)) => {
             if !response_is_encodable(&response) {
@@ -2178,6 +2336,11 @@ async fn serve_tcp_connection(
     // Held for the whole connection: releasing it is what frees the slot.
     _inflight: Option<limit::Permit>,
 ) -> std::io::Result<()> {
+    // TURN over TCP is a distinct framing (ChannelData first byte), so it gets
+    // its own loop. Without `--turn` this is the unchanged pre-TURN path.
+    if let Some(turn) = stats.turn().cloned() {
+        return serve_tcp_turn(stream, peer, context, turn, software, stats, _inflight).await;
+    }
     let local = stream.local_addr()?;
     let mut drain = stats.subscribe_drain();
     if stats.is_draining() {
@@ -2296,10 +2459,10 @@ async fn serve_tcp_connection(
 }
 
 /// Read exactly `buffer.len()` bytes; `false` means the peer closed cleanly.
-async fn read_exact_with_timeout(
-    stream: &mut TcpStream,
-    buffer: &mut [u8],
-) -> std::io::Result<bool> {
+async fn read_exact_with_timeout<R>(stream: &mut R, buffer: &mut [u8]) -> std::io::Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
     match tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(buffer)).await {
         Ok(Ok(_)) => Ok(true),
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
@@ -2308,6 +2471,196 @@ async fn read_exact_with_timeout(
             std::io::ErrorKind::TimedOut,
             format!("STUN frame read timed out after {elapsed}"),
         )),
+    }
+}
+
+/// One TURN-capable TCP connection: STUN frames and `ChannelData` share the
+/// stream, distinguished by the first byte (RFC 8656 §12.5).
+///
+/// Only reached with `--turn`; the connection's writer lives in one task so a
+/// relay reader can push `Data`/`ChannelData` without borrowing the request
+/// loop. Closing the connection releases its allocations immediately instead of
+/// leaving relay sockets bound until the TTL.
+async fn serve_tcp_turn(
+    stream: TcpStream,
+    peer: SocketAddr,
+    context: Arc<ServerContext>,
+    turn: Arc<turn::Turn>,
+    software: &str,
+    stats: &ServerStats,
+    _inflight: Option<limit::Permit>,
+) -> std::io::Result<()> {
+    let local = stream.local_addr()?;
+    let mut drain = stats.subscribe_drain();
+    if stats.is_draining() {
+        return Ok(());
+    }
+    let (mut reader, writer) = stream.into_split();
+    // Bounded on purpose (see `turn::TCP_SINK_CAPACITY`): an authenticated
+    // client that stops reading must not grow an unbounded server-side queue.
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(turn::TCP_SINK_CAPACITY);
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(bytes) = receiver.recv().await {
+            if writer.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+        let _ = writer.shutdown().await;
+    });
+    let result = tcp_turn_loop(
+        &mut reader,
+        peer,
+        local,
+        &context,
+        &turn,
+        software,
+        stats,
+        &sender,
+        &mut drain,
+    )
+    .await;
+    turn.release_connection(peer, local);
+    drop(sender);
+    writer_task.abort();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn tcp_turn_loop(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    peer: SocketAddr,
+    local: SocketAddr,
+    context: &ServerContext,
+    turn: &turn::Turn,
+    software: &str,
+    stats: &ServerStats,
+    sender: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    drain: &mut tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    loop {
+        let mut prefix = [0_u8; 4];
+        let read = tokio::select! {
+            biased;
+            _ = drain.changed() => return Ok(()),
+            read = read_exact_with_timeout(reader, &mut prefix) => read,
+        };
+        if !read? {
+            return Ok(());
+        }
+        stats.count_received(Transport::Tcp);
+
+        // ChannelData: 4-byte header + payload + 4-byte padding (§12.5).
+        if turn::is_channel_data_prefix(prefix[0]) {
+            let channel = u16::from_be_bytes([prefix[0], prefix[1]]);
+            let length = usize::from(u16::from_be_bytes([prefix[2], prefix[3]]));
+            let mut data = vec![0_u8; length];
+            if !read_exact_with_timeout(reader, &mut data).await? {
+                stats.count_error(Transport::Tcp);
+                return Ok(());
+            }
+            let padding = (4 - length % 4) % 4;
+            if padding > 0 {
+                let mut skip = [0_u8; 3];
+                if !read_exact_with_timeout(reader, &mut skip[..padding]).await? {
+                    stats.count_error(Transport::Tcp);
+                    return Ok(());
+                }
+            }
+            turn.handle_channel_data(
+                channel,
+                &data,
+                peer,
+                local,
+                turn::ClientTransport::Tcp,
+                context,
+            );
+            stats.count_ignored(Transport::Tcp);
+            continue;
+        }
+
+        let mut header = [0_u8; protocol::HEADER_LEN];
+        header[..4].copy_from_slice(&prefix);
+        if !read_exact_with_timeout(reader, &mut header[4..]).await? {
+            stats.count_error(Transport::Tcp);
+            return Ok(());
+        }
+        let frame_len = match protocol::peek_frame_len(&header) {
+            Ok(frame_len) => frame_len,
+            Err(error) => {
+                stats.count_error(Transport::Tcp);
+                tracing::debug!(%peer, %error, "rstun: malformed TCP STUN header");
+                return Ok(());
+            }
+        };
+        let mut frame = vec![0_u8; frame_len];
+        frame[..protocol::HEADER_LEN].copy_from_slice(&header);
+        if !read_exact_with_timeout(reader, &mut frame[protocol::HEADER_LEN..]).await? {
+            stats.count_error(Transport::Tcp);
+            tracing::debug!(%peer, "rstun: truncated TCP STUN message");
+            return Ok(());
+        }
+        if let Some(Err(refusal)) = context.check_rates(peer) {
+            stats.count_dropped(Transport::Tcp);
+            tracing::debug!(
+                %peer,
+                reason = refusal.reason(),
+                counter = refusal.counter(),
+                "rstun: TCP request refused by abuse guard, closing connection"
+            );
+            return Ok(());
+        }
+
+        let in_flight = stats.enter();
+        let decision = match turn.handle(&frame, peer, local, Transport::Tcp, context, Some(sender))
+        {
+            Some(decision) => decision,
+            None => decide_guarded(
+                &frame,
+                peer,
+                local,
+                Transport::Tcp,
+                context,
+                software,
+                stats,
+            ),
+        };
+        match decision {
+            Ok(Decision::Respond(response)) => {
+                if !response_is_encodable(&response) {
+                    stats.count_error(Transport::Tcp);
+                    tracing::error!(%peer, "rstun: response violates STUN wire invariants");
+                    if let Some(error) = server_error_bytes(&frame, protocol::ERROR_SERVER_ERROR) {
+                        let _ = sender.try_send(error);
+                        stats.count_answered(Transport::Tcp);
+                    }
+                } else if sender.try_send(response).is_err() {
+                    // Queue full or writer gone: the connection is backed up
+                    // beyond recovery, close it instead of buffering forever.
+                    return Ok(());
+                } else {
+                    stats.count_answered(Transport::Tcp);
+                }
+            }
+            Ok(Decision::RespondFrom { bytes, .. }) => {
+                // Not produced for TURN; the STUN path cannot reach here over
+                // TCP either (CHANGE-REQUEST/RESPONSE-PORT are UDP-only).
+                if sender.try_send(bytes).is_err() {
+                    return Ok(());
+                }
+                stats.count_answered(Transport::Tcp);
+            }
+            Ok(Decision::Ignore(reason)) => {
+                stats.count_ignored(Transport::Tcp);
+                tracing::debug!(%peer, reason, "rstun: ignored message");
+            }
+            Err(error) => {
+                stats.count_error(Transport::Tcp);
+                tracing::debug!(%peer, %error, "rstun: malformed TCP STUN message");
+                return Ok(());
+            }
+        }
+        drop(in_flight);
     }
 }
 
@@ -5362,6 +5715,66 @@ mod tests {
             auth: Some(auth),
             ..ServerContext::default()
         }
+    }
+
+    // ----- TURN configuration (prd R2 / R5) -----
+
+    #[test]
+    fn turn_requires_long_term_credentials() {
+        // No credentials at all.
+        let args = Args {
+            turn: true,
+            ..Args::default()
+        };
+        assert!(build_turn(&args, None).is_err());
+
+        // Short-term credentials are not enough.
+        let short = auth::Auth::short_term(vec![auth::User {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        }]);
+        assert!(build_turn(&args, Some(&short)).is_err());
+
+        // Long-term credentials enable the defaults.
+        let long = long_term_auth(false);
+        let config = build_turn(&args, Some(&long)).unwrap().expect("enabled");
+        assert_eq!(config.relay_ports, turn::DEFAULT_RELAY_PORTS);
+        assert_eq!(
+            config.max_allocations_per_user,
+            turn::DEFAULT_MAX_ALLOCATIONS_PER_USER
+        );
+    }
+
+    #[test]
+    fn turn_flags_need_turn_and_config_is_validated() {
+        let long = long_term_auth(false);
+        // TURN-only flags without --turn are a startup error, not a no-op.
+        let args = Args {
+            relay_ports: Some("5000-5001".to_string()),
+            ..Args::default()
+        };
+        assert!(build_turn(&args, Some(&long)).is_err());
+
+        let args = Args {
+            turn: true,
+            relay_ports: Some("6000-5000".to_string()),
+            ..Args::default()
+        };
+        assert!(build_turn(&args, Some(&long)).is_err());
+
+        let args = Args {
+            turn: true,
+            max_allocations_per_user: Some(0),
+            ..Args::default()
+        };
+        assert!(build_turn(&args, Some(&long)).is_err());
+
+        let args = Args {
+            turn: true,
+            allocation_lifetime: Some(u64::MAX),
+            ..Args::default()
+        };
+        assert!(build_turn(&args, Some(&long)).is_err());
     }
 
     /// `(code, attributes)` of an error response, decoded once.

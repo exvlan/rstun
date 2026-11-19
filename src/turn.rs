@@ -1,0 +1,2024 @@
+//! TURN (RFC 8656) UDP relay — T1 scope.
+//!
+//! What this module implements and, more importantly, what it does **not**:
+//!
+//! * `Allocate` / `Refresh` / `CreatePermission` / `ChannelBind` over UDP and TCP
+//!   client transports, always with **long-term credentials** (`--realm` +
+//!   `--auth-secret` + a user). There is no unauthenticated operation: the
+//!   startup path refuses to enable `--turn` without long-term credentials.
+//! * A UDP relay allocation (`REQUESTED-TRANSPORT = 17`). A TCP allocation
+//!   (RFC 6062, `REQUESTED-TRANSPORT = 6`) is answered `442`.
+//! * `Send` / `Data` indications and `ChannelData` (4-byte header, TCP padding).
+//!
+//! `EVEN-PORT` (including the R=1 reservation token) is implemented because
+//! coturn's `turnutils_uclient` sends it on every Allocate.
+//!
+//! Deliberately absent (T2 or later): TLS/DTLS, REST ephemeral credentials,
+//! bandwidth quotas, TCP allocations (RFC 6062), `DONT-FRAGMENT` and
+//! `REQUESTED-ADDRESS-FAMILY` (answered `420` because they are
+//! comprehension-required and unsupported).
+//!
+//! ## Accounting model
+//!
+//! Everything short-lived is time-stamped with a monotonic [`Instant`] and
+//! reclaimed by one 1-second sweeper ([`Turn::sweep`], started by
+//! [`start_sweeper`]). A removal drops the [`Allocation`], whose `Drop` aborts
+//! the relay reader task and lets the relay socket fall out of scope — the port
+//! goes back to the pool at the same moment, which is what makes the acceptance
+//! check "`ss -lun` has no leftover relay socket" meaningful.
+//!
+//! Counters are atomics shared by every task, read by `/metrics` and by the exit
+//! log — one source, no double bookkeeping. When `--turn` is off the whole
+//! module is inert: no table, no task, no metric line.
+
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use crate::auth::{self, Identity};
+use crate::protocol::{self, MessageClass, TransactionId};
+use crate::{Decision, ServerContext, Transport};
+
+// ---------------------------------------------------------------------------
+// Wire constants (RFC 8656 §14)
+// ---------------------------------------------------------------------------
+
+/// `Allocate` (RFC 8656 §7.2).
+pub const ALLOCATE_METHOD: u16 = 0x003;
+/// `Refresh` (§7.2).
+pub const REFRESH_METHOD: u16 = 0x004;
+/// `Send` indication (§7.3).
+pub const SEND_METHOD: u16 = 0x006;
+/// `Data` indication (§7.3).
+pub const DATA_METHOD: u16 = 0x007;
+/// `CreatePermission` (§9).
+pub const CREATE_PERMISSION_METHOD: u16 = 0x008;
+/// `ChannelBind` (§11).
+pub const CHANNEL_BIND_METHOD: u16 = 0x009;
+
+/// `CHANNEL-NUMBER` (§14.1): channel (u16) + RFFU.
+pub const ATTR_CHANNEL_NUMBER: u16 = 0x000C;
+/// `LIFETIME` (§14.2): u32 seconds.
+pub const ATTR_LIFETIME: u16 = 0x000D;
+/// `XOR-PEER-ADDRESS` (§14.3).
+pub const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
+/// `DATA` (§14.4).
+pub const ATTR_DATA: u16 = 0x0013;
+/// `XOR-RELAYED-ADDRESS` (§14.5).
+pub const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
+/// `REQUESTED-TRANSPORT` (§14.7): protocol (1 byte) + RFFU.
+pub const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
+/// `EVEN-PORT` (§14.6): R bit + reserved. coturn's `turnutils_uclient` sends
+/// it on every Allocate, so T1 accepts the "even port" half of it.
+pub const ATTR_EVEN_PORT: u16 = 0x0018;
+/// `RESERVATION-TOKEN` (§14.9): 8 opaque bytes naming an EVEN-PORT reservation.
+pub const ATTR_RESERVATION_TOKEN: u16 = 0x0022;
+
+/// IANA protocol number of UDP.
+pub const TRANSPORT_UDP: u8 = 17;
+/// IANA protocol number of TCP (`REQUESTED-TRANSPORT = 6` → `442`, RFC 6062 is
+/// out of scope).
+pub const TRANSPORT_TCP: u8 = 6;
+
+/// RFC 8656 §14 error codes.
+pub const ERROR_FORBIDDEN: u16 = 403;
+/// `441 Wrong Credentials`: the 5-tuple is in use by another username
+/// (RFC 8656 §5 / §6.2). The allocation must not be touched.
+pub const ERROR_WRONG_CREDENTIALS: u16 = 441;
+pub const ERROR_ALLOCATION_MISMATCH: u16 = 437;
+pub const ERROR_ADDRESS_FAMILY_NOT_SUPPORTED: u16 = 440;
+pub const ERROR_UNSUPPORTED_TRANSPORT: u16 = 442;
+pub const ERROR_PEER_ADDRESS_FAMILY_MISMATCH: u16 = 443;
+pub const ERROR_ALLOCATION_QUOTA_REACHED: u16 = 486;
+pub const ERROR_INSUFFICIENT_CAPACITY: u16 = 508;
+
+/// First/last channel number of the `ChannelData` range (§12).
+///
+/// RFC 8656 §12.1 defines `0x4000-0x7FFE`; the last value is accepted as
+/// coturn compatibility (its parser allows `0x7FFF`), documented in README.
+pub const CHANNEL_MIN: u16 = 0x4000;
+pub const CHANNEL_MAX: u16 = 0x7FFF;
+
+/// Capacity of the per-connection writer queue for TURN-over-TCP.
+///
+/// Bounded on purpose: an authenticated client that stops reading must not be
+/// able to grow an unbounded `Vec` queue in the server. Overflow drops the
+/// datagram (relayed data is best-effort, like UDP itself).
+pub(crate) const TCP_SINK_CAPACITY: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Defaults (conservative by contract; see prd.md R3/R5)
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_RELAY_PORTS: (u16, u16) = (49152, 65535);
+pub const DEFAULT_MAX_ALLOCATIONS_PER_USER: usize = 8;
+pub const DEFAULT_MAX_ALLOCATIONS_PER_IP: usize = 16;
+pub const DEFAULT_PERMISSION_LIMIT: usize = 10;
+pub const DEFAULT_ALLOCATION_LIFETIME_SECONDS: u64 = 600;
+pub const MAX_ALLOCATION_LIFETIME_SECONDS: u64 = 3600;
+/// Permission lifetime, fixed by RFC 8656 §8 (5 minutes).
+pub const PERMISSION_LIFETIME: Duration = Duration::from_secs(300);
+/// Channel lifetime, fixed by RFC 8656 §11 (10 minutes).
+pub const CHANNEL_LIFETIME: Duration = Duration::from_secs(600);
+/// Sweeper cadence; also the worst-case overshoot of an expired TTL.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+/// How long an `EVEN-PORT` reservation token stays usable (RFC 8656 §7.2).
+pub const RESERVATION_LIFETIME: Duration = Duration::from_secs(30);
+
+/// Parsed `--turn` configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    /// Inclusive relay port range (`--relay-ports LO-HI`).
+    pub relay_ports: (u16, u16),
+    pub max_allocations_per_user: usize,
+    pub max_allocations_per_ip: usize,
+    pub permission_limit: usize,
+    /// Default `LIFETIME` granted when a client requests none, and the cap
+    /// applied to whatever it does request. `--allocation-lifetime`.
+    pub lifetime: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            relay_ports: DEFAULT_RELAY_PORTS,
+            max_allocations_per_user: DEFAULT_MAX_ALLOCATIONS_PER_USER,
+            max_allocations_per_ip: DEFAULT_MAX_ALLOCATIONS_PER_IP,
+            permission_limit: DEFAULT_PERMISSION_LIMIT,
+            lifetime: Duration::from_secs(DEFAULT_ALLOCATION_LIFETIME_SECONDS),
+        }
+    }
+}
+
+impl Config {
+    /// Reject configurations that would silently disable a limit (the project
+    /// rule: a half-configured guard is worse than a refused start).
+    pub fn validate(&self) -> Result<(), String> {
+        let (lo, hi) = self.relay_ports;
+        if lo == 0 {
+            return Err("--relay-ports must not start at 0".to_string());
+        }
+        if lo > hi {
+            return Err(format!(
+                "--relay-ports LO-HI needs LO <= HI (got {lo}-{hi})"
+            ));
+        }
+        if self.max_allocations_per_user == 0 {
+            return Err("--max-allocations-per-user must be at least 1".to_string());
+        }
+        if self.max_allocations_per_ip == 0 {
+            return Err("--max-allocations-per-ip must be at least 1".to_string());
+        }
+        if self.permission_limit == 0 {
+            return Err("--permission-limit must be at least 1".to_string());
+        }
+        if self.lifetime.is_zero() {
+            return Err("--allocation-lifetime must be at least 1 second".to_string());
+        }
+        if self.lifetime > Duration::from_secs(MAX_ALLOCATION_LIFETIME_SECONDS) {
+            return Err(format!(
+                "--allocation-lifetime must be at most {MAX_ALLOCATION_LIFETIME_SECONDS} seconds"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Parse the `LO-HI` spelling of `--relay-ports`.
+pub fn parse_port_range(text: &str) -> Result<(u16, u16), String> {
+    let (lo, hi) = text
+        .split_once('-')
+        .ok_or_else(|| format!("--relay-ports expects LO-HI (got {text:?})"))?;
+    let lo: u16 = lo
+        .trim()
+        .parse()
+        .map_err(|_| format!("--relay-ports: invalid low port {lo:?}"))?;
+    let hi: u16 = hi
+        .trim()
+        .parse()
+        .map_err(|_| format!("--relay-ports: invalid high port {hi:?}"))?;
+    if lo == 0 {
+        return Err("--relay-ports must not start at 0".to_string());
+    }
+    Ok((lo, hi))
+}
+
+// ---------------------------------------------------------------------------
+// Counters
+// ---------------------------------------------------------------------------
+
+/// Everything `/metrics` and the exit log report about TURN.
+#[derive(Debug, Default)]
+pub struct Counters {
+    /// Client → peer payload bytes accepted for relaying.
+    pub bytes_in: AtomicU64,
+    /// Peer → client payload bytes relayed to the client.
+    pub bytes_out: AtomicU64,
+    pub created: AtomicU64,
+    pub expired: AtomicU64,
+    pub rejected_quota: AtomicU64,
+    pub rejected_ports: AtomicU64,
+    pub rejected_family: AtomicU64,
+    pub rejected_loopback: AtomicU64,
+}
+
+/// One consistent read of [`Counters`] plus the live allocation count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub active: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub created: u64,
+    pub expired: u64,
+    pub rejected_quota: u64,
+    pub rejected_ports: u64,
+    pub rejected_family: u64,
+    pub rejected_loopback: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Tables
+// ---------------------------------------------------------------------------
+
+/// Which transport the *client* speaks to us (the relay itself is always UDP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClientTransport {
+    Udp,
+    Tcp,
+}
+
+impl ClientTransport {
+    pub(crate) fn from_transport(transport: Transport) -> Self {
+        match transport {
+            Transport::Udp => Self::Udp,
+            Transport::Tcp => Self::Tcp,
+        }
+    }
+}
+
+/// RFC 8656 §2 "5-tuple": client address, transport, server address.
+///
+/// The relayed transport is always UDP in T1, so it is not part of the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Key {
+    pub client: SocketAddr,
+    pub transport: ClientTransport,
+    pub server: SocketAddr,
+}
+
+/// Where relayed payload goes on the client side.
+#[derive(Clone)]
+enum ClientSink {
+    /// The listening socket that received the request (source address must be
+    /// the server's own, RFC 8656 §7.3).
+    Udp(Arc<UdpSocket>),
+    /// A TCP connection's writer task (ChannelData / Data indication framed).
+    /// Bounded: `try_send` drops on overflow instead of growing memory.
+    Tcp(mpsc::Sender<Vec<u8>>),
+}
+
+impl std::fmt::Debug for ClientSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Udp(_) => f.write_str("Udp"),
+            Self::Tcp(_) => f.write_str("Tcp"),
+        }
+    }
+}
+
+/// One channel binding (RFC 8656 §11).
+#[derive(Debug, Clone, Copy)]
+struct ChannelBinding {
+    peer: SocketAddr,
+    expires_at: Instant,
+}
+
+/// The mutable part of an allocation; shared with its relay reader task.
+#[derive(Debug)]
+struct AllocationState {
+    expires_at: Instant,
+    permissions: HashMap<IpAddr, Instant>,
+    channels: HashMap<u16, ChannelBinding>,
+}
+
+/// One live allocation.
+pub struct Allocation {
+    key: Key,
+    relay: Arc<UdpSocket>,
+    relay_addr: SocketAddr,
+    /// Credentials that created the allocation: a different user on the same
+    /// 5-tuple gets `441` and cannot touch it (RFC 8656 §5).
+    username: String,
+    /// Transaction id of the creating `Allocate`: only a retransmission with
+    /// the **same** id is idempotent; a new id is `437` (RFC 8656 §6.2).
+    transaction_id: TransactionId,
+    /// Lifetime granted by the creating response; a retransmission must return
+    /// the same value, not the remaining one (§6.2).
+    lifetime: u32,
+    client: SocketAddr,
+    state: Arc<RwLock<AllocationState>>,
+    /// Aborts the relay reader when the allocation goes away.
+    relay_task: JoinHandle<()>,
+}
+
+impl std::fmt::Debug for Allocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Allocation")
+            .field("key", &self.key)
+            .field("relay_addr", &self.relay_addr)
+            .field("username", &self.username)
+            .field("transaction_id", &self.transaction_id)
+            .field("lifetime", &self.lifetime)
+            .field("client", &self.client)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        // Stopping the reader is what lets the socket (and its port) go.
+        self.relay_task.abort();
+    }
+}
+
+impl Allocation {
+    fn remaining(&self, now: Instant) -> Duration {
+        lock_read(&self.state)
+            .expires_at
+            .saturating_duration_since(now)
+    }
+
+    fn relay_addr(&self) -> SocketAddr {
+        self.relay_addr
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The server
+// ---------------------------------------------------------------------------
+
+/// The TURN table: allocations, relay port pool and counters.
+///
+/// `Turn` is immutable except for the two locks; it is stored in an `Arc` and
+/// reached from the request paths through [`ServerStats`](crate::ServerStats)
+/// so the STUN payload functions keep their signatures.
+pub struct Turn {
+    config: Config,
+    /// `SOFTWARE` value emitted on every success response (RFC 8656 §14.10
+    /// SHOULD). Fixed per process, so it lives next to the table.
+    software: String,
+    allocations: RwLock<HashMap<Key, Arc<Allocation>>>,
+    used_ports: Mutex<HashSet<u16>>,
+    /// `EVEN-PORT` (R=1) reservations: token → (odd port, deadline).
+    reservations: Mutex<HashMap<[u8; 8], Reservation>>,
+    counters: Arc<Counters>,
+}
+
+/// One pending `EVEN-PORT` reservation (the odd half of the requested pair).
+#[derive(Debug, Clone, Copy)]
+struct Reservation {
+    port: u16,
+    expires_at: Instant,
+}
+
+impl std::fmt::Debug for Turn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Turn")
+            .field("config", &self.config)
+            .field("software", &self.software)
+            .field("allocations", &lock_read(&self.allocations).len())
+            .field("used_ports", &lock_lock(&self.used_ports).len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Turn {
+    pub fn new(config: Config, software: impl Into<String>) -> Self {
+        Self {
+            config,
+            software: software.into(),
+            allocations: RwLock::new(HashMap::new()),
+            used_ports: Mutex::new(HashSet::new()),
+            reservations: Mutex::new(HashMap::new()),
+            counters: Arc::new(Counters::default()),
+        }
+    }
+
+    pub fn config(&self) -> Config {
+        self.config
+    }
+
+    pub fn active(&self) -> u64 {
+        lock_read(&self.allocations).len() as u64
+    }
+
+    /// One consistent snapshot for `/metrics` and the exit log.
+    pub fn snapshot(&self) -> Snapshot {
+        let counters = &self.counters;
+        Snapshot {
+            active: self.active(),
+            bytes_in: counters.bytes_in.load(Ordering::Relaxed),
+            bytes_out: counters.bytes_out.load(Ordering::Relaxed),
+            created: counters.created.load(Ordering::Relaxed),
+            expired: counters.expired.load(Ordering::Relaxed),
+            rejected_quota: counters.rejected_quota.load(Ordering::Relaxed),
+            rejected_ports: counters.rejected_ports.load(Ordering::Relaxed),
+            rejected_family: counters.rejected_family.load(Ordering::Relaxed),
+            rejected_loopback: counters.rejected_loopback.load(Ordering::Relaxed),
+        }
+    }
+
+    // -- lookup ------------------------------------------------------------
+
+    fn get(&self, key: &Key, now: Instant) -> Option<Arc<Allocation>> {
+        let allocation = lock_read(&self.allocations).get(key).cloned()?;
+        if allocation.remaining(now).is_zero() {
+            return None;
+        }
+        Some(allocation)
+    }
+
+    fn insert(&self, allocation: Allocation) {
+        let replaced = lock_write(&self.allocations).insert(allocation.key, Arc::new(allocation));
+        // Replacing an expired-but-not-yet-swept entry must not leak its port;
+        // the old socket dies with the last `Arc` right after this.
+        if let Some(previous) = replaced {
+            self.release_port(previous.relay_addr.port());
+        }
+    }
+
+    /// Return one relay port to the pool (idempotent).
+    fn release_port(&self, port: u16) {
+        lock_lock(&self.used_ports).remove(&port);
+    }
+
+    /// Remove one allocation, returning its relay port to the pool.
+    fn remove(&self, key: &Key) -> Option<Arc<Allocation>> {
+        let allocation = lock_write(&self.allocations).remove(key)?;
+        self.release_port(allocation.relay_addr.port());
+        Some(allocation)
+    }
+
+    /// Allocations belonging to one closed TCP connection: their writer task
+    /// is gone, so keeping them would only leak relay sockets until the TTL.
+    pub fn release_connection(&self, client: SocketAddr, server: SocketAddr) {
+        let key = Key {
+            client,
+            transport: ClientTransport::Tcp,
+            server,
+        };
+        self.remove(&key);
+    }
+
+    // -- port pool ---------------------------------------------------------
+
+    /// Take the lowest free port of the range and bind a relay socket on `ip`.
+    fn take_port(&self, ip: IpAddr, even: bool) -> Option<Arc<UdpSocket>> {
+        let (lo, hi) = self.config.relay_ports;
+        let mut used = lock_lock(&self.used_ports);
+        for port in lo..=hi {
+            if used.contains(&port) {
+                continue;
+            }
+            if even && !port.is_multiple_of(2) {
+                continue;
+            }
+            // A bind failure means the port is held by *someone else* (or the
+            // OS ephemeral range): skip it, it is not ours to claim.
+            let Ok(socket) = crate::udp_socket(SocketAddr::new(ip, port)) else {
+                continue;
+            };
+            used.insert(port);
+            return Some(Arc::new(socket));
+        }
+        None
+    }
+
+    /// Bind an even relay port and keep the next (odd) port reserved for the
+    /// `EVEN-PORT` (R=1) token (RFC 8656 §7.2).
+    fn take_even_port_with_reservation(&self, ip: IpAddr) -> Option<(Arc<UdpSocket>, u16)> {
+        let (lo, hi) = self.config.relay_ports;
+        let mut used = lock_lock(&self.used_ports);
+        for port in lo..=hi {
+            if !port.is_multiple_of(2) || port == u16::MAX {
+                continue;
+            }
+            let next = port + 1;
+            if next > hi || used.contains(&port) || used.contains(&next) {
+                continue;
+            }
+            let Ok(socket) = crate::udp_socket(SocketAddr::new(ip, port)) else {
+                continue;
+            };
+            used.insert(port);
+            used.insert(next);
+            return Some((Arc::new(socket), next));
+        }
+        None
+    }
+
+    /// Bind the port named by a reservation token, if it is still valid.
+    fn take_reserved_port(&self, ip: IpAddr, token: [u8; 8]) -> Option<Arc<UdpSocket>> {
+        let now = Instant::now();
+        let reservation = lock_lock(&self.reservations).remove(&token)?;
+        if reservation.expires_at <= now {
+            self.release_port(reservation.port);
+            return None;
+        }
+        match crate::udp_socket(SocketAddr::new(ip, reservation.port)) {
+            Ok(socket) => Some(Arc::new(socket)),
+            Err(_) => {
+                // Give the port back rather than leave it reserved forever.
+                self.release_port(reservation.port);
+                None
+            }
+        }
+    }
+
+    // -- sweeper -----------------------------------------------------------
+
+    /// Expire allocations, permissions and channels.
+    ///
+    /// One scan instead of one sleeping task per entry: the table is bounded by
+    /// the quota (hundreds at most), and a single task cannot be starved by
+    /// timer pile-up.
+    pub fn sweep(&self, now: Instant) -> usize {
+        let mut expired: Vec<Key> = Vec::new();
+        {
+            let allocations = lock_read(&self.allocations);
+            for (key, allocation) in allocations.iter() {
+                let mut state = lock_write(&allocation.state);
+                state.permissions.retain(|_, deadline| *deadline > now);
+                state.channels.retain(|_, binding| binding.expires_at > now);
+                if state.expires_at <= now {
+                    expired.push(*key);
+                }
+            }
+        }
+        let mut removed = 0;
+        for key in expired {
+            if self.remove(&key).is_some() {
+                self.counters.expired.fetch_add(1, Ordering::Relaxed);
+                removed += 1;
+            }
+        }
+
+        // Unused EVEN-PORT reservations expire after 30 seconds; the odd port
+        // they held goes back to the pool with them.
+        let stale: Vec<[u8; 8]> = {
+            let reservations = lock_lock(&self.reservations);
+            reservations
+                .iter()
+                .filter(|(_, reservation)| reservation.expires_at <= now)
+                .map(|(token, _)| *token)
+                .collect()
+        };
+        for token in stale {
+            if let Some(reservation) = lock_lock(&self.reservations).remove(&token) {
+                self.release_port(reservation.port);
+            }
+        }
+        removed
+    }
+
+    /// Start the 1-second sweeper; abort the handle at shutdown.
+    pub fn start_sweeper(self: &Arc<Self>) -> JoinHandle<()> {
+        let turn = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                turn.sweep(Instant::now());
+            }
+        })
+    }
+
+    /// RFC 8656 §7.2 lifetime arithmetic: the server's **default** is the floor;
+    /// a request above it is clamped to the configured maximum.
+    ///
+    /// `config.lifetime` is both knobs in T1: it is the maximum granted and,
+    /// capped at the RFC default (600 s), the value used when a client asks for
+    /// less. An operator setting `--allocation-lifetime 2` therefore gets 2 s,
+    /// while the default 600 keeps coturn's observable behaviour.
+    fn granted_lifetime(&self, requested: u32) -> u32 {
+        let cap = self.config.lifetime.as_secs() as u32;
+        let default = cap.min(DEFAULT_ALLOCATION_LIFETIME_SECONDS as u32);
+        let computed = requested.min(cap);
+        if computed > default {
+            computed
+        } else {
+            default
+        }
+    }
+
+    // -- request entry points ---------------------------------------------
+
+    /// Handle a datagram/frame that may be TURN.
+    ///
+    /// `None` means "not ours": the STUN path keeps deciding (a Binding request,
+    /// a malformed frame, an indication we do not answer). `Some(Ok(decision))`
+    /// is a fully handled TURN message.
+    pub(crate) fn handle(
+        &self,
+        datagram: &[u8],
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: Transport,
+        context: &ServerContext,
+        tcp_sink: Option<&mpsc::Sender<Vec<u8>>>,
+    ) -> Option<Result<Decision, protocol::ParseError>> {
+        let client_transport = ClientTransport::from_transport(transport);
+
+        // ChannelData is not STUN: first byte 0x40–0x7F (RFC 8656 §12.4).
+        // Over a datagram the frame is exactly header + payload; over TCP the
+        // caller has already de-framed it and calls `handle_channel_data`.
+        if client_transport == ClientTransport::Udp && is_channel_data(datagram) {
+            if datagram.len() < 4 {
+                // A truncated header is not a STUN frame either; ignore it
+                // rather than index past the datagram.
+                return Some(Ok(Decision::Ignore("short TURN ChannelData")));
+            }
+            let channel = u16::from_be_bytes([datagram[0], datagram[1]]);
+            let length = usize::from(u16::from_be_bytes([datagram[2], datagram[3]]));
+            let Some(end) = 4usize.checked_add(length) else {
+                return Some(Ok(Decision::Ignore("TURN ChannelData length overflow")));
+            };
+            if end > datagram.len() {
+                // The declared length is longer than the datagram: dropping is
+                // mandatory (§12.4) — forwarding a truncated payload would
+                // deliver bytes the peer never received.
+                return Some(Ok(Decision::Ignore("truncated TURN ChannelData")));
+            }
+            self.handle_channel_data(
+                channel,
+                &datagram[4..end],
+                peer,
+                local,
+                client_transport,
+                context,
+            );
+            return Some(Ok(Decision::Ignore("TURN ChannelData")));
+        }
+
+        // A malformed frame is the STUN path's error to report: return `None`
+        // so `decide` produces the same drop it always did.
+        let message = protocol::parse(datagram).ok()?;
+        let method = protocol::message_method(message.msg_type);
+        let class = protocol::message_class(message.msg_type);
+
+        if class == MessageClass::Indication && method == SEND_METHOD {
+            self.send_indication(&message, peer, local, client_transport, context);
+            return Some(Ok(Decision::Ignore("TURN Send indication")));
+        }
+        if class != MessageClass::Request {
+            return None;
+        }
+        if !matches!(
+            method,
+            ALLOCATE_METHOD | REFRESH_METHOD | CREATE_PERMISSION_METHOD | CHANNEL_BIND_METHOD
+        ) {
+            return None;
+        }
+        Some(Ok(self.handle_request(
+            datagram,
+            &message,
+            method,
+            peer,
+            local,
+            client_transport,
+            context,
+            tcp_sink,
+        )))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_request(
+        &self,
+        datagram: &[u8],
+        message: &protocol::Message<'_>,
+        method: u16,
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        context: &ServerContext,
+        tcp_sink: Option<&mpsc::Sender<Vec<u8>>>,
+    ) -> Decision {
+        let transaction_id = &message.transaction_id;
+
+        // 1. Long-term credentials. `--turn` is refused at startup without
+        //    them, so the `None` arm is a defensive 500 rather than a policy.
+        let Some(auth) = context.auth.as_ref() else {
+            return Decision::Respond(protocol::error_response(
+                transaction_id,
+                method,
+                protocol::ERROR_SERVER_ERROR,
+                "Server Error",
+            ));
+        };
+        let identity = match authenticate(auth, datagram, message, peer, method) {
+            Ok(identity) => identity,
+            // 401 / 438 / 400 — always unsigned (the client has no key yet).
+            Err(response) => return Decision::Respond(response),
+        };
+
+        // 2. Unknown comprehension-required attributes (RFC 5389 §7.3.1). The
+        //    TURN-only set is understood here even though plain Binding does not
+        //    know it (and must keep answering 400 for other methods).
+        let unknown = turn_unknown_attributes(message.body);
+        if !unknown.is_empty() {
+            tracing::debug!(
+                %peer,
+                ?unknown,
+                "rstun: TURN request with unknown comprehension-required attributes"
+            );
+            return Decision::Respond(auth::seal(
+                protocol::unknown_attributes_response(transaction_id, method, &unknown),
+                &identity,
+            ));
+        }
+
+        match method {
+            ALLOCATE_METHOD => self.allocate(
+                message, peer, local, transport, context, tcp_sink, &identity,
+            ),
+            REFRESH_METHOD => self.refresh(message, peer, local, transport, &identity),
+            CREATE_PERMISSION_METHOD => {
+                self.create_permission(message, peer, local, transport, context, &identity)
+            }
+            CHANNEL_BIND_METHOD => {
+                self.channel_bind(message, peer, local, transport, context, &identity)
+            }
+            _ => unreachable!("handle_request is only called for the four methods"),
+        }
+    }
+
+    // -- Allocate ----------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn allocate(
+        &self,
+        message: &protocol::Message<'_>,
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        context: &ServerContext,
+        tcp_sink: Option<&mpsc::Sender<Vec<u8>>>,
+        identity: &Identity,
+    ) -> Decision {
+        let transaction_id = &message.transaction_id;
+        let body = message.body;
+        let now = Instant::now();
+
+        // REQUESTED-TRANSPORT is mandatory (RFC 8656 §7.2).
+        let Some(requested) = attribute(body, ATTR_REQUESTED_TRANSPORT) else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        };
+        if requested.len() != 4 {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        // The wire value is `protocol (1 byte) | RFFU (3 bytes)`.
+        match requested[0] {
+            TRANSPORT_UDP => {}
+            TRANSPORT_TCP => {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    ERROR_UNSUPPORTED_TRANSPORT,
+                    "Unsupported Transport Protocol",
+                    identity,
+                ));
+            }
+            _ => {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    ERROR_UNSUPPORTED_TRANSPORT,
+                    "Unsupported Transport Protocol",
+                    identity,
+                ));
+            }
+        }
+
+        let requested_lifetime = match parse_lifetime(body) {
+            // RFC 8656 §6.2: an absent (or zero) LIFETIME means "server
+            // default"; zero is only an explicit release on Refresh.
+            Ok(Some(0)) | Ok(None) => self.config.lifetime.as_secs() as u32,
+            Ok(Some(seconds)) => seconds,
+            Err(()) => {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    protocol::ERROR_BAD_REQUEST,
+                    "Bad Request",
+                    identity,
+                ));
+            }
+        };
+        let granted = self.granted_lifetime(requested_lifetime);
+
+        let key = Key {
+            client: peer,
+            transport,
+            server: local,
+        };
+
+        // An existing allocation on this 5-tuple (§6.2): another user must not
+        // learn or touch it (441), a *new* transaction is an allocation
+        // mismatch (437), and only a retransmission of the creating request is
+        // answered idempotently.
+        if let Some(existing) = self.get(&key, now) {
+            if existing.username != identity.username {
+                tracing::debug!(
+                    %peer,
+                    username = %identity.username,
+                    owner = %existing.username,
+                    "rstun: TURN Allocate with another user's 5-tuple"
+                );
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    ERROR_WRONG_CREDENTIALS,
+                    "Wrong Credentials",
+                    identity,
+                ));
+            }
+            if existing.transaction_id != *transaction_id {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    ERROR_ALLOCATION_MISMATCH,
+                    "Allocation Mismatch",
+                    identity,
+                ));
+            }
+            let attributes =
+                relay_attributes(&existing, peer, transaction_id, existing.lifetime, None);
+            return Decision::Respond(success(
+                transaction_id,
+                ALLOCATE_METHOD,
+                &attributes,
+                identity,
+                &self.software,
+            ));
+        }
+
+        // Quotas (§6.2 / §7.2): per authenticated user and per client IP.
+        let (per_user, per_ip) = self.quota_counts(&identity.username, peer.ip());
+        if per_user >= self.config.max_allocations_per_user
+            || per_ip >= self.config.max_allocations_per_ip
+        {
+            self.counters.rejected_quota.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                %peer,
+                username = %identity.username,
+                per_user,
+                per_ip,
+                "rstun: TURN allocation refused by quota"
+            );
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                ERROR_ALLOCATION_QUOTA_REACHED,
+                "Allocation Quota Reached",
+                identity,
+            ));
+        }
+
+        // The relay address must be reachable by the client: bind the relay
+        // socket on the address the client sees, not blindly on `0.0.0.0`.
+        let Some(relay_ip) = egress_ip(local, peer) else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                protocol::ERROR_SERVER_ERROR,
+                "Server Error",
+                identity,
+            ));
+        };
+        if relay_ip.is_ipv4() != peer.is_ipv4() {
+            self.counters
+                .rejected_family
+                .fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                ERROR_ADDRESS_FAMILY_NOT_SUPPORTED,
+                "Address Family not Supported",
+                identity,
+            ));
+        }
+        // `EVEN-PORT` (§14.6): an even relay port; with the R bit, the next
+        // (odd) port is reserved and its token returned. coturn's
+        // `turnutils_uclient` asks for R=1 on every Allocate, so this is the
+        // difference between "interoperates" and "420 on the first request".
+        // Understanding the attribute keeps the 420 branch for genuinely
+        // unknown extensions.
+        let even_port_attribute = attribute(body, ATTR_EVEN_PORT);
+        let reserve_next = match even_port_attribute {
+            None => false,
+            Some(value) if value.len() == 1 => value[0] & 0x80 != 0,
+            Some(_) => {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    protocol::ERROR_BAD_REQUEST,
+                    "Bad Request",
+                    identity,
+                ));
+            }
+        };
+        let wants_even = even_port_attribute.is_some();
+        let reservation_token = match attribute(body, ATTR_RESERVATION_TOKEN) {
+            None => None,
+            Some(value) => match <[u8; 8]>::try_from(value) {
+                Ok(token) => Some(token),
+                Err(_) => {
+                    return Decision::Respond(signed_error(
+                        transaction_id,
+                        ALLOCATE_METHOD,
+                        protocol::ERROR_BAD_REQUEST,
+                        "Bad Request",
+                        identity,
+                    ));
+                }
+            },
+        };
+        if reservation_token.is_some() && wants_even {
+            // Mutually exclusive (RFC 8656 §7.2).
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+
+        let (relay, new_token) = if let Some(token) = reservation_token {
+            match self.take_reserved_port(relay_ip, token) {
+                Some(relay) => (relay, None),
+                None => {
+                    self.counters.rejected_ports.fetch_add(1, Ordering::Relaxed);
+                    return Decision::Respond(signed_error(
+                        transaction_id,
+                        ALLOCATE_METHOD,
+                        ERROR_INSUFFICIENT_CAPACITY,
+                        "Insufficient Capacity",
+                        identity,
+                    ));
+                }
+            }
+        } else if reserve_next {
+            match self.take_even_port_with_reservation(relay_ip) {
+                Some((relay, next)) => {
+                    let token = fresh_reservation_token();
+                    lock_lock(&self.reservations).insert(
+                        token,
+                        Reservation {
+                            port: next,
+                            expires_at: now + RESERVATION_LIFETIME,
+                        },
+                    );
+                    (relay, Some(token))
+                }
+                None => {
+                    self.counters.rejected_ports.fetch_add(1, Ordering::Relaxed);
+                    return Decision::Respond(signed_error(
+                        transaction_id,
+                        ALLOCATE_METHOD,
+                        ERROR_INSUFFICIENT_CAPACITY,
+                        "Insufficient Capacity",
+                        identity,
+                    ));
+                }
+            }
+        } else {
+            match self.take_port(relay_ip, wants_even) {
+                Some(relay) => (relay, None),
+                None => {
+                    self.counters.rejected_ports.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        ports = ?self.config.relay_ports,
+                        "rstun: TURN relay port range exhausted"
+                    );
+                    return Decision::Respond(signed_error(
+                        transaction_id,
+                        ALLOCATE_METHOD,
+                        ERROR_INSUFFICIENT_CAPACITY,
+                        "Insufficient Capacity",
+                        identity,
+                    ));
+                }
+            }
+        };
+        let Ok(relay_addr) = relay.local_addr() else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                protocol::ERROR_SERVER_ERROR,
+                "Server Error",
+                identity,
+            ));
+        };
+
+        let sink = match transport {
+            ClientTransport::Udp => match context.socket_for(local) {
+                Some(socket) => ClientSink::Udp(socket.clone()),
+                None => {
+                    self.release_port(relay_addr.port());
+                    return Decision::Respond(signed_error(
+                        transaction_id,
+                        ALLOCATE_METHOD,
+                        protocol::ERROR_SERVER_ERROR,
+                        "Server Error",
+                        identity,
+                    ));
+                }
+            },
+            ClientTransport::Tcp => match tcp_sink {
+                Some(sink) => ClientSink::Tcp(sink.clone()),
+                None => {
+                    self.release_port(relay_addr.port());
+                    return Decision::Respond(signed_error(
+                        transaction_id,
+                        ALLOCATE_METHOD,
+                        protocol::ERROR_SERVER_ERROR,
+                        "Server Error",
+                        identity,
+                    ));
+                }
+            },
+        };
+
+        let state = Arc::new(RwLock::new(AllocationState {
+            expires_at: now + Duration::from_secs(u64::from(granted)),
+            permissions: HashMap::new(),
+            channels: HashMap::new(),
+        }));
+        let relay_task = spawn_relay_reader(
+            relay.clone(),
+            state.clone(),
+            sink.clone(),
+            peer,
+            transport,
+            self.counters.clone(),
+        );
+        let allocation = Allocation {
+            key,
+            relay,
+            relay_addr,
+            username: identity.username.clone(),
+            transaction_id: *transaction_id,
+            lifetime: granted,
+            client: peer,
+            state,
+            relay_task,
+        };
+        let attributes = relay_attributes(&allocation, peer, transaction_id, granted, new_token);
+        self.insert(allocation);
+        self.counters.created.fetch_add(1, Ordering::Relaxed);
+
+        tracing::debug!(
+            %peer,
+            relay = %relay_addr,
+            transport = ?transport,
+            lifetime = granted,
+            username = %identity.username,
+            "rstun: TURN allocation created"
+        );
+        Decision::Respond(success(
+            transaction_id,
+            ALLOCATE_METHOD,
+            &attributes,
+            identity,
+            &self.software,
+        ))
+    }
+
+    // -- Refresh -----------------------------------------------------------
+
+    fn refresh(
+        &self,
+        message: &protocol::Message<'_>,
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        identity: &Identity,
+    ) -> Decision {
+        let transaction_id = &message.transaction_id;
+        let key = Key {
+            client: peer,
+            transport,
+            server: local,
+        };
+        let now = Instant::now();
+        let Some(allocation) = self.get(&key, now) else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                REFRESH_METHOD,
+                ERROR_ALLOCATION_MISMATCH,
+                "Allocation Mismatch",
+                identity,
+            ));
+        };
+        // Another user owns this 5-tuple: 441, and the allocation is untouched
+        // (a `LIFETIME=0` from that user must not delete it).
+        if allocation.username != identity.username {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                REFRESH_METHOD,
+                ERROR_WRONG_CREDENTIALS,
+                "Wrong Credentials",
+                identity,
+            ));
+        }
+
+        // RFC 8656 §8.2: an absent LIFETIME means "server default", not 400.
+        let lifetime = match parse_lifetime(message.body) {
+            Ok(Some(seconds)) => seconds,
+            Ok(None) => self.config.lifetime.as_secs() as u32,
+            Err(()) => {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    REFRESH_METHOD,
+                    protocol::ERROR_BAD_REQUEST,
+                    "Bad Request",
+                    identity,
+                ));
+            }
+        };
+
+        if lifetime == 0 {
+            // `LIFETIME=0` releases immediately: port back to the pool, relay
+            // socket dropped, subsequent requests on the key get 437.
+            self.remove(&key);
+            self.counters.expired.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%peer, "rstun: TURN allocation released (lifetime=0)");
+            return Decision::Respond(success(
+                transaction_id,
+                REFRESH_METHOD,
+                &[(ATTR_LIFETIME, 0_u32.to_be_bytes().to_vec())],
+                identity,
+                &self.software,
+            ));
+        }
+
+        let granted = self.granted_lifetime(lifetime);
+        lock_write(&allocation.state).expires_at = now + Duration::from_secs(u64::from(granted));
+        Decision::Respond(success(
+            transaction_id,
+            REFRESH_METHOD,
+            &[(ATTR_LIFETIME, granted.to_be_bytes().to_vec())],
+            identity,
+            &self.software,
+        ))
+    }
+
+    // -- CreatePermission --------------------------------------------------
+
+    fn create_permission(
+        &self,
+        message: &protocol::Message<'_>,
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        context: &ServerContext,
+        identity: &Identity,
+    ) -> Decision {
+        let transaction_id = &message.transaction_id;
+        let key = Key {
+            client: peer,
+            transport,
+            server: local,
+        };
+        let now = Instant::now();
+        let Some(allocation) = self.get(&key, now) else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CREATE_PERMISSION_METHOD,
+                ERROR_ALLOCATION_MISMATCH,
+                "Allocation Mismatch",
+                identity,
+            ));
+        };
+        if allocation.username != identity.username {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CREATE_PERMISSION_METHOD,
+                ERROR_WRONG_CREDENTIALS,
+                "Wrong Credentials",
+                identity,
+            ));
+        }
+
+        let mut peers = Vec::new();
+        for attribute in protocol::attributes(message.body)
+            .filter(|attribute| attribute.attr_type == ATTR_XOR_PEER_ADDRESS)
+        {
+            let Some(address) =
+                protocol::decode_xor_mapped_address(attribute.value, &message.transaction_id)
+            else {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    CREATE_PERMISSION_METHOD,
+                    protocol::ERROR_BAD_REQUEST,
+                    "Bad Request",
+                    identity,
+                ));
+            };
+            peers.push(address);
+        }
+        // At least one XOR-PEER-ADDRESS is required (RFC 8656 §9.1).
+        if peers.is_empty() {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CREATE_PERMISSION_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        if let Some(response) = self.check_peers(
+            &allocation,
+            &peers,
+            local,
+            context,
+            CREATE_PERMISSION_METHOD,
+            transaction_id,
+            identity,
+        ) {
+            return Decision::Respond(response);
+        }
+        // Validate the **whole** request before touching the table: a single
+        // request carrying more peers than the remaining quota must install
+        // nothing (RFC 8656 §10.2, 508 Insufficient Capacity).
+        let mut state = lock_write(&allocation.state);
+        let live = state
+            .permissions
+            .iter()
+            .filter(|(_, deadline)| **deadline > now)
+            .count();
+        let is_live = |state: &AllocationState, ip: IpAddr| {
+            state
+                .permissions
+                .get(&ip)
+                .is_some_and(|deadline| *deadline > now)
+        };
+        let mut wanted: Vec<IpAddr> = Vec::with_capacity(peers.len());
+        for address in &peers {
+            let ip = address.ip();
+            if !wanted.contains(&ip) && !is_live(&state, ip) {
+                wanted.push(ip);
+            }
+        }
+        if live + wanted.len() > self.config.permission_limit {
+            drop(state);
+            self.counters.rejected_quota.fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CREATE_PERMISSION_METHOD,
+                ERROR_INSUFFICIENT_CAPACITY,
+                "Insufficient Capacity",
+                identity,
+            ));
+        }
+        // Refresh every listed permission (idempotent repeats included).
+        for address in &peers {
+            state
+                .permissions
+                .insert(address.ip(), now + PERMISSION_LIFETIME);
+        }
+        drop(state);
+        Decision::Respond(success(
+            transaction_id,
+            CREATE_PERMISSION_METHOD,
+            &[],
+            identity,
+            &self.software,
+        ))
+    }
+
+    // -- ChannelBind -------------------------------------------------------
+
+    fn channel_bind(
+        &self,
+        message: &protocol::Message<'_>,
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        context: &ServerContext,
+        identity: &Identity,
+    ) -> Decision {
+        let transaction_id = &message.transaction_id;
+        let key = Key {
+            client: peer,
+            transport,
+            server: local,
+        };
+        let now = Instant::now();
+        let Some(allocation) = self.get(&key, now) else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                ERROR_ALLOCATION_MISMATCH,
+                "Allocation Mismatch",
+                identity,
+            ));
+        };
+        if allocation.username != identity.username {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                ERROR_WRONG_CREDENTIALS,
+                "Wrong Credentials",
+                identity,
+            ));
+        }
+
+        let Some(channel) = attribute(message.body, ATTR_CHANNEL_NUMBER) else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        };
+        if channel.len() != 4 {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        let channel_number = u16::from_be_bytes([channel[0], channel[1]]);
+        if !(CHANNEL_MIN..=CHANNEL_MAX).contains(&channel_number) {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        let Some(peer_address) = attribute(message.body, ATTR_XOR_PEER_ADDRESS)
+            .and_then(|value| protocol::decode_xor_mapped_address(value, &message.transaction_id))
+        else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        };
+        if let Some(response) = self.check_peers(
+            &allocation,
+            &[peer_address],
+            local,
+            context,
+            CHANNEL_BIND_METHOD,
+            transaction_id,
+            identity,
+        ) {
+            return Decision::Respond(response);
+        }
+
+        let mut state = lock_write(&allocation.state);
+        // Same channel to a different peer, or the same peer on a different
+        // channel: 400 (RFC 8656 §11).
+        if state
+            .channels
+            .get(&channel_number)
+            .is_some_and(|binding| binding.expires_at > now && binding.peer != peer_address)
+        {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        if state.channels.iter().any(|(number, binding)| {
+            *number != channel_number && binding.expires_at > now && binding.peer == peer_address
+        }) {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        // ChannelBind installs/refreshes the permission for the peer's IP
+        // (§9.1); it counts against the same limit.
+        let live = state
+            .permissions
+            .iter()
+            .filter(|(_, deadline)| **deadline > now)
+            .count();
+        let permitted = state
+            .permissions
+            .get(&peer_address.ip())
+            .is_some_and(|deadline| *deadline > now);
+        if !permitted && live >= self.config.permission_limit {
+            drop(state);
+            self.counters.rejected_quota.fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                ERROR_INSUFFICIENT_CAPACITY,
+                "Insufficient Capacity",
+                identity,
+            ));
+        }
+        state
+            .permissions
+            .insert(peer_address.ip(), now + PERMISSION_LIFETIME);
+        state.channels.insert(
+            channel_number,
+            ChannelBinding {
+                peer: peer_address,
+                expires_at: now + CHANNEL_LIFETIME,
+            },
+        );
+        drop(state);
+        Decision::Respond(success(
+            transaction_id,
+            CHANNEL_BIND_METHOD,
+            &[],
+            identity,
+            &self.software,
+        ))
+    }
+
+    /// Shared peer validation: family, loopback, permission upper bound.
+    ///
+    /// Returns the response to send when a peer is not acceptable.
+    #[allow(clippy::too_many_arguments)]
+    fn check_peers(
+        &self,
+        allocation: &Allocation,
+        peers: &[SocketAddr],
+        local: SocketAddr,
+        context: &ServerContext,
+        method: u16,
+        transaction_id: &TransactionId,
+        identity: &Identity,
+    ) -> Option<Vec<u8>> {
+        for peer in peers {
+            let same_family = peer.is_ipv4() == allocation.relay_addr().is_ipv4();
+            if !same_family {
+                self.counters
+                    .rejected_family
+                    .fetch_add(1, Ordering::Relaxed);
+                return Some(signed_error(
+                    transaction_id,
+                    method,
+                    ERROR_PEER_ADDRESS_FAMILY_MISMATCH,
+                    "Peer Address Family Mismatch",
+                    identity,
+                ));
+            }
+            if *peer == allocation.relay_addr() || self.is_own_endpoint(*peer, local, context) {
+                self.counters
+                    .rejected_loopback
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    peer = %peer,
+                    "rstun: TURN peer points at this server, refusing (loopback)"
+                );
+                return Some(signed_error(
+                    transaction_id,
+                    method,
+                    ERROR_FORBIDDEN,
+                    "Forbidden",
+                    identity,
+                ));
+            }
+        }
+        None
+    }
+
+    /// Would relaying to `address` point back at this host's own protocol
+    /// surface, or at a destination class that must never be relayed to?
+    ///
+    /// Rejected unconditionally:
+    /// * unspecified (`0.0.0.0` / `::`) and multicast destinations — never a
+    ///   legitimate peer and a known amplification vector;
+    /// * any address equal to a bound listener socket (the request path itself)
+    ///   or to the socket the request arrived on.
+    ///
+    /// Rejected **unless** the request arrived on a loopback socket:
+    /// * loopback peers. With `--listen 0.0.0.0:3478` the exact-address checks
+    ///   all miss `127.0.0.1:3478` (the bound address is `0.0.0.0:3478`), so the
+    ///   wildcard case is the one that matters: a public TURN server must not be
+    ///   usable as a bridge to localhost-only services. Deliberately allowing
+    ///   loopback when the listener itself is loopback keeps local development
+    ///   and the `turnutils_uclient -y` matrix working.
+    ///
+    /// Other allocations' *relay* addresses stay allowed: client-to-client
+    /// relaying through one TURN server is the standard `-y` / same-NAT WebRTC
+    /// case, and a relay socket only talks to peers that already hold a
+    /// permission (the caller checks the allocation's own relay separately).
+    ///
+    /// Known limitation: the host's own **public** IP cannot be enumerated
+    /// without interface discovery (a new dependency, out of scope for T1), so
+    /// `peer = <this host's public IP>:<port>` is not detectable. See README.
+    ///
+    /// The loopback decision is made from the **bound** listener set, not from
+    /// `local`: for TURN-over-TCP `stream.local_addr()` is concrete even when
+    /// the listener is `0.0.0.0`, so using it would let a wildcard deployment
+    /// reach localhost over TCP.
+    fn loopback_peers_allowed(context: &ServerContext, local: SocketAddr) -> bool {
+        if context.udp.is_empty() {
+            // Tests / exotic embeddings: fall back to the socket that received
+            // the request (the production path always has the UDP listeners).
+            return local.ip().is_loopback();
+        }
+        context
+            .udp
+            .iter()
+            .all(|(bound, _)| bound.ip().is_loopback())
+    }
+
+    fn is_own_endpoint(
+        &self,
+        address: SocketAddr,
+        local: SocketAddr,
+        context: &ServerContext,
+    ) -> bool {
+        // Normalise IPv4-mapped IPv6 first: `is_loopback()` / `is_unspecified()` /
+        // `is_multicast()` all return false for `::ffff:127.0.0.1`, which would
+        // otherwise skip every address-class check below.
+        let ip = match address.ip() {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(v6),
+            },
+            ip => ip,
+        };
+        if ip.is_unspecified() || ip.is_multicast() {
+            return true;
+        }
+        if matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()) {
+            return true;
+        }
+        if ip.is_loopback() && !Self::loopback_peers_allowed(context, local) {
+            return true;
+        }
+        // A wildcard listener cannot be matched by address, so ask the kernel
+        // which source it would use to reach the peer: if that is the peer's own
+        // address, the peer is on this host and the port is one of ours.
+        if context
+            .udp
+            .iter()
+            .any(|(bound, _)| bound.port() == address.port())
+            && egress_ip(local, address) == Some(ip)
+        {
+            return true;
+        }
+        address == local || context.udp.iter().any(|(bound, _)| *bound == address)
+    }
+
+    // -- data plane --------------------------------------------------------
+
+    /// `Send` indication: client → peer, only through a live permission.
+    fn send_indication(
+        &self,
+        message: &protocol::Message<'_>,
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        context: &ServerContext,
+    ) {
+        let key = Key {
+            client: peer,
+            transport,
+            server: local,
+        };
+        let now = Instant::now();
+        let Some(allocation) = self.get(&key, now) else {
+            return;
+        };
+        let Some(peer_address) = attribute(message.body, ATTR_XOR_PEER_ADDRESS)
+            .and_then(|value| protocol::decode_xor_mapped_address(value, &message.transaction_id))
+        else {
+            return;
+        };
+        let Some(data) = attribute(message.body, ATTR_DATA) else {
+            return;
+        };
+        // No permission → silent discard (§7.3); never answer an indication.
+        let permitted = lock_read(&allocation.state)
+            .permissions
+            .get(&peer_address.ip())
+            .is_some_and(|deadline| *deadline > now);
+        if !permitted {
+            return;
+        }
+        if self.is_own_endpoint(peer_address, local, context) {
+            self.counters
+                .rejected_loopback
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if allocation.relay.try_send_to(data, peer_address).is_ok() {
+            self.counters
+                .bytes_in
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// `ChannelData` from the client: channel hit → relay, no STUN parsing.
+    pub(crate) fn handle_channel_data(
+        &self,
+        channel: u16,
+        data: &[u8],
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        context: &ServerContext,
+    ) {
+        let key = Key {
+            client: peer,
+            transport,
+            server: local,
+        };
+        let now = Instant::now();
+        let Some(allocation) = self.get(&key, now) else {
+            return;
+        };
+        let peer_address = {
+            let state = lock_read(&allocation.state);
+            let Some(binding) = state.channels.get(&channel) else {
+                return;
+            };
+            if binding.expires_at <= now {
+                return;
+            }
+            let permitted = state
+                .permissions
+                .get(&binding.peer.ip())
+                .is_some_and(|deadline| *deadline > now);
+            if !permitted {
+                return;
+            }
+            binding.peer
+        };
+        if self.is_own_endpoint(peer_address, local, context) {
+            self.counters
+                .rejected_loopback
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if allocation.relay.try_send_to(data, peer_address).is_ok() {
+            self.counters
+                .bytes_in
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn quota_counts(&self, username: &str, ip: IpAddr) -> (usize, usize) {
+        let allocations = lock_read(&self.allocations);
+        let mut per_user = 0;
+        let mut per_ip = 0;
+        for allocation in allocations.values() {
+            if allocation.username == username {
+                per_user += 1;
+            }
+            if allocation.client.ip() == ip {
+                per_ip += 1;
+            }
+        }
+        (per_user, per_ip)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Relay reader (peer → client)
+// ---------------------------------------------------------------------------
+
+/// Forward datagrams arriving on the relay socket to the client.
+///
+/// * permission for the peer's IP is mandatory — a stranger that learned the
+///   relayed address cannot make us talk to the client (§8);
+/// * a live channel binding picks `ChannelData`, otherwise a `Data` indication;
+/// * the task ends when the allocation expires or its `Arc`/socket goes away.
+fn spawn_relay_reader(
+    relay: Arc<UdpSocket>,
+    state: Arc<RwLock<AllocationState>>,
+    sink: ClientSink,
+    client: SocketAddr,
+    transport: ClientTransport,
+    counters: Arc<Counters>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buffer = vec![0_u8; 65535];
+        loop {
+            let (length, source) = match relay.recv_from(&mut buffer).await {
+                Ok(received) => received,
+                Err(error) => {
+                    tracing::debug!(%client, %error, "rstun: TURN relay recv_from failed");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+            };
+            let now = Instant::now();
+            let (permitted, channel) = {
+                let state = lock_read(&state);
+                if state.expires_at <= now {
+                    break;
+                }
+                let permitted = state
+                    .permissions
+                    .get(&source.ip())
+                    .is_some_and(|deadline| *deadline > now);
+                let channel = state
+                    .channels
+                    .iter()
+                    .find(|(_, binding)| binding.expires_at > now && binding.peer == source)
+                    .map(|(number, _)| *number);
+                (permitted, channel)
+            };
+            if !permitted {
+                continue;
+            }
+            let payload = match channel {
+                Some(channel) => channel_data_frame(channel, &buffer[..length], transport),
+                None => data_indication(source, &buffer[..length]),
+            };
+            let sent = match &sink {
+                ClientSink::Udp(socket) => socket.send_to(&payload, client).await.is_ok(),
+                // Bounded queue: a client that stops reading loses datagrams
+                // (relayed data is best-effort) but cannot grow memory.
+                ClientSink::Tcp(writer) => writer.try_send(payload).is_ok(),
+            };
+            if sent {
+                counters
+                    .bytes_out
+                    .fetch_add(length as u64, Ordering::Relaxed);
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Wire helpers
+// ---------------------------------------------------------------------------
+
+/// First byte of a `ChannelData` frame is in `0x40..=0x7F` (RFC 8656 §12.4).
+pub fn is_channel_data(frame: &[u8]) -> bool {
+    frame.first().is_some_and(|byte| byte & 0xC0 == 0x40)
+}
+
+/// True when the *first* byte says ChannelData (TCP framing reads it alone).
+pub fn is_channel_data_prefix(byte: u8) -> bool {
+    byte & 0xC0 == 0x40
+}
+
+/// `ChannelData` framing: 4-byte header + payload; TCP pads to 4 bytes (§12.5).
+fn channel_data_frame(channel: u16, data: &[u8], transport: ClientTransport) -> Vec<u8> {
+    let padding = match transport {
+        ClientTransport::Udp => 0,
+        ClientTransport::Tcp => (4 - data.len() % 4) % 4,
+    };
+    let mut frame = Vec::with_capacity(4 + data.len() + padding);
+    frame.extend_from_slice(&channel.to_be_bytes());
+    frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    frame.extend_from_slice(data);
+    frame.resize(frame.len() + padding, 0);
+    frame
+}
+
+/// `Data` indication: `XOR-PEER-ADDRESS` + `DATA` (RFC 8656 §7.3).
+fn data_indication(peer: SocketAddr, data: &[u8]) -> Vec<u8> {
+    let transaction_id = fresh_transaction_id();
+    let mut body = Vec::with_capacity(32 + data.len());
+    protocol::push_attribute(
+        &mut body,
+        ATTR_XOR_PEER_ADDRESS,
+        &protocol::xor_mapped_address_value(peer, &transaction_id),
+    );
+    protocol::push_attribute(&mut body, ATTR_DATA, data);
+    protocol::encode_message(
+        protocol::message_type(DATA_METHOD, MessageClass::Indication),
+        &transaction_id,
+        &body,
+    )
+}
+
+/// Reply attributes of a successful `Allocate` (RFC 8656 §7.2).
+fn relay_attributes(
+    allocation: &Allocation,
+    peer: SocketAddr,
+    transaction_id: &TransactionId,
+    lifetime: u32,
+    reservation_token: Option<[u8; 8]>,
+) -> Vec<(u16, Vec<u8>)> {
+    let mut attributes = vec![
+        (
+            ATTR_XOR_RELAYED_ADDRESS,
+            protocol::xor_mapped_address_value(allocation.relay_addr(), transaction_id),
+        ),
+        (
+            protocol::ATTR_XOR_MAPPED_ADDRESS,
+            protocol::xor_mapped_address_value(peer, transaction_id),
+        ),
+        (ATTR_LIFETIME, lifetime.to_be_bytes().to_vec()),
+    ];
+    if let Some(token) = reservation_token {
+        attributes.push((ATTR_RESERVATION_TOKEN, token.to_vec()));
+    }
+    attributes
+}
+
+fn success(
+    transaction_id: &TransactionId,
+    method: u16,
+    attributes: &[(u16, Vec<u8>)],
+    identity: &Identity,
+    software: &str,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (attr_type, value) in attributes {
+        protocol::push_attribute(&mut body, *attr_type, value);
+    }
+    // RFC 8656 §14.10: SHOULD on every success response. Placed last (before
+    // the integrity attribute `seal` appends), like the STUN path.
+    protocol::push_attribute(&mut body, protocol::ATTR_SOFTWARE, software.as_bytes());
+    let frame = protocol::encode_message(
+        protocol::message_type(method, MessageClass::SuccessResponse),
+        transaction_id,
+        &body,
+    );
+    auth::seal(frame, identity)
+}
+
+fn signed_error(
+    transaction_id: &TransactionId,
+    method: u16,
+    code: u16,
+    reason: &str,
+    identity: &Identity,
+) -> Vec<u8> {
+    auth::seal(
+        protocol::error_response(transaction_id, method, code, reason),
+        identity,
+    )
+}
+
+/// First value of `attr_type` in `body`, if any.
+fn attribute(body: &[u8], attr_type: u16) -> Option<&[u8]> {
+    protocol::attributes(body)
+        .find(|attribute| attribute.attr_type == attr_type)
+        .map(|attribute| attribute.value)
+}
+
+/// `Ok(None)` = absent; `Ok(Some(seconds))` = present and well formed;
+/// `Err(())` = present with the wrong length.
+fn parse_lifetime(body: &[u8]) -> Result<Option<u32>, ()> {
+    match attribute(body, ATTR_LIFETIME) {
+        None => Ok(None),
+        Some(value) if value.len() == 4 => Ok(Some(u32::from_be_bytes([
+            value[0], value[1], value[2], value[3],
+        ]))),
+        Some(_) => Err(()),
+    }
+}
+
+/// Unknown comprehension-required attributes *in the TURN dialect*.
+fn turn_unknown_attributes(body: &[u8]) -> Vec<u16> {
+    let mut unknown: Vec<u16> = Vec::new();
+    for attribute in protocol::attributes(body) {
+        let attr_type = attribute.attr_type;
+        if !protocol::is_comprehension_required(attr_type) {
+            continue;
+        }
+        if protocol::is_known_attribute(attr_type)
+            || matches!(
+                attr_type,
+                ATTR_CHANNEL_NUMBER
+                    | ATTR_LIFETIME
+                    | ATTR_XOR_PEER_ADDRESS
+                    | ATTR_DATA
+                    | ATTR_XOR_RELAYED_ADDRESS
+                    | ATTR_REQUESTED_TRANSPORT
+                    | ATTR_EVEN_PORT
+                    | ATTR_RESERVATION_TOKEN
+            )
+        {
+            continue;
+        }
+        if !unknown.contains(&attr_type) {
+            unknown.push(attr_type);
+        }
+    }
+    unknown
+}
+
+/// Authenticate one TURN request with the shared long-term implementation.
+///
+/// `Err(response)` is the wire answer (401 / 438 / 400), counted exactly like
+/// the STUN path (`Auth::count`), which is what keeps a 401 flood inside the
+/// abuse guard's buckets.
+fn authenticate(
+    auth: &auth::Auth,
+    datagram: &[u8],
+    message: &protocol::Message<'_>,
+    peer: SocketAddr,
+    method: u16,
+) -> Result<Identity, Vec<u8>> {
+    let now = SystemTime::now();
+    // A UDP datagram may carry trailing junk; the MAC covers only the frame.
+    let end = (protocol::HEADER_LEN + message.body.len()).min(datagram.len());
+    let frame = &datagram[..end];
+    let outcome = auth.verify(frame, message, peer.ip(), now);
+    auth.count(&outcome);
+    match outcome {
+        Ok(identity) => Ok(identity),
+        Err(rejection) => {
+            Err(auth.rejection_response(rejection, &message.transaction_id, method, peer.ip(), now))
+        }
+    }
+}
+
+/// The address a client would see as the relay: the socket's own address when
+/// it is concrete, otherwise the egress address the kernel picks for `peer`.
+fn egress_ip(local: SocketAddr, peer: SocketAddr) -> Option<IpAddr> {
+    if !local.ip().is_unspecified() {
+        return Some(local.ip());
+    }
+    let bind: SocketAddr = if peer.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0_u16; 8], 0))
+    };
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(peer).ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+/// A transaction id for server-originated indications: no matching semantics,
+/// only uniqueness (time counter mixed with a process-local sequence).
+fn fresh_transaction_id() -> TransactionId {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = nanos ^ sequence.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut id = [0_u8; 12];
+    id[..8].copy_from_slice(&mixed.to_be_bytes());
+    id[8..].copy_from_slice(&((nanos >> 32) as u32 ^ sequence as u32).to_be_bytes());
+    TransactionId(id)
+}
+
+/// Opaque 8-byte token for an `EVEN-PORT` reservation.
+fn fresh_reservation_token() -> [u8; 8] {
+    let id = fresh_transaction_id();
+    let mut token = [0_u8; 8];
+    token.copy_from_slice(&id.as_bytes()[..8]);
+    token
+}
+
+// Lock helpers: a poisoned lock still carries a consistent (if possibly
+// half-updated) table, and the process keeps serving rather than panicking.
+
+fn lock_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|error| error.into_inner())
+}
+
+fn lock_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|error| error.into_inner())
+}
+
+fn lock_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+#[cfg(test)]
+mod tests;
