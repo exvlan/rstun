@@ -7,7 +7,8 @@
 ## 需求
 
 1. **基准**：Criterion（或自写 bench）测 `decide()` 与端到端 UDP 吞吐（req/s）与 p50/p99 延迟；
-   基线写入 `docs/perf.md`，每次发布对比。
+   基线写入 `docs/perf.md`，每次发布对比。抗滥用限速表在 65536 条目时的内存与 P99 也在此项
+   （来自 `11-19-rstun-abuse-guard` 的未闭环观察项）。
 2. **压测**：脚本 `script/lab/rstun-load.sh`（UDP 洪水 + 限速生效验证 + TCP 连接洪水），可指定并发/时长/源地址。
 3. **混沌**：`tc netem` 丢包/延迟/MTU 分片下行为（UDP 截断、TCP 半包、超时回收）。
 4. **覆盖率**：`cargo llvm-cov` 门禁（建议 ≥ 80%，协议模块单独阈值），CI 上传报告。
