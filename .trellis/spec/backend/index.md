@@ -19,6 +19,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [发布物契约](./release-artifacts.md) | Release 资产可执行位、tag↔资产↔digest、双架构 manifest、public 仓扫描 | Done |
+| [抗滥用契约](./abuse-guard.md) | 放大上界 `max(len×ratio, len+32)`、省略 SOFTWARE 的域=防护域、默认关闭零变化、统计口径 | Done |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 
 ---
