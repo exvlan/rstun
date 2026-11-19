@@ -1,0 +1,733 @@
+#!/usr/bin/env bash
+#
+# `rstun` TURN（RFC 8656）验收：强制鉴权 / 中继回环 / 配额与端口 / 回收 / 指标 /
+# 与 coturn 的对照。默认关闭的 STUN 路径不在这里重测（那是 `rstun-interop.sh` 与
+# `rstun-abuse.sh` 的门禁）。
+#
+# 用法：
+#   bash script/lab/rstun-turn.sh                  # 全部项
+#   bash script/lab/rstun-turn.sh --port 34980     # 端口基准（默认 34980）
+#   bash script/lab/rstun-turn.sh --no-build       # 复用 target/debug/rstun
+#   bash script/lab/rstun-turn.sh --only relay     # 只跑一项
+#     （startup|relay|auth|lifecycle|wrong-user|wildcard|permission-limit|quota|ports|cleanup|frozen|coturn）
+#   bash script/lab/rstun-turn.sh --keep           # 保留日志（默认只清进程）
+#
+# 依赖：cargo/rustc（本仓）、python3（探针，只用标准库）、`turnutils_uclient`
+# （coturn 自带客户端）。`turnserver` 缺失时 coturn 项记 SKIP 并说明；其余项用
+# 本仓探针 + uclient，缺 uclient 的项同理 SKIP。
+#
+# 退出码：0 = 全部 ok；1 = 至少一项 FAIL；2 = 参数/环境错误。
+# 日志：$RSTUN_TURN_DIR（默认 /tmp/opencode/rstun-turn），每项一个 .log。
+#
+# 判据提醒：本脚本用**真 socket + 真鉴权**，不用 mock。cleanup 项用
+# `--allocation-lifetime 2` 让 allocation 自然过期，再断言 `ss -lun` 在 relay
+# 端口段内无监听 —— 这就是「回收彻底」的可执行定义。
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+BIN="$ROOT/target/debug/rstun"
+PROBE="$ROOT/script/lab/rstun-turn-probe.py"
+WORK="${RSTUN_TURN_DIR:-/tmp/opencode/rstun-turn}"
+LOG_DIR="$WORK/logs"
+
+BASE=34980
+RELAY_LO=49700
+RELAY_HI=49799
+BUILD=true
+ONLY=""
+
+USER_NAME="turnuser"
+USER_PASS="turnpass"
+REALM="example.org"
+SECRET="turn-test-secret"
+
+PIDS=()
+FAILED=()
+SKIPPED=()
+PASSED=()
+
+ALL_ITEMS=(startup relay auth lifecycle wrong-user wildcard permission-limit quota ports cleanup frozen coturn)
+
+usage() {
+  sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port) BASE="${2:?--port 需要一个端口}"; shift ;;
+    --port=*) BASE="${1#*=}" ;;
+    --no-build) BUILD=false ;;
+    --only) ONLY="${2:?--only 需要一项名字}"; shift ;;
+    --only=*) ONLY="${1#*=}" ;;
+    --keep) : ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "未知参数: $1（--help 看用法）" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if ! [[ "$BASE" =~ ^[0-9]+$ ]]; then
+  echo "--port 需要整数，收到: $BASE" >&2
+  exit 2
+fi
+if [[ "$BASE" == "3478" || "$BASE" -le 1024 ]]; then
+  echo "不要用 3478/特权端口（容易撞上本机服务）；给个高位端口" >&2
+  exit 2
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "需要 python3（探针只用标准库）" >&2
+  exit 2
+fi
+if [[ -n "$ONLY" ]]; then
+  case "$ONLY" in
+    startup | relay | auth | lifecycle | wrong-user | wildcard | permission-limit | quota | ports | cleanup | frozen | coturn) : ;;
+    *) echo "--only 未知项: $ONLY（可用：${ALL_ITEMS[*]}）" >&2; exit 2 ;;
+  esac
+fi
+
+export PYTHONIOENCODING=utf-8
+mkdir -p "$LOG_DIR"
+: >"$LOG_DIR/summary.log"
+
+log() { printf '%s\n' "$*" | tee -a "$LOG_DIR/summary.log"; }
+ok() { PASSED+=("$1"); log "ok: $1${2:+ $2}"; }
+fail() { FAILED+=("$1"); log "FAIL: $1${2:+ — $2}"; }
+skip() { SKIPPED+=("$1"); log "SKIP: $1${2:+ — $2}"; }
+
+cleanup() {
+  local pid
+  for pid in "${PIDS[@]:-}"; do
+    [[ -n "$pid" ]] && kill -TERM "$pid" 2>/dev/null
+  done
+  wait 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+# ---------- process helpers ----------
+
+start_server() { # name args...
+  local name="$1"
+  shift
+  "$BIN" server "$@" >"$LOG_DIR/$name.log" 2>&1 &
+  echo $! >>"$WORK/pids"
+  PIDS+=("$!")
+}
+
+stop_server() { # name
+  local name="$1"
+  local pid
+  pid="$(tail -n 1 "$WORK/pids" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 0
+  kill -TERM "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  sed '$d' "$WORK/pids" >"$WORK/pids.tmp" 2>/dev/null && mv "$WORK/pids.tmp" "$WORK/pids"
+}
+
+wait_health() { # port [tries]
+  local port="$1"
+  local tries="${2:-50}"
+  local i=0
+  while (( i < tries )); do
+    if curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+metric() { # name
+  curl -fsS "http://127.0.0.1:$HEALTH_PORT/metrics" 2>/dev/null |
+    awk -v name="$1" '$1 == name {print $2; found=1} END {if (!found) print ""}'
+}
+
+relay_listeners() {
+  # Listening UDP sockets whose local port is inside the relay range.
+  ss -lunH 2>/dev/null | awk '{print $4}' | awk -F: -v lo="$RELAY_LO" -v hi="$RELAY_HI" '
+    { port = $NF + 0; if (port >= lo && port <= hi) print $NF }
+  ' | sort -u
+}
+
+turn_args() { # extra args...
+  printf '%s\0' "--listen" "127.0.0.1:$BASE" \
+    "--turn" "--realm" "$REALM" "--auth-secret" "$SECRET" \
+    "--auth-user" "$USER_NAME" "--auth-pass" "$USER_PASS" \
+    "--relay-ports" "$RELAY_LO-$RELAY_HI" \
+    "--health-listen" "127.0.0.1:$HEALTH_PORT" "$@"
+}
+
+start_turn() { # name extra args...
+  local name="$1"
+  shift
+  local args=()
+  while IFS= read -r -d '' arg; do args+=("$arg"); done < <(turn_args "$@")
+  start_server "$name" "${args[@]}"
+}
+
+# Same server, two users: needed for the 441 (Wrong Credentials) cases.
+start_turn_users() { # name extra args...
+  local name="$1"
+  shift
+  start_server "$name" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-file "$USERS_FILE" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --health-listen "127.0.0.1:$HEALTH_PORT" "$@"
+}
+
+uclient_ok() { # logfile
+  grep -a -q "lost packets 0" "$1"
+}
+
+# ---------- build ----------
+
+rm -f "$WORK/pids"
+if $BUILD; then
+  log "building $BIN"
+  if ! (cd "$ROOT" && cargo build >"$LOG_DIR/build.log" 2>&1); then
+    log "FAIL: build (see $LOG_DIR/build.log)"
+    exit 1
+  fi
+fi
+HEALTH_PORT=$((BASE + 1))
+USERS_FILE="$WORK/users.txt"
+cat >"$USERS_FILE" <<EOF
+$USER_NAME:$USER_PASS
+otheruser:otherpass
+EOF
+
+# ---------- 1. startup: TURN requires long-term credentials ----------
+
+run_startup() {
+  local name=startup
+  "$BIN" server --turn --listen "127.0.0.1:$BASE" >"$LOG_DIR/$name-no-credentials.log" 2>&1
+  local code=$?
+  local short
+  short="$("$BIN" server --turn --auth-user u --auth-pass p --listen "127.0.0.1:$BASE" 2>&1)"
+  local short_code=$?
+  if [[ $code -ne 0 ]] && grep -qa "long-term credentials" "$LOG_DIR/$name-no-credentials.log" &&
+    [[ $short_code -ne 0 ]] && grep -qa "long-term credentials" <<<"$short"; then
+    ok "$name" "exit=$code (no creds), exit=$short_code (short-term)"
+  else
+    fail "$name" "expected exit!=0 with an explicit long-term message (got $code/$short_code)"
+  fi
+}
+
+# ---------- 2. relay: turnutils_uclient completes a UDP relay ----------
+
+run_relay() {
+  local name=relay
+  start_turn "$name" "--max-allocations-per-user" "32"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    stop_server "$name"
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 5 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient.log" 2>&1
+  local exit_code=$?
+  local bytes_in bytes_out
+  bytes_in="$(metric 'rstun_turn_bytes_total{direction="in"}')"
+  bytes_out="$(metric 'rstun_turn_bytes_total{direction="out"}')"
+  if [[ $exit_code -eq 0 ]] && uclient_ok "$LOG_DIR/$name-uclient.log" &&
+    [[ -n "$bytes_in" && "$bytes_in" -gt 0 && -n "$bytes_out" && "$bytes_out" -gt 0 ]]; then
+    ok "$name" "uclient exit=0, relay bytes in=$bytes_in out=$bytes_out"
+  else
+    fail "$name" "uclient exit=$exit_code bytes in=$bytes_in out=$bytes_out"
+  fi
+  # The probe adds the per-step view (permission/channel/indications).
+  if python3 "$PROBE" relay --server "127.0.0.1:$BASE" >"$LOG_DIR/$name-probe.log" 2>&1; then
+    ok "$name-probe" "$(grep -c '^ok:' "$LOG_DIR/$name-probe.log") assertions"
+  else
+    fail "$name-probe" "see $LOG_DIR/$name-probe.log"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 3. auth: 401 (missing/wrong) and 438 (expired nonce) ----------
+
+run_auth() {
+  local name=auth
+  start_turn "$name" "--nonce-lifetime" "1"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if python3 "$PROBE" wrong-password --server "127.0.0.1:$BASE" >"$LOG_DIR/$name-401.log" 2>&1 &&
+    python3 "$PROBE" auth --server "127.0.0.1:$BASE" --wait 1.3 >"$LOG_DIR/$name-438.log" 2>&1; then
+    ok "$name" "401 on wrong password, 438 on expired nonce"
+  else
+    fail "$name" "see $LOG_DIR/$name-401.log / $LOG_DIR/$name-438.log"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 4. lifecycle: Allocate / Refresh 600 / Refresh 0 / 437 ----------
+
+run_lifecycle() {
+  local name=lifecycle
+  start_turn "$name"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if python3 "$PROBE" lifecycle --server "127.0.0.1:$BASE" >"$LOG_DIR/$name-probe.log" 2>&1; then
+    ok "$name" "tid retransmit / new-tid 437, refresh no-lifetime=600, LIFETIME=0 → 437"
+  else
+    fail "$name" "see $LOG_DIR/$name-probe.log"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 4b. wrong-user: same 5-tuple, other credentials → 441 ----------
+
+run_wrong_user() {
+  local name=wrong-user
+  start_turn_users "$name"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if python3 "$PROBE" wrong-user --server "127.0.0.1:$BASE" \
+    >"$LOG_DIR/$name-probe.log" 2>&1; then
+    ok "$name" "Refresh/CreatePermission/LIFETIME=0 from another user all 441"
+  else
+    fail "$name" "see $LOG_DIR/$name-probe.log"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 4c. wildcard listener: loopback peers are refused ----------
+
+run_wildcard() {
+  local name=wildcard
+  start_server "$name" --listen "0.0.0.0:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --health-listen "127.0.0.1:$HEALTH_PORT"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if python3 "$PROBE" loopback --server "127.0.0.1:$BASE" \
+    >"$LOG_DIR/$name-probe.log" 2>&1; then
+    ok "$name" "CreatePermission to 127.0.0.1:<listen> and another loopback port → 403"
+  else
+    fail "$name" "see $LOG_DIR/$name-probe.log"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 4d. permission limit: one request cannot bypass the cap ----------
+
+run_permission_limit() {
+  local name=permission-limit
+  start_turn "$name" "--permission-limit" "1"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if python3 "$PROBE" permission-limit --server "127.0.0.1:$BASE" \
+    >"$LOG_DIR/$name-probe.log" 2>&1; then
+    ok "$name" "combined request → 508 with zero effect; channel implicit permission → 508"
+  else
+    fail "$name" "see $LOG_DIR/$name-probe.log"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 5. quota: per-user cap → 486 ----------
+
+run_quota() {
+  local name=quota
+  start_turn "$name" "--max-allocations-per-user" "1"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    stop_server "$name"
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 1 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient.log" 2>&1
+  local created
+  created="$(metric 'rstun_turn_allocations_total{result="created"}')"
+  if grep -qa "486 (Allocation Quota Reached)" "$LOG_DIR/$name-uclient.log" &&
+    [[ -n "$created" && "$created" -ge 1 ]]; then
+    ok "$name" "first allocation created, second refused with 486"
+  else
+    fail "$name" "no 486 in $LOG_DIR/$name-uclient.log"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 6. ports: one-port relay range → 508 ----------
+
+run_ports() {
+  local name=ports
+  local only_port
+  only_port="$(python3 - <<'PY'
+import socket
+# uclient asks for EVEN-PORT (R=1), so a single-port range must be even to let
+# the first client succeed; the second then runs out of ports (508).
+while True:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    if port % 2 == 0:
+        print(port)
+        break
+PY
+)"
+  # Two ports: the first client takes the EVEN-PORT pair, the second is out.
+  start_server "$name" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$only_port-$((only_port + 1))" \
+    --health-listen "127.0.0.1:$HEALTH_PORT"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    stop_server "$name"
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 1 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient.log" 2>&1
+  local created
+  created="$(metric 'rstun_turn_allocations_total{result="created"}')"
+  if grep -qa "508 (Insufficient Capacity)" "$LOG_DIR/$name-uclient.log" &&
+    [[ -n "$created" && "$created" -ge 1 ]]; then
+    ok "$name" "first allocation created, second refused with 508 (range=$only_port-$((only_port + 1)))"
+  else
+    fail "$name" "no 508 in $LOG_DIR/$name-uclient.log"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 7. cleanup: TTL expiry releases the relay socket ----------
+
+run_cleanup() {
+  local name=cleanup
+  local before
+  before="$(relay_listeners)"
+  if [[ -n "$before" ]]; then
+    skip "$name" "relay range $RELAY_LO-$RELAY_HI already has listeners: $(echo "$before" | tr '\n' ' ')"
+    return
+  fi
+  start_turn "$name" "--allocation-lifetime" "2"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    stop_server "$name"
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 2 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient.log" 2>&1
+  local created active
+  created="$(metric 'rstun_turn_allocations_total{result="created"}')"
+  active="$(metric 'rstun_turn_allocations')"
+  if [[ -z "$created" || "$created" -eq 0 ]]; then
+    fail "$name" "no allocation was created (see $LOG_DIR/$name-uclient.log)"
+    stop_server "$name"
+    return
+  fi
+  local waited=0
+  while (( waited < 60 )); do
+    active="$(metric 'rstun_turn_allocations')"
+    [[ "$active" == "0" ]] && break
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  local leftover
+  leftover="$(relay_listeners)"
+  if [[ "$active" == "0" && -z "$leftover" ]]; then
+    ok "$name" "created=$created, allocations=0 and no relay listener in $RELAY_LO-$RELAY_HI"
+  else
+    fail "$name" "created=$created allocations=$active leftover=[$(echo "$leftover" | tr '\n' ' ')]"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 8. frozen: no --turn is byte-identical to HEAD ----------
+
+FROZEN_PY='
+import socket, struct, sys, zlib
+
+host, port = sys.argv[1], int(sys.argv[2])
+MAGIC = 0x2112A442
+
+def attr(t, v):
+    pad = (4 - len(v) % 4) % 4
+    return struct.pack("!HH", t, len(v)) + v + b"\0" * pad
+
+def message(t, txn, body=b""):
+    return struct.pack("!HH", t, len(body)) + struct.pack("!I", MAGIC) + txn + body
+
+def fingerprint(frame):
+    length = len(frame) - 20 + 8
+    prefix = frame[:2] + struct.pack("!H", length) + frame[4:]
+    crc = (zlib.crc32(prefix) & 0xFFFFFFFF) ^ 0x5354554E
+    return prefix + attr(0x8028, struct.pack("!I", crc))
+
+txn = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C"
+binding = 0x0001
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(0.3)
+requests = [
+    message(binding, txn),
+    message(binding, txn, attr(0x8022, b"probe")),
+    message(binding, txn, attr(0x0002, b"")),
+    message(0x0002, txn),
+    message(binding, txn, attr(0x0026, b"12345678")),
+    message(binding, txn, attr(0x0026, b"1234") + attr(0x0027, struct.pack("!H", 0))),
+    message(binding, txn, attr(0x0003, struct.pack("!I", 0x06))),
+    message(binding, txn, attr(0x0027, struct.pack("!H", port))),
+    fingerprint(message(binding, txn)),
+    message(binding, txn) + b"\0\0\0\0",           # trailing junk
+    message(0x0011, txn),                           # indication
+    message(0x0101, txn),                           # response
+    message(0x0001, txn, attr(0x0024, struct.pack("!I", 1)) + attr(0x0025, b"")),
+    message(0x0001, txn, attr(0x7777, b"")),
+    b"\x00\x01",                                    # truncated
+    b"\x00\x01\x00\x00\xde\xad\xbe\xef" + b"\0" * 12,  # bad magic cookie
+    message(binding, txn, attr(0x8029, b"12345678")),
+]
+def normalise(reply):
+    """Zero address payloads: the client source port differs between runs."""
+    if len(reply) < 20:
+        return reply
+    length = struct.unpack("!H", reply[2:4])[0]
+    body = bytearray(reply[20:20 + length])
+    offset = 0
+    address_types = {0x0001, 0x0020, 0x802B, 0x802C}
+    while offset < len(body):
+        attr_type, attr_length = struct.unpack("!HH", body[offset:offset + 4])
+        if attr_type in address_types and attr_length >= 8:
+            value = offset + 4
+            body[value + 2:value + attr_length] = b"\0" * (attr_length - 2)
+        offset += 4 + attr_length + ((4 - attr_length % 4) % 4)
+    return reply[:20] + bytes(body) + reply[20 + length:]
+
+for index, request in enumerate(requests):
+    try:
+        sock.sendto(request, (host, port))
+        reply, _ = sock.recvfrom(65535)
+        print(f"{index}: {normalise(reply).hex()}")
+    except socket.timeout:
+        print(f"{index}: NONE")
+'
+# The wrong-cookie frame above is malformed on purpose; send the rest anyway.
+
+run_frozen() {
+  local name=frozen
+  local old_src="$WORK/old-src"
+  local old_target="$WORK/old-target"
+  # Baseline for the byte-freeze check. HEAD is correct *before* this work is
+  # committed; after committing, pin the last pre-TURN commit here (or pass
+  # FROZEN_BASE=<sha>), otherwise the check compares the new tree with itself.
+  local base="${FROZEN_BASE:-75ed637}"
+  if ! git -C "$ROOT" archive "$base" | tar -x -C "$old_src" 2>/dev/null; then
+    mkdir -p "$old_src"
+    if ! git -C "$ROOT" archive "$base" | tar -x -C "$old_src"; then
+      skip "$name" "cannot export HEAD via git archive"
+      return
+    fi
+  fi
+  if ! cargo build --manifest-path "$old_src/Cargo.toml" --target-dir "$old_target" \
+    >"$LOG_DIR/$name-build.log" 2>&1; then
+    skip "$name" "old binary did not build (see $LOG_DIR/$name-build.log)"
+    return
+  fi
+  local old_bin="$old_target/debug/rstun"
+  local config_name config_args
+  local mismatches=0
+  for config_name in default verbose inflight; do
+    case "$config_name" in
+      default) config_args=() ;;
+      verbose) config_args=(--verbose) ;;
+      inflight) config_args=(--max-inflight 8) ;;
+    esac
+    local new_port=$((BASE + 20))
+    local old_port=$((BASE + 21))
+    "$BIN" server --listen "127.0.0.1:$new_port" "${config_args[@]}" \
+      >"$LOG_DIR/$name-new-$config_name.log" 2>&1 &
+    local new_pid=$!
+    PIDS+=("$new_pid")
+    "$old_bin" server --listen "127.0.0.1:$old_port" "${config_args[@]}" \
+      >"$LOG_DIR/$name-old-$config_name.log" 2>&1 &
+    local old_pid=$!
+    PIDS+=("$old_pid")
+    sleep 0.6
+    python3 -c "$FROZEN_PY" 127.0.0.1 "$new_port" >"$LOG_DIR/$name-new-$config_name.txt"
+    python3 -c "$FROZEN_PY" 127.0.0.1 "$old_port" >"$LOG_DIR/$name-old-$config_name.txt"
+    kill -TERM "$new_pid" "$old_pid" 2>/dev/null
+    wait "$new_pid" "$old_pid" 2>/dev/null
+    if ! diff -q "$LOG_DIR/$name-old-$config_name.txt" "$LOG_DIR/$name-new-$config_name.txt" \
+      >/dev/null; then
+      mismatches=$((mismatches + 1))
+      diff -u "$LOG_DIR/$name-old-$config_name.txt" "$LOG_DIR/$name-new-$config_name.txt" \
+        >"$LOG_DIR/$name-diff-$config_name.txt"
+    fi
+  done
+  if [[ $mismatches -eq 0 ]]; then
+    ok "$name" "3 configurations × 17 requests byte-identical to HEAD"
+  else
+    fail "$name" "$mismatches configuration(s) differ (see $LOG_DIR/$name-diff-*.txt)"
+  fi
+}
+
+# ---------- 9. coturn: same client, same steps, same outcomes ----------
+
+run_coturn() {
+  local name=coturn
+  if ! command -v turnserver >/dev/null 2>&1 || ! command -v turnutils_uclient >/dev/null 2>&1; then
+    skip "$name" "turnserver/turnutils_uclient not installed"
+    return
+  fi
+  mkdir -p "$WORK/coturn"
+  local coturn_port=$((BASE + 30))
+  local coturn_lo=$((RELAY_HI + 1))
+  local coturn_hi=$((RELAY_HI + 100))
+  (cd "$WORK/coturn" && exec turnserver -n \
+    --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
+    --listening-port="$coturn_port" \
+    --min-port="$coturn_lo" --max-port="$coturn_hi" \
+    --lt-cred-mech --realm="$REALM" --user="$USER_NAME:$USER_PASS" \
+    --user=otheruser:otherpass \
+    --allow-loopback-peers --no-multicast-peers --no-cli --log-file=stdout) \
+    >"$LOG_DIR/$name-server.log" 2>&1 &
+  local coturn_pid=$!
+  PIDS+=("$coturn_pid")
+  sleep 1.5
+  if ! kill -0 "$coturn_pid" 2>/dev/null; then
+    fail "$name" "turnserver did not start (see $LOG_DIR/$name-server.log)"
+    return
+  fi
+
+  # Our server, same parameters (two users: the 441 comparison needs both).
+  start_turn_users "$name-rstun"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "rstun did not become healthy"
+    stop_server "$name-rstun"
+    kill -TERM "$coturn_pid" 2>/dev/null
+    return
+  fi
+
+  local ok_all=true
+  if ! python3 "$PROBE" relay --server "127.0.0.1:$coturn_port" \
+    >"$LOG_DIR/$name-coturn-relay.log" 2>&1; then
+    ok_all=false
+  fi
+  if ! python3 "$PROBE" relay --server "127.0.0.1:$BASE" \
+    >"$LOG_DIR/$name-rstun-relay.log" 2>&1; then
+    ok_all=false
+  fi
+  diff -u "$LOG_DIR/$name-coturn-relay.log" "$LOG_DIR/$name-rstun-relay.log" \
+    >"$LOG_DIR/$name-relay-diff.log" 2>&1 || ok_all=false
+
+  python3 "$PROBE" lifecycle --server "127.0.0.1:$coturn_port" --lenient-refresh \
+    >"$LOG_DIR/$name-coturn-lifecycle.log" 2>&1 || ok_all=false
+  python3 "$PROBE" lifecycle --server "127.0.0.1:$BASE" \
+    >"$LOG_DIR/$name-rstun-lifecycle.log" 2>&1 || ok_all=false
+
+  if ! python3 "$PROBE" wrong-user --server "127.0.0.1:$coturn_port" \
+    >"$LOG_DIR/$name-coturn-wrong-user.log" 2>&1; then
+    ok_all=false
+  fi
+  if ! python3 "$PROBE" wrong-user --server "127.0.0.1:$BASE" \
+    >"$LOG_DIR/$name-rstun-wrong-user.log" 2>&1; then
+    ok_all=false
+  fi
+  diff -u "$LOG_DIR/$name-coturn-wrong-user.log" "$LOG_DIR/$name-rstun-wrong-user.log" \
+    >"$LOG_DIR/$name-wrong-user-diff.log" 2>&1 || ok_all=false
+
+  # The same uclient run against both, relayed messages compared.
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$coturn_port" -n 5 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-coturn-uclient.log" 2>&1
+  local coturn_exit=$?
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 5 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-rstun-uclient.log" 2>&1
+  local rstun_exit=$?
+
+  log "coturn comparison (same client, same steps):"
+  log "  relay probe:    $(diff -q "$LOG_DIR/$name-coturn-relay.log" "$LOG_DIR/$name-rstun-relay.log" >/dev/null && echo identical || echo DIFFERENT)"
+  log "  wrong-user:     $(diff -q "$LOG_DIR/$name-coturn-wrong-user.log" "$LOG_DIR/$name-rstun-wrong-user.log" >/dev/null && echo identical || echo DIFFERENT)"
+  log "  uclient:        coturn exit=$coturn_exit  rstun exit=$rstun_exit"
+  log "  allocation:     $(grep -a '^ok: allocate' "$LOG_DIR/$name-coturn-lifecycle.log" | sed 's/^ok: //')  (both servers)"
+  log "  refresh:        $(grep -a '^ok: refresh-' "$LOG_DIR/$name-rstun-lifecycle.log" | sed 's/^ok: //' | tr '\n' ';')"
+  local coturn_release rstun_release
+  coturn_release="$(grep -a 'refresh-after-release' "$LOG_DIR/$name-coturn-lifecycle.log" | sed 's/.*code=//')"
+  rstun_release="$(grep -a 'refresh-error-60' "$LOG_DIR/$name-rstun-lifecycle.log" | sed 's/.*code=//')"
+  log "  after LIFETIME=0: coturn code=${coturn_release:-?}  rstun code=${rstun_release:-?}"
+  log "  judgement:      rstun follows RFC 8656 §7.2 (437 for an unknown allocation);"
+  log "                  coturn re-creates it (lenient, not RFC-mandated). All other steps identical."
+
+  if $ok_all && [[ $coturn_exit -eq 0 && $rstun_exit -eq 0 ]]; then
+    ok "$name" "relay behaviour identical; lifecycle identical except coturn's lenient refresh"
+  else
+    fail "$name" "see $LOG_DIR/$name-*.log"
+  fi
+  stop_server "$name-rstun"
+  kill -TERM "$coturn_pid" 2>/dev/null
+  wait "$coturn_pid" 2>/dev/null
+}
+
+# ---------- run ----------
+
+run_item() {
+  case "$1" in
+    startup) run_startup ;;
+    relay) run_relay ;;
+    auth) run_auth ;;
+    lifecycle) run_lifecycle ;;
+    wrong-user) run_wrong_user ;;
+    wildcard) run_wildcard ;;
+    permission-limit) run_permission_limit ;;
+    quota) run_quota ;;
+    ports) run_ports ;;
+    cleanup) run_cleanup ;;
+    frozen) run_frozen ;;
+    coturn) run_coturn ;;
+  esac
+}
+
+if [[ -n "$ONLY" ]]; then
+  run_item "$ONLY"
+else
+  for item in "${ALL_ITEMS[@]}"; do
+    run_item "$item"
+  done
+fi
+
+log ""
+log "passed: ${#PASSED[@]}  failed: ${#FAILED[@]}  skipped: ${#SKIPPED[@]}"
+if ((${#FAILED[@]} > 0)); then
+  log "failed items: ${FAILED[*]}"
+  exit 1
+fi
+exit 0
