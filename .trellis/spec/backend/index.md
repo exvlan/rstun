@@ -20,6 +20,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [发布物契约](./release-artifacts.md) | Release 资产可执行位、tag↔资产↔digest、双架构 manifest、public 仓扫描 | Done |
 | [抗滥用契约](./abuse-guard.md) | 放大上界 `max(len×ratio, len+32)`、省略 SOFTWARE 的域=防护域、默认关闭零变化、统计口径 | Done |
+| [协议错误路径](./protocol-errors.md) | FINGERPRINT 的 Length/CRC 语义、300 优先级与放大面、500 映射、错误码矩阵 | Done |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 
 ---
