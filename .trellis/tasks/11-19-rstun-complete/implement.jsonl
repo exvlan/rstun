@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "本仓 Rust 约定索引"}
+{"file": ".trellis/spec/backend/release-artifacts.md", "reason": "发布物契约（子任务完成后仍要满足）"}
+{"file": ".trellis/tasks/archive/2026-11/11-19-rstun-standalone/research/T1-interop-matrix.md", "reason": "互操作基线与失败项判定方法（改协议前必读）"}
+{"file": ".trellis/tasks/archive/2026-11/11-19-rstun-standalone/research/S4-production-switch.md", "reason": "生产验收口径与「客户端 NAT 丢弃 change 回包」判据"}
