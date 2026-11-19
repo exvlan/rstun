@@ -56,6 +56,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
+mod crc32;
 pub mod limit;
 pub mod protocol;
 pub mod rfc5780;
@@ -163,6 +164,23 @@ struct Args {
     #[arg(long)]
     mapped_address: bool,
 
+    /// validate FINGERPRINT (RFC 5389 §15.5) when a request carries one: it must
+    /// be the last attribute and its CRC must match. Off by default, so a request
+    /// without FINGERPRINT is answered exactly as before
+    #[arg(long)]
+    check_fingerprint: bool,
+
+    /// what a FINGERPRINT with a wrong CRC gets: `answer` = 400 Bad Request (the
+    /// default), `drop` = no response. `drop` needs --check-fingerprint
+    #[arg(long, value_name = "ACTION", value_enum, default_value = "answer")]
+    fingerprint_action: FingerprintAction,
+
+    /// answer every Binding request with `300 Try Alternate` + ALTERNATE-SERVER
+    /// (RFC 5389 §15.11), pointing at this instance; repeatable, only the first
+    /// address is used. Redirect wins over RFC 5780
+    #[arg(long, value_name = "ADDR")]
+    alternate_server: Vec<SocketAddr>,
+
     /// log every Binding request with its source and mapped address
     #[arg(long)]
     verbose: bool,
@@ -213,12 +231,25 @@ struct Args {
     deny: Vec<limit::IpNet>,
 }
 
+/// What an invalid `FINGERPRINT` gets (`--fingerprint-action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum FingerprintAction {
+    /// `400 Bad Request` (RFC 5389 §15.5 makes a bad fingerprint a bad message).
+    #[default]
+    Answer,
+    /// No response at all — for deployments that do not want to answer probes
+    /// with a broken fingerprint (still counted, see `ServerStats`).
+    Drop,
+}
+
 /// Counters reported when the server stops; also what `--verbose` helps debug.
 #[derive(Debug, Default)]
 pub struct ServerStats {
     received: AtomicU64,
     answered: AtomicU64,
     dropped: AtomicU64,
+    /// Requests rejected because of a bad `FINGERPRINT` (`--check-fingerprint`).
+    fingerprint_rejected: AtomicU64,
 }
 
 impl ServerStats {
@@ -231,6 +262,11 @@ impl ServerStats {
         )
     }
 
+    /// Requests whose `FINGERPRINT` was absent-but-invalid, misplaced or wrong.
+    pub fn fingerprint_rejected(&self) -> u64 {
+        self.fingerprint_rejected.load(Ordering::Relaxed)
+    }
+
     fn count_received(&self) {
         self.received.fetch_add(1, Ordering::Relaxed);
     }
@@ -241,6 +277,10 @@ impl ServerStats {
 
     fn count_dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn count_fingerprint_rejected(&self) {
+        self.fingerprint_rejected.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -289,6 +329,12 @@ struct ServerContext {
     /// Abuse guard; `None` unless at least one `--rate-limit`-family flag was
     /// given, so the default path allocates nothing and checks nothing.
     admission: Option<Arc<limit::Admission>>,
+    /// `--check-fingerprint`: validate `FINGERPRINT` and pick what an invalid one
+    /// gets. `None` = off (the attribute is ignored, as before).
+    fingerprint: Option<FingerprintAction>,
+    /// `--alternate-server`: answer every Binding request with `300 Try
+    /// Alternate` + `ALTERNATE-SERVER` pointing here.
+    alternate_server: Option<SocketAddr>,
 }
 
 impl ServerContext {
@@ -541,6 +587,30 @@ fn build_policy(args: &Args) -> Result<Option<limit::Policy>, String> {
     Ok(Some(policy))
 }
 
+/// Turn the protocol flags into the two optional behaviours, or explain why they
+/// are unusable.
+///
+/// `Ok(None)` means "no flag given": the caller then never parses twice, never
+/// checks a fingerprint and never answers `300` — the default path stays
+/// byte-for-byte the pre-flag one. `--fingerprint-action` alone is refused
+/// because a silent no-op guard is worse than a refused start (same rule the
+/// abuse-guard flags follow).
+fn fingerprint_policy(args: &Args) -> Result<Option<FingerprintAction>, String> {
+    if args.check_fingerprint {
+        return Ok(Some(args.fingerprint_action));
+    }
+    if args.fingerprint_action != FingerprintAction::Answer {
+        return Err("--fingerprint-action needs --check-fingerprint".to_string());
+    }
+    Ok(None)
+}
+
+/// `--alternate-server` is repeatable but only one redirect target makes sense:
+/// the first entry wins, the caller warns about the rest (no silent merge).
+fn alternate_server(args: &Args) -> Option<SocketAddr> {
+    args.alternate_server.first().copied()
+}
+
 /// Run the STUN Binding server until Ctrl-C (Unix: also SIGTERM).
 async fn run(args: Args) -> ExitCode {
     let (addresses, plan) = match resolve_listen(&args) {
@@ -574,6 +644,22 @@ async fn run(args: Args) -> ExitCode {
 
     let software: Arc<str> = Arc::from(format!("rstun/{BUILD_VERSION}"));
     let stats = Arc::new(ServerStats::default());
+    // 协议闭环的两个开关同样「不给就不改任何字节」：`None` 时下面的路径与 26.410.100 一致。
+    let fingerprint = match fingerprint_policy(&args) {
+        Ok(policy) => policy,
+        Err(message) => {
+            tracing::error!(%message, "rstun: invalid protocol configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    let alternate_server = alternate_server(&args);
+    if args.alternate_server.len() > 1 {
+        tracing::warn!(
+            ignored = ?&args.alternate_server[1..],
+            used = %args.alternate_server[0],
+            "rstun: only the first --alternate-server is used"
+        );
+    }
     // Every listener shares one view of the bound sockets: that is what makes
     // `CHANGE-REQUEST` able to answer from a different one.
     let context = Arc::new(ServerContext {
@@ -581,6 +667,8 @@ async fn run(args: Args) -> ExitCode {
         udp: udp.clone(),
         mapped_address: args.mapped_address,
         admission: admission.clone(),
+        fingerprint,
+        alternate_server,
     });
     let mut tasks = Vec::new();
 
@@ -627,6 +715,15 @@ async fn run(args: Args) -> ExitCode {
     if args.mapped_address {
         tracing::info!("rstun: legacy MAPPED-ADDRESS enabled (--mapped-address)");
     }
+    if let Some(action) = fingerprint {
+        tracing::info!(
+            ?action,
+            "rstun: FINGERPRINT validation enabled (--check-fingerprint)"
+        );
+    }
+    if let Some(server) = alternate_server {
+        tracing::info!(%server, "rstun: answering with 300 Try Alternate (--alternate-server)");
+    }
     tracing::info!(
         software = %software,
         listeners = tasks.len(),
@@ -659,7 +756,13 @@ async fn run(args: Args) -> ExitCode {
         );
     }
     let (received, answered, dropped) = stats.counters();
-    tracing::info!(received, answered, dropped, "rstun: stopped");
+    tracing::info!(
+        received,
+        answered,
+        dropped,
+        fingerprint_rejected = stats.fingerprint_rejected(),
+        "rstun: stopped"
+    );
     exit_code
 }
 
@@ -772,6 +875,24 @@ fn decide(
             protocol::message_method(message.msg_type),
             protocol::ERROR_BAD_REQUEST,
             "Bad Request",
+        )));
+    }
+
+    // `--alternate-server`: this instance only redirects. It deliberately comes
+    // before the extension checks below (design §4: *every* Binding request gets
+    // 300), including RFC 5780's redirect attributes — the point is to move the
+    // client to the real server, not to answer the probe ourselves.
+    if let Some(server) = context.alternate_server {
+        tracing::debug!(
+            %peer,
+            transaction_id = %message.transaction_id,
+            %server,
+            "rstun: answering 300 Try Alternate"
+        );
+        return Ok(Decision::Respond(protocol::alternate_server_response(
+            &message.transaction_id,
+            BINDING_METHOD,
+            server,
         )));
     }
 
@@ -903,10 +1024,13 @@ fn response_route(
     (from, to, context.addresses(from))
 }
 
-/// [`decide`], with the abuse guard's reflection check in front of it.
+/// [`decide`], with the abuse guard's reflection check and the optional
+/// `FINGERPRINT` validation in front of it.
 ///
-/// The check is only enabled by `--reflect-min-request` / `--reflect-ratio`, so
-/// with the guard off this is `decide` plus one `Option` test.
+/// Both are off by default, so without flags this is `decide` plus one `Option`
+/// test; only when one of them is enabled is the message parsed a second time
+/// (the pre-existing shape for the reflection guard, kept because `decide` must
+/// stay byte-for-byte the function it was).
 fn decide_guarded(
     datagram: &[u8],
     peer: SocketAddr,
@@ -916,13 +1040,22 @@ fn decide_guarded(
     software: &str,
     stats: &ServerStats,
 ) -> Result<Decision, protocol::ParseError> {
-    if let Some(admission) = &context.admission
-        && let Some(policy) = admission.policy().reflect
+    let reflect = context
+        .admission
+        .as_ref()
+        .and_then(|admission| admission.policy().reflect);
+    if context.fingerprint.is_none() && reflect.is_none() {
+        return decide(datagram, peer, local, transport, context, software);
+    }
+    let message = protocol::parse(datagram)?;
+    if let Some(action) = context.fingerprint
+        && let Some(decision) = fingerprint_guard(datagram, &message, action, stats)
     {
-        // Parsed here as well as in `decide` **only** when the guard is on: the
-        // guard needs the attribute list, and `decide` stays byte-for-byte the
-        // function it was.
-        let message = protocol::parse(datagram)?;
+        return Ok(decision);
+    }
+    if let Some(admission) = &context.admission
+        && let Some(policy) = reflect
+    {
         let inbound = Inbound {
             datagram,
             peer,
@@ -936,6 +1069,56 @@ fn decide_guarded(
         }
     }
     decide(datagram, peer, local, transport, context, software)
+}
+
+/// Validate `FINGERPRINT` when `--check-fingerprint` is on (RFC 5389 §15.5).
+///
+/// Only **requests** are validated: a server must not answer an indication or a
+/// response at all, so a bad fingerprint there stays silence (`decide` ignores
+/// the message for its own reasons). A structural error (another attribute after
+/// `FINGERPRINT`) is always answered with `400`; only a CRC mismatch honours
+/// `--fingerprint-action=drop`, because a misplaced attribute means the client
+/// cannot interpret the message boundary either way.
+fn fingerprint_guard(
+    datagram: &[u8],
+    message: &protocol::Message<'_>,
+    action: FingerprintAction,
+    stats: &ServerStats,
+) -> Option<Decision> {
+    if protocol::message_class(message.msg_type) != MessageClass::Request {
+        return None;
+    }
+    let frame = &datagram[..protocol::HEADER_LEN + message.body.len()];
+    let verdict = protocol::check_fingerprint(frame);
+    if matches!(
+        verdict,
+        protocol::FingerprintVerdict::Absent | protocol::FingerprintVerdict::Valid
+    ) {
+        return None;
+    }
+    stats.count_fingerprint_rejected();
+    tracing::debug!(
+        transaction_id = %message.transaction_id,
+        ?verdict,
+        ?action,
+        "rstun: FINGERPRINT rejected"
+    );
+    match (verdict, action) {
+        (protocol::FingerprintVerdict::NotLast, _) | (_, FingerprintAction::Answer) => {
+            Some(Decision::Respond(protocol::error_response(
+                &message.transaction_id,
+                protocol::message_method(message.msg_type),
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+            )))
+        }
+        (_, FingerprintAction::Drop) => {
+            // Counted twice on purpose: `dropped` keeps `received = answered +
+            // dropped` readable for this path, `fingerprint_rejected` says *why*.
+            stats.count_dropped();
+            Some(Decision::Ignore("fingerprint mismatch"))
+        }
+    }
 }
 
 /// The request path's fixed context, bundled so the guard stays readable.
@@ -979,9 +1162,14 @@ fn reflect_guard(
     }
     // Everything else is either answered with a small 400/420 or ignored by
     // `decide`; there is no large answer to prevent.
+    //
+    // `--alternate-server` changes that: every Binding request (even one with an
+    // unknown comprehension-required attribute, which `decide` never reaches)
+    // gets the fixed 300. The guard therefore estimates *that* answer below.
+    let alternate = inbound.context.alternate_server.is_some();
     if protocol::message_class(message.msg_type) != MessageClass::Request
         || protocol::message_method(message.msg_type) != BINDING_METHOD
-        || !protocol::unknown_attributes(message.body).is_empty()
+        || (!alternate && !protocol::unknown_attributes(message.body).is_empty())
     {
         return None;
     }
@@ -990,8 +1178,9 @@ fn reflect_guard(
     // RESPONSE-PORT + PADDING is a 400 (RFC 5780 §6) — a *refusal*, so it goes
     // through the same "a refusal must not amplify" rule as everything else on
     // this path (and is counted in `reflect_rejected`). Without the guard,
-    // `decide` still answers the 400 itself.
-    if padding.is_some() && response_port.is_some() {
+    // `decide` still answers the 400 itself. With `--alternate-server` the
+    // answer is a 300 (redirect wins), so this early refusal does not apply.
+    if !alternate && padding.is_some() && response_port.is_some() {
         return Some(reflection_refusal(
             inbound, message, policy, admission, stats,
         ));
@@ -1012,30 +1201,36 @@ fn reflect_guard(
     }
 
     let context = inbound.context;
-    let (_from, _to, addresses) = response_route(
-        message,
-        inbound.peer,
-        inbound.local,
-        inbound.transport,
-        context,
-    );
-    // Estimate with the very software value `decide` will emit, otherwise the
-    // ratio would be measured on a different message than the one we send.
-    let estimated = protocol::binding_success_response(&protocol::SuccessResponse {
-        transaction_id: &message.transaction_id,
-        peer: inbound.peer,
-        software: answer_software(
-            inbound.datagram.len(),
+    // Estimate with the very bytes `decide` will emit, otherwise the ratio would
+    // be measured on a different message than the one we send: a 300 is fixed
+    // size and carries no redirect attributes, a success answer depends on
+    // SOFTWARE / RFC 5780 / PADDING.
+    let estimated = if let Some(server) = context.alternate_server {
+        protocol::alternate_server_response(&message.transaction_id, BINDING_METHOD, server).len()
+    } else {
+        let (_from, _to, addresses) = response_route(
             message,
+            inbound.peer,
+            inbound.local,
             inbound.transport,
             context,
-            inbound.software,
-        ),
-        addresses,
-        mapped_address: context.mapped_address,
-        padding,
-    })
-    .len();
+        );
+        protocol::binding_success_response(&protocol::SuccessResponse {
+            transaction_id: &message.transaction_id,
+            peer: inbound.peer,
+            software: answer_software(
+                inbound.datagram.len(),
+                message,
+                inbound.transport,
+                context,
+                inbound.software,
+            ),
+            addresses,
+            mapped_address: context.mapped_address,
+            padding,
+        })
+        .len()
+    };
     if !policy.allows_response(inbound.datagram.len(), estimated) {
         return Some(reflection_refusal(
             inbound, message, policy, admission, stats,
@@ -1154,6 +1349,78 @@ async fn serve_udp(
     }
 }
 
+/// Map a failed `send_to` to a STUN error code, or `None` when the failure is the
+/// **client's** address problem rather than an internal one (design §2).
+///
+/// `ConnectionRefused` / `NetworkUnreachable` / `AddrNotAvailable` describe where
+/// the datagram was going, not what this server did: answering them with `500`
+/// would claim an internal fault and add traffic to a path that is already
+/// broken. Everything else means the send failed for a reason we cannot express
+/// in the original answer, so the client gets an explicit `500 Server Error`.
+fn server_error_for(error: &std::io::Error) -> Option<u16> {
+    match error.kind() {
+        std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::NetworkUnreachable
+        | std::io::ErrorKind::AddrNotAvailable => None,
+        _ => Some(protocol::ERROR_SERVER_ERROR),
+    }
+}
+
+/// Wire invariants every response must satisfy before it is sent (design §2's
+/// "encoding failure" path): a STUN header, and a `Message Length` that matches
+/// the bytes about to be written.
+///
+/// The encoders cannot produce anything else — bodies are padded and the echoed
+/// `PADDING` is clamped — so a violation means an internal bug. Answering `500`
+/// (instead of writing a malformed frame) is what keeps the failure visible to
+/// the client without leaking the bug.
+fn response_is_encodable(response: &[u8]) -> bool {
+    response.len() >= protocol::HEADER_LEN
+        && usize::from(u16::from_be_bytes([response[2], response[3]])) + protocol::HEADER_LEN
+            == response.len()
+}
+
+/// The fixed `500 Server Error` for `frame`, or `None` when the frame cannot be
+/// parsed (no transaction id to answer to).
+///
+/// `code` is what `server_error_for` decided; only the fixed reason text is ever
+/// used, so no `io::Error` detail ends up on the wire.
+fn server_error_bytes(frame: &[u8], code: u16) -> Option<Vec<u8>> {
+    let message = protocol::parse(frame).ok()?;
+    Some(protocol::error_response(
+        &message.transaction_id,
+        protocol::message_method(message.msg_type),
+        code,
+        "Server Error",
+    ))
+}
+
+/// Best-effort `500 Server Error` for an internal failure (design §2).
+///
+/// The reason text is fixed and the `io::Error` only goes to the log, so the
+/// response can neither leak internal detail nor grow: it is always 40 bytes
+/// (20 header + 20 `ERROR-CODE`), which also means it cannot become an
+/// amplifier. A failure to deliver it is logged at `debug` and otherwise
+/// ignored — there is nothing left to answer on.
+async fn send_server_error(
+    socket: &UdpSocket,
+    local: SocketAddr,
+    peer: SocketAddr,
+    datagram: &[u8],
+    stats: &ServerStats,
+    code: u16,
+) {
+    let Some(response) = server_error_bytes(datagram, code) else {
+        return;
+    };
+    match socket.send_to(&response, peer).await {
+        Ok(_) => stats.count_answered(),
+        Err(error) => {
+            tracing::debug!(%local, %peer, %error, "rstun: 500 Server Error could not be sent")
+        }
+    }
+}
+
 /// Resolve one datagram into a response and send it.
 ///
 /// Split from [`serve_udp`] so the serial and the `--max-inflight` (spawned)
@@ -1178,18 +1445,54 @@ async fn respond_to_datagram(
         stats,
     );
     match decision {
-        Ok(Decision::Respond(response)) => match socket.send_to(&response, peer).await {
-            Ok(_) => stats.count_answered(),
-            Err(error) => {
-                tracing::warn!(%local, %peer, %error, "rstun: UDP send_to failed")
+        Ok(Decision::Respond(response)) => {
+            if !response_is_encodable(&response) {
+                stats.count_dropped();
+                tracing::error!(%local, %peer, "rstun: response violates STUN wire invariants");
+                send_server_error(
+                    socket,
+                    local,
+                    peer,
+                    datagram,
+                    stats,
+                    protocol::ERROR_SERVER_ERROR,
+                )
+                .await;
+                return;
             }
-        },
+            match socket.send_to(&response, peer).await {
+                Ok(_) => stats.count_answered(),
+                Err(error) => {
+                    tracing::warn!(%local, %peer, %error, "rstun: UDP send_to failed");
+                    if let Some(code) = server_error_for(&error) {
+                        send_server_error(socket, local, peer, datagram, stats, code).await;
+                    }
+                }
+            }
+        }
         Ok(Decision::RespondFrom { from, to, bytes }) => {
+            if !response_is_encodable(&bytes) {
+                stats.count_dropped();
+                tracing::error!(%local, %peer, %from, "rstun: response violates STUN wire invariants");
+                send_server_error(
+                    socket,
+                    local,
+                    peer,
+                    datagram,
+                    stats,
+                    protocol::ERROR_SERVER_ERROR,
+                )
+                .await;
+                return;
+            }
             // `from` is the *source* address (CHANGE-REQUEST picks another
             // socket we hold); `to` is the *destination* (RESPONSE-PORT moves
             // only the port — the IP stays the one the request came from).
             let target = context.socket_for(from);
             let Some(target) = target else {
+                // Internal invariant violation: the plan only ever names sockets
+                // this process bound, so this is a bug, not a client error.
+                // Answer 500 (best effort) rather than leave the client waiting.
                 stats.count_dropped();
                 tracing::error!(
                     %local,
@@ -1197,17 +1500,31 @@ async fn respond_to_datagram(
                     %from,
                     "rstun: no socket bound for the requested response address"
                 );
+                send_server_error(
+                    socket,
+                    local,
+                    peer,
+                    datagram,
+                    stats,
+                    protocol::ERROR_SERVER_ERROR,
+                )
+                .await;
                 return;
             };
             match target.send_to(&bytes, to).await {
                 Ok(_) => stats.count_answered(),
-                Err(error) => tracing::warn!(
-                    %local,
-                    %from,
-                    %to,
-                    %error,
-                    "rstun: UDP send_to failed (RFC 5780)"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        %local,
+                        %from,
+                        %to,
+                        %error,
+                        "rstun: UDP send_to failed (RFC 5780)"
+                    );
+                    if let Some(code) = server_error_for(&error) {
+                        send_server_error(socket, local, peer, datagram, stats, code).await;
+                    }
+                }
             }
         }
         Ok(Decision::Ignore(reason)) => {
@@ -1329,6 +1646,17 @@ async fn serve_tcp_connection(
             stats,
         ) {
             Ok(Decision::Respond(response)) => {
+                if !response_is_encodable(&response) {
+                    // Same internal-invariant path as UDP: answer 500 in-band
+                    // instead of writing a malformed frame.
+                    stats.count_dropped();
+                    tracing::error!(%peer, "rstun: response violates STUN wire invariants");
+                    if let Some(error) = server_error_bytes(&frame, protocol::ERROR_SERVER_ERROR) {
+                        stream.write_all(&error).await?;
+                        stats.count_answered();
+                    }
+                    continue;
+                }
                 stream.write_all(&response).await?;
                 stats.count_answered();
             }
@@ -1343,6 +1671,15 @@ async fn serve_tcp_connection(
                     %to,
                     "rstun: CHANGE-REQUEST / RESPONSE-PORT are UDP-only, answering on the same connection"
                 );
+                if !response_is_encodable(&bytes) {
+                    stats.count_dropped();
+                    tracing::error!(%peer, "rstun: response violates STUN wire invariants");
+                    if let Some(error) = server_error_bytes(&frame, protocol::ERROR_SERVER_ERROR) {
+                        stream.write_all(&error).await?;
+                        stats.count_answered();
+                    }
+                    continue;
+                }
                 stream.write_all(&bytes).await?;
                 stats.count_answered();
             }
@@ -1524,6 +1861,8 @@ mod tests {
             udp: vec![(address, socket.clone())],
             mapped_address: false,
             admission: None,
+            fingerprint: None,
+            alternate_server: None,
         });
         tokio::spawn(serve_udp(
             socket.clone(),
@@ -1541,6 +1880,8 @@ mod tests {
     fn rfc5780_context() -> ServerContext {
         ServerContext {
             admission: None,
+            fingerprint: None,
+            alternate_server: None,
             plan: Some(rfc5780::Plan::new(
                 "127.0.0.1:3478".parse().unwrap(),
                 "127.0.0.2".parse().unwrap(),
@@ -1609,6 +1950,8 @@ mod tests {
                 udp: sockets.clone(),
                 mapped_address: false,
                 admission: None,
+                fingerprint: None,
+                alternate_server: None,
             });
             let stats = Arc::new(ServerStats::default());
             for (local, socket) in sockets {
@@ -1726,6 +2069,8 @@ mod tests {
             udp: Vec::new(),
             mapped_address: false,
             admission: None,
+            fingerprint: None,
+            alternate_server: None,
         });
         tokio::spawn(serve_tcp(
             listener,
@@ -2027,6 +2372,8 @@ mod tests {
             udp: bound.udp.clone(),
             mapped_address: false,
             admission: None,
+            fingerprint: None,
+            alternate_server: None,
         });
         let stats = Arc::new(ServerStats::default());
         for (_, socket) in bound.udp {
@@ -2635,6 +2982,8 @@ mod tests {
                 udp: Vec::new(),
                 mapped_address,
                 admission: None,
+                fingerprint: None,
+                alternate_server: None,
             };
             match decide(
                 &request,
@@ -3073,6 +3422,8 @@ mod tests {
             udp: Vec::new(),
             mapped_address: false,
             admission: Some(limit::Admission::new(policy).expect("policy must build")),
+            fingerprint: None,
+            alternate_server: None,
         }
     }
 
@@ -3638,6 +3989,8 @@ mod tests {
             udp: vec![(address, socket.clone())],
             mapped_address: false,
             admission: Some(admission.clone()),
+            fingerprint: None,
+            alternate_server: None,
         });
         let stats = Arc::new(ServerStats::default());
         tokio::spawn(serve_udp(
@@ -3706,6 +4059,8 @@ mod tests {
             udp: vec![(address, socket.clone())],
             mapped_address: false,
             admission: Some(admission.clone()),
+            fingerprint: None,
+            alternate_server: None,
         });
         let stats = Arc::new(ServerStats::default());
         tokio::spawn(serve_udp(
@@ -3766,6 +4121,8 @@ mod tests {
                 })
                 .unwrap(),
             ),
+            fingerprint: None,
+            alternate_server: None,
         });
         let stats = Arc::new(ServerStats::default());
         tokio::spawn(serve_udp(
@@ -3803,6 +4160,418 @@ mod tests {
             .unwrap();
         assert_binding_success(&buffer[..len], [0x93; 12], allowed.local_addr().unwrap());
         assert_eq!(stats.counters(), (2, 1, 1));
+    }
+
+    // ---------- 协议闭环（FINGERPRINT / 300 / 500） ----------
+
+    /// A request whose `FINGERPRINT` (RFC 5389 §15.5) is the last attribute.
+    fn request_with_fingerprint(transaction_id: [u8; 12], attributes: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut bytes = request_with_attributes(transaction_id, attributes);
+        // The header Length must already include the 8-byte attribute before the
+        // CRC is computed (RFC 5389 §15.5), so set it first, then checksum.
+        let body_len = (bytes.len() - HEADER_LEN + 8) as u16;
+        bytes[2..4].copy_from_slice(&body_len.to_be_bytes());
+        let value = protocol::fingerprint_value(&bytes);
+        bytes.extend_from_slice(&protocol::ATTR_FINGERPRINT.to_be_bytes());
+        bytes.extend_from_slice(&4_u16.to_be_bytes());
+        bytes.extend_from_slice(&value.to_be_bytes());
+        bytes
+    }
+
+    /// Append one zero-valued attribute *after* an existing FINGERPRINT.
+    fn append_attribute(mut request: Vec<u8>, attr_type: u16) -> Vec<u8> {
+        let grown = u16::from_be_bytes([request[2], request[3]]) + 4;
+        request[2..4].copy_from_slice(&grown.to_be_bytes());
+        request.extend_from_slice(&attr_type.to_be_bytes());
+        request.extend_from_slice(&0_u16.to_be_bytes());
+        request
+    }
+
+    fn protocol_context(
+        fingerprint: Option<FingerprintAction>,
+        alternate_server: Option<SocketAddr>,
+    ) -> ServerContext {
+        ServerContext {
+            fingerprint,
+            alternate_server,
+            ..ServerContext::default()
+        }
+    }
+
+    /// A UDP server whose only configuration is the protocol-closure feature
+    /// under test (no plan, no guard): the bytes are the frozen default ones.
+    async fn udp_server_with_protocol(
+        fingerprint: Option<FingerprintAction>,
+        alternate_server: Option<SocketAddr>,
+    ) -> (SocketAddr, Arc<ServerStats>) {
+        let socket = Arc::new(udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
+        let address = socket.local_addr().unwrap();
+        let context = Arc::new(ServerContext {
+            udp: vec![(address, socket.clone())],
+            ..protocol_context(fingerprint, alternate_server)
+        });
+        let stats = Arc::new(ServerStats::default());
+        tokio::spawn(serve_udp(
+            socket,
+            context,
+            Arc::from(TEST_SOFTWARE),
+            stats.clone(),
+        ));
+        (address, stats)
+    }
+
+    #[test]
+    fn fingerprint_check_is_off_and_the_action_needs_it() {
+        assert_eq!(fingerprint_policy(&Args::default()), Ok(None));
+
+        let cli = Cli::try_parse_from(["rstun", "server", "--check-fingerprint"]).unwrap();
+        let Command::Server(args) = cli.command;
+        assert_eq!(
+            fingerprint_policy(&args),
+            Ok(Some(FingerprintAction::Answer))
+        );
+
+        let cli = Cli::try_parse_from([
+            "rstun",
+            "server",
+            "--check-fingerprint",
+            "--fingerprint-action",
+            "drop",
+        ])
+        .unwrap();
+        let Command::Server(args) = cli.command;
+        assert_eq!(fingerprint_policy(&args), Ok(Some(FingerprintAction::Drop)));
+
+        // A `drop` action without the switch would be a silent no-op: refused.
+        let cli = Cli::try_parse_from(["rstun", "server", "--fingerprint-action", "drop"]).unwrap();
+        let Command::Server(args) = cli.command;
+        let error = fingerprint_policy(&args).unwrap_err();
+        assert!(error.contains("--check-fingerprint"), "{error}");
+        // An unknown action is a clap usage error, not a silent default.
+        assert!(
+            Cli::try_parse_from(["rstun", "server", "--fingerprint-action", "explode"]).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprint_five_states_over_udp() {
+        let (address, stats) =
+            udp_server_with_protocol(Some(FingerprintAction::Answer), None).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transaction_id = [0xa1; 12];
+        let valid = request_with_fingerprint(transaction_id, &[]);
+        assert_eq!(valid.len(), HEADER_LEN + 8);
+
+        // 1) Correct fingerprint -> the ordinary Binding success.
+        let (response, _) = udp_exchange(&client, address, &valid).await;
+        assert_binding_success(&response, transaction_id, client.local_addr().unwrap());
+        assert_eq!(stats.fingerprint_rejected(), 0);
+
+        // 2) Wrong CRC -> 400 Bad Request (not a success, not silence).
+        let mut mismatch = valid.clone();
+        let last = mismatch.len() - 1;
+        mismatch[last] ^= 0xff;
+        let (response, _) = udp_exchange(&client, address, &mismatch).await;
+        assert_eq!(error_details(&response).0, 400);
+        assert_eq!(stats.fingerprint_rejected(), 1);
+        assert_eq!(stats.counters(), (2, 2, 0));
+
+        // 3) FINGERPRINT followed by another attribute -> 400, even though the
+        //    CRC bytes themselves would still be right for that prefix.
+        let misplaced = append_attribute(valid.clone(), protocol::ATTR_PADDING);
+        let (response, _) = udp_exchange(&client, address, &misplaced).await;
+        assert_eq!(error_details(&response).0, 400);
+        assert_eq!(stats.fingerprint_rejected(), 2);
+
+        // 4) `--fingerprint-action drop`: the same wrong CRC gets no answer,
+        //    but is counted (both as a drop and as a fingerprint rejection).
+        let (drop_address, drop_stats) =
+            udp_server_with_protocol(Some(FingerprintAction::Drop), None).await;
+        client.send_to(&mismatch, drop_address).await.unwrap();
+        let mut buffer = [0_u8; 256];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "drop mode must stay silent"
+        );
+        assert_eq!(drop_stats.counters(), (1, 0, 1));
+        assert_eq!(drop_stats.fingerprint_rejected(), 1);
+
+        // 5) Default (switch off): a broken FINGERPRINT is ignored and the
+        //    response is byte-identical to the one for a bare request.
+        let (plain_address, plain_stats) = udp_server_with_protocol(None, None).await;
+        let (response, _) = udp_exchange(&client, plain_address, &mismatch).await;
+        assert_binding_success(&response, transaction_id, client.local_addr().unwrap());
+        let (bare, _) =
+            udp_exchange(&client, plain_address, &binding_request(transaction_id)).await;
+        assert_eq!(response, bare, "the attribute must not change any byte");
+        assert_eq!(plain_stats.fingerprint_rejected(), 0);
+    }
+
+    #[test]
+    fn fingerprint_guard_uses_the_request_method_in_the_400() {
+        // A non-Binding request with a broken FINGERPRINT keeps its own method in
+        // the error response (RFC 5389 §7.3.1), like every other 400.
+        let mut request = request_with_fingerprint([0xa2; 12], &[]);
+        request[0..2].copy_from_slice(&0x0003_u16.to_be_bytes());
+        let context = protocol_context(Some(FingerprintAction::Answer), None);
+        match guarded(
+            &request,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &context,
+        ) {
+            Decision::Respond(response) => {
+                let msg_type = u16::from_be_bytes([response[0], response[1]]);
+                assert_eq!(msg_type, 0x0113, "Allocate error response");
+                assert_eq!(error_details(&response).0, 400);
+            }
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn alternate_server_answers_every_binding_with_300() {
+        let server: SocketAddr = "192.0.2.9:3478".parse().unwrap();
+        let (address, stats) = udp_server_with_protocol(None, Some(server)).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Plain Binding *and* a redirect probe: the 300 wins over RFC 5780 and
+        // always leaves from the socket that received the request.
+        for request in [
+            binding_request([0xb1; 12]),
+            change_request([0xb2; 12], protocol::CHANGE_PORT),
+        ] {
+            let (response, from) = udp_exchange(&client, address, &request).await;
+            assert_eq!(from, address, "redirect must not move the source");
+            assert_eq!(
+                u16::from_be_bytes([response[0], response[1]]),
+                protocol::BINDING_ERROR_RESPONSE
+            );
+            let (code, unknown) = error_details(&response);
+            assert_eq!(code, 300);
+            assert!(unknown.is_empty());
+            let message = protocol::parse(&response).unwrap();
+            let alternate = protocol::attributes(message.body)
+                .find(|attribute| attribute.attr_type == protocol::ATTR_ALTERNATE_SERVER)
+                .expect("ALTERNATE-SERVER");
+            assert_eq!(
+                protocol::decode_address_value(alternate.value),
+                Some(server)
+            );
+            // A redirect answer carries no mapped address: it is not an answer
+            // *about* the peer, it is an instruction.
+            assert!(
+                protocol::attributes(message.body)
+                    .all(|attribute| attribute.attr_type != ATTR_XOR_MAPPED_ADDRESS)
+            );
+        }
+        assert_eq!(stats.counters(), (2, 2, 0));
+    }
+
+    #[test]
+    fn alternate_server_keeps_400_for_other_methods_and_takes_the_first_address() {
+        let server: SocketAddr = "192.0.2.9:3478".parse().unwrap();
+        let context = protocol_context(None, Some(server));
+
+        // Non-Binding methods keep their 400 (a redirect would not be an answer).
+        let mut allocate = binding_request([0xb3; 12]);
+        allocate[0..2].copy_from_slice(&0x0003_u16.to_be_bytes());
+        match decide(
+            &allocate,
+            "198.51.100.9:5000".parse().unwrap(),
+            "127.0.0.1:3478".parse().unwrap(),
+            Transport::Udp,
+            &context,
+            TEST_SOFTWARE,
+        )
+        .unwrap()
+        {
+            Decision::Respond(response) => assert_eq!(error_details(&response).0, 400),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+
+        // Repeated flag: the first address wins (the rest are warned about).
+        let cli = Cli::try_parse_from([
+            "rstun",
+            "server",
+            "--alternate-server",
+            "192.0.2.9:3478",
+            "--alternate-server",
+            "192.0.2.10:3478",
+        ])
+        .unwrap();
+        let Command::Server(args) = cli.command;
+        assert_eq!(
+            alternate_server(&args),
+            Some("192.0.2.9:3478".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn alternate_server_answer_is_what_the_reflection_guard_estimates() {
+        // The guard must measure the answer it will actually send: with
+        // `--alternate-server` that is the fixed 56-byte 300, not a success
+        // response (which would be 76 bytes with --alt-listen and 52 plain).
+        let context = ServerContext {
+            alternate_server: Some("192.0.2.9:3478".parse().unwrap()),
+            ..guarded_context(reflect_policy(20, limit::DEFAULT_REFLECT_RATIO))
+        };
+        let request = minimal_response_port_request(TEST_TRANSACTION, 23480);
+        match guarded(
+            &request,
+            "198.51.100.9:5000",
+            "127.0.0.1:3478",
+            Transport::Udp,
+            &context,
+        ) {
+            Decision::Respond(bytes) => {
+                assert_eq!(error_details(&bytes).0, 300);
+                assert_eq!(bytes.len(), 56);
+                assert!(
+                    limit::Reflect {
+                        min_request: 20,
+                        ratio: limit::DEFAULT_REFLECT_RATIO,
+                    }
+                    .allows_response(request.len(), bytes.len())
+                );
+            }
+            other => panic!("a 28-byte probe must still get the 300, got {other:?}"),
+        }
+        assert_eq!(admission_of(&context).counters().reflect_rejected, 0);
+    }
+
+    #[test]
+    fn server_error_mapping_only_covers_internal_failures() {
+        use std::io::ErrorKind;
+
+        // The client's address problem: the datagram never left (or can never
+        // arrive), so claiming "server error" would be wrong and noisy.
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert_eq!(
+                server_error_for(&std::io::Error::from(kind)),
+                None,
+                "{kind:?} must not map to 500"
+            );
+        }
+        // Everything else is a failure on our side of the send.
+        for kind in [
+            ErrorKind::InvalidInput,
+            ErrorKind::PermissionDenied,
+            ErrorKind::BrokenPipe,
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                server_error_for(&std::io::Error::from(kind)),
+                Some(protocol::ERROR_SERVER_ERROR),
+                "{kind:?} must map to 500"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn server_error_answer_is_forty_bytes_with_the_transaction_id() {
+        let server = Arc::new(udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
+        let local = server.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = client.local_addr().unwrap();
+        let request = binding_request([0xc1; 12]);
+        let stats = ServerStats::default();
+
+        send_server_error(
+            &server,
+            local,
+            peer,
+            &request,
+            &stats,
+            protocol::ERROR_SERVER_ERROR,
+        )
+        .await;
+
+        let mut buffer = [0_u8; 256];
+        let (len, from) =
+            tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buffer))
+                .await
+                .expect("500 was not delivered")
+                .unwrap();
+        assert_eq!(from, local);
+        let response = &buffer[..len];
+        assert_eq!(response.len(), 40, "500 must stay a fixed 40 bytes");
+        assert_eq!(&response[8..20], &[0xc1; 12]);
+        let (code, unknown) = error_details(response);
+        assert_eq!(code, 500);
+        assert!(unknown.is_empty());
+        assert_eq!(stats.counters(), (0, 1, 0));
+    }
+
+    #[test]
+    fn wire_invariants_and_the_server_error_builder() {
+        let transaction_id = protocol::TransactionId([0xd1; 12]);
+        let good = protocol::server_error_response(&transaction_id, protocol::BINDING_REQUEST);
+        assert!(response_is_encodable(&good));
+
+        // Anything that is not a complete STUN frame is refused before sending.
+        assert!(!response_is_encodable(&[]));
+        assert!(!response_is_encodable(&[0_u8; protocol::HEADER_LEN - 1]));
+        let mut wrong_length = good.clone();
+        wrong_length[2..4].copy_from_slice(&0_u16.to_be_bytes());
+        assert!(!response_is_encodable(&wrong_length));
+        let mut truncated = good.clone();
+        truncated.pop();
+        assert!(!response_is_encodable(&truncated));
+
+        // The 500 builder needs only a parseable frame, and its bytes are the
+        // fixed `Server Error` response (no internal detail can ride along).
+        let request = binding_request([0xd2; 12]);
+        assert_eq!(
+            server_error_bytes(&request, protocol::ERROR_SERVER_ERROR),
+            Some(protocol::server_error_response(
+                &protocol::TransactionId([0xd2; 12]),
+                protocol::BINDING_REQUEST
+            ))
+        );
+        assert_eq!(
+            server_error_bytes(b"not stun", protocol::ERROR_SERVER_ERROR),
+            None
+        );
+    }
+
+    /// A real failed `send_to`: the kernel refuses destination port 0 (EINVAL),
+    /// so `server_error_for` maps it to 500 and the client sees the error answer
+    /// instead of dead air. Linux-only because the errno is what makes it
+    /// deterministic; elsewhere the mapping is covered by the table test.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_send_failure_answers_500_server_error() {
+        let (_server, address, stats) = udp_server().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transaction_id = [0xc2; 12];
+        let request = request_with_attribute(
+            transaction_id,
+            protocol::ATTR_RESPONSE_PORT,
+            &0_u16.to_be_bytes(),
+        );
+        client.send_to(&request, address).await.unwrap();
+
+        let mut buffer = [0_u8; 512];
+        let (len, from) =
+            tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buffer))
+                .await
+                .expect("a failed send_to must be answered with 500")
+                .unwrap();
+        assert_eq!(from, address);
+        let (code, unknown) = error_details(&buffer[..len]);
+        assert_eq!(code, 500);
+        assert!(unknown.is_empty());
+        assert_eq!(stats.counters(), (1, 1, 0));
     }
 
     // ---------- CLI ----------

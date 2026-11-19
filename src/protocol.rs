@@ -52,11 +52,29 @@
 //!   act on. §15.9 keeps the list strictly `2 × N` bytes and defers alignment to
 //!   the generic TLV padding ("In this version of the specification, the normal
 //!   padding rules for attributes are used instead" of RFC 3489's duplication).
+//!
+//! Two more error paths complete the server side of RFC 5389:
+//!
+//! * `300 Try Alternate` + `ALTERNATE-SERVER` (RFC 5389 §15.11) — only when
+//!   `--alternate-server` names another instance. The address attribute uses the
+//!   same plain `0 | family | port | address` layout as `MAPPED-ADDRESS`.
+//! * `500 Server Error` (§15.6) — for failures that are *ours* (a send that
+//!   cannot be retried, an internal invariant), never for a bad request. The
+//!   reason text is a fixed `Server Error`, so no `io::Error` detail leaks and
+//!   the message stays 40 bytes (it cannot become an amplifier).
+//!
+//! `FINGERPRINT` (§15.5) is validated on request with [`check_fingerprint`]:
+//! the attribute must be *last* and its value must be `CRC32(prefix) XOR
+//! 0x5354554e`, where the prefix is the message **as sent** minus the attribute —
+//! the header `Length` already counts the attribute, as §15.5 requires. The
+//! `crate::crc32` module provides the IEEE CRC-32 (RFC 5769's vectors lock it).
 
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
+
+use crate::crc32::crc32;
 
 /// `0x2112A442`, fixed by RFC 5389 §6.
 pub const MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -122,9 +140,17 @@ pub const ATTR_RESPONSE_ORIGIN: u16 = 0x802b;
 pub const ATTR_OTHER_ADDRESS: u16 = 0x802c;
 /// `400 Bad Request`, for a request whose method this server does not implement.
 pub const ERROR_BAD_REQUEST: u16 = 400;
+/// `300 Try Alternate` (RFC 5389 §15.6, used with `ALTERNATE-SERVER` §15.11):
+/// "use the server in this attribute instead".
+pub const ERROR_TRY_ALTERNATE: u16 = 300;
 /// `420 Unknown Attribute` (RFC 5389 §7.3.1 / §15.9): a request carried at least
 /// one comprehension-required attribute this server does not implement.
 pub const ERROR_UNKNOWN_ATTRIBUTE: u16 = 420;
+/// `500 Server Error` (RFC 5389 §15.6): a failure on our side, never a client
+/// error. The reason text is always the fixed `Server Error`.
+pub const ERROR_SERVER_ERROR: u16 = 500;
+/// XOR applied to the CRC-32 of a message to form `FINGERPRINT` (RFC 5389 §15.5).
+pub const FINGERPRINT_XOR: u32 = 0x5354_554e;
 
 /// `CHANGE-REQUEST` bit: answer from the other IP (RFC 5780 §7.2, bit `A`).
 ///
@@ -638,12 +664,146 @@ pub fn error_response(
 /// `<ERROR-CODE>` value: 2 reserved bytes, class digit, number digit, reason.
 ///
 /// RFC 5389 §15.6 keeps the class/number split so a client can match on the
-/// class alone; we only ever emit 4xx, but the encoding is kept as-is.
+/// class alone; the class digit is `code / 100` for every code we emit
+/// (`300` / `400` / `420` / `500`).
 fn error_code_value(code: u16, reason: &str) -> Vec<u8> {
     let mut value = Vec::with_capacity(4 + reason.len());
     value.extend_from_slice(&[0, 0, (code / 100) as u8, (code % 100) as u8]);
     value.extend_from_slice(reason.as_bytes());
     value
+}
+
+/// `300 Try Alternate` carrying `ALTERNATE-SERVER` (RFC 5389 §15.11).
+///
+/// The address attribute is the plain RFC 5389 §15.1 layout
+/// (`0 | family | port | address`) — **not** XOR-obfuscated: §15.11 says
+/// "the format of the ALTERNATE-SERVER attribute is identical to the
+/// MAPPED-ADDRESS attribute" and only §15.2's XOR form is obfuscated.
+///
+/// Emitted by an instance configured with `--alternate-server`; the redirect
+/// deliberately wins over RFC 5780 (a `CHANGE-REQUEST`/`RESPONSE-PORT` request
+/// still gets this answer, from the socket that received it).
+pub fn alternate_server_response(
+    transaction_id: &TransactionId,
+    method: u16,
+    server: SocketAddr,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(32);
+    push_attribute(
+        &mut body,
+        ATTR_ERROR_CODE,
+        &error_code_value(ERROR_TRY_ALTERNATE, "Try Alternate"),
+    );
+    push_attribute(&mut body, ATTR_ALTERNATE_SERVER, &address_value(server));
+    encode_message(
+        message_type(method, MessageClass::ErrorResponse),
+        transaction_id,
+        &body,
+    )
+}
+
+/// `500 Server Error` with the fixed `Server Error` reason (RFC 5389 §15.6).
+///
+/// The response is exactly **40 bytes** (20-byte header + 20-byte `ERROR-CODE`:
+/// 4 value bytes + the 11-byte reason + 1 byte of TLV padding). A fixed reason
+/// is the point: internal details (`io::Error`, paths, hostnames) go to the log
+/// only, and the size cannot grow with them.
+pub fn server_error_response(transaction_id: &TransactionId, method: u16) -> Vec<u8> {
+    error_response(transaction_id, method, ERROR_SERVER_ERROR, "Server Error")
+}
+
+/// The value a `FINGERPRINT` attribute carries (RFC 5389 §15.5).
+///
+/// `frame_without_fingerprint` is the message **as sent**, minus the 8-byte
+/// attribute: the header `Length` still counts the attribute (RFC 5389 §15.5:
+/// "this value must be correct and include the CRC attribute as part of the
+/// message length, prior to computation of the CRC"). That is what the RFC 5769
+/// §2.1–§2.3 vectors encode, and what real clients compute — see
+/// `crc32::tests::rfc5769_section_2_1_fingerprint_vector`.
+///
+/// Kept public for tests and the interop probe: an independent implementation
+/// (python's `zlib.crc32`) can then be compared byte for byte instead of
+/// trusting our own round trip.
+pub fn fingerprint_value(frame_without_fingerprint: &[u8]) -> u32 {
+    crc32(frame_without_fingerprint) ^ FINGERPRINT_XOR
+}
+
+/// What a message's `FINGERPRINT` attribute (if any) says about the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintVerdict {
+    /// No `FINGERPRINT` attribute: nothing to check (the default path).
+    Absent,
+    /// Present as the last attribute, four bytes, CRC matches.
+    Valid,
+    /// Present, but at least one attribute follows it (or it is not 4 bytes).
+    NotLast,
+    /// Last and four bytes, but the CRC does not match.
+    Mismatch,
+}
+
+/// Validate the `FINGERPRINT` attribute of one STUN frame (RFC 5389 §15.5).
+///
+/// The rule is deliberately *structural first*: the attribute has to be the last
+/// one, and only then is the CRC compared. RFC 5389 §15.5 makes the position
+/// part of the definition ("it MUST be the last attribute in the message"), so a
+/// misplaced `FINGERPRINT` is [`FingerprintVerdict::NotLast`] even when the
+/// four bytes would otherwise check out.
+///
+/// `frame` is one whole message (`HEADER_LEN + Message Length` bytes). Trailing
+/// bytes are ignored, so a UDP datagram carrying extra junk is judged on its
+/// declared frame — the same boundary [`parse`] uses.
+pub fn check_fingerprint(frame: &[u8]) -> FingerprintVerdict {
+    let Ok(frame_len) = peek_frame_len(frame) else {
+        return FingerprintVerdict::Absent;
+    };
+    // `peek_frame_len` trusts the header's declared length; a truncated datagram
+    // has no attributes to judge (and `parse` will reject it first), so do not
+    // slice past the buffer here.
+    let Some(frame) = frame.get(..frame_len) else {
+        return FingerprintVerdict::Absent;
+    };
+    let body = &frame[HEADER_LEN..];
+
+    let mut offset = 0;
+    let mut fingerprint: Option<usize> = None;
+    while offset + 4 <= body.len() {
+        let attr_type = u16::from_be_bytes([body[offset], body[offset + 1]]);
+        let length = usize::from(u16::from_be_bytes([body[offset + 2], body[offset + 3]]));
+        if attr_type == ATTR_FINGERPRINT {
+            if fingerprint.replace(offset).is_some() {
+                // A second FINGERPRINT means the first one was not last.
+                return FingerprintVerdict::NotLast;
+            }
+        } else if fingerprint.is_some() {
+            return FingerprintVerdict::NotLast;
+        }
+        offset += 4 + length.div_ceil(4) * 4;
+    }
+
+    let Some(offset) = fingerprint else {
+        return FingerprintVerdict::Absent;
+    };
+    let length = usize::from(u16::from_be_bytes([body[offset + 2], body[offset + 3]]));
+    let Some(value) = body.get(offset + 4..offset + 4 + length) else {
+        return FingerprintVerdict::Mismatch;
+    };
+    // "MUST be the last attribute" also fixes the on-wire size at 8 bytes:
+    // a FINGERPRINT of another length cannot be the one the sender computed.
+    if offset + 8 != body.len() || value.len() != 4 {
+        return FingerprintVerdict::NotLast;
+    }
+
+    // RFC 5389 §15.5: "the CRC used in the FINGERPRINT attribute covers the
+    // length field from the STUN message header. Therefore, this value must be
+    // correct and include the CRC attribute as part of the message length,
+    // prior to computation of the CRC." So the prefix is the frame as sent, with
+    // the header Length left alone — no rewriting (RFC 5769's vectors agree).
+    let expected = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+    if fingerprint_value(&frame[..HEADER_LEN + offset]) == expected {
+        FingerprintVerdict::Valid
+    } else {
+        FingerprintVerdict::Mismatch
+    }
 }
 
 /// `420 Unknown Attribute` with the `UNKNOWN-ATTRIBUTES` list (RFC 5389 §7.3.1,
@@ -1432,6 +1592,203 @@ mod tests {
         assert_eq!(msg_type, 0x0113);
         assert_eq!(message_method(msg_type), 0x0003);
         assert_eq!(message_class(msg_type), MessageClass::ErrorResponse);
+    }
+
+    /// Append a `FINGERPRINT` (RFC 5389 §15.5) to a request whose body is
+    /// `attributes`, computing the CRC over the message **without** it but with
+    /// the header `Length` already counting the attribute.
+    fn with_fingerprint(transaction_id: [u8; 12], attributes: &[u8]) -> Vec<u8> {
+        let mut bytes = binding_request(transaction_id, attributes);
+        let body_len = (attributes.len() + 8) as u16;
+        bytes[2..4].copy_from_slice(&body_len.to_be_bytes());
+        let value = fingerprint_value(&bytes);
+        bytes.extend_from_slice(&ATTR_FINGERPRINT.to_be_bytes());
+        bytes.extend_from_slice(&4_u16.to_be_bytes());
+        bytes.extend_from_slice(&value.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn fingerprint_verdict_covers_absent_valid_mismatch_and_position() {
+        let transaction_id = [0x61; 12];
+
+        // No attribute: nothing to check (the default path).
+        assert_eq!(
+            check_fingerprint(&bare_binding_request(transaction_id)),
+            FingerprintVerdict::Absent
+        );
+
+        // Valid, as the only attribute.
+        let only = with_fingerprint(transaction_id, &[]);
+        assert_eq!(only.len(), HEADER_LEN + 8);
+        assert_eq!(check_fingerprint(&only), FingerprintVerdict::Valid);
+
+        // Valid with attributes in front of it (the CRC covers them too).
+        let mut body = Vec::new();
+        push_attribute(&mut body, ATTR_SOFTWARE, b"rstun/test");
+        push_attribute(&mut body, ATTR_PADDING, &[0x5a; 8]);
+        let with_extras = with_fingerprint(transaction_id, &body);
+        assert_eq!(check_fingerprint(&with_extras), FingerprintVerdict::Valid);
+
+        // One flipped byte in the value -> Mismatch.
+        let mut mismatch = with_extras.clone();
+        let last = mismatch.len() - 1;
+        mismatch[last] ^= 0xff;
+        assert_eq!(check_fingerprint(&mismatch), FingerprintVerdict::Mismatch);
+
+        // A CRC that matches the prefix but the attribute is not last: the
+        // position check wins (RFC 5389 §15.5: "MUST be the last attribute").
+        let mut misplaced = with_extras.clone();
+        let grown = u16::from_be_bytes([misplaced[2], misplaced[3]]) + 4;
+        misplaced[2..4].copy_from_slice(&grown.to_be_bytes());
+        push_attribute(&mut misplaced, ATTR_PADDING, &[]);
+        assert_eq!(check_fingerprint(&misplaced), FingerprintVerdict::NotLast);
+
+        // Two FINGERPRINTs: the first one was not last.
+        let mut twice = with_extras.clone();
+        let doubled = u16::from_be_bytes([twice[2], twice[3]]) + 8;
+        twice[2..4].copy_from_slice(&doubled.to_be_bytes());
+        twice.extend_from_slice(&ATTR_FINGERPRINT.to_be_bytes());
+        twice.extend_from_slice(&4_u16.to_be_bytes());
+        twice.extend_from_slice(&[0_u8; 4]);
+        assert_eq!(check_fingerprint(&twice), FingerprintVerdict::NotLast);
+
+        // A FINGERPRINT whose value is not 4 bytes cannot be the one the sender
+        // computed -> treated as a structural error, never as "valid".
+        let mut wrong_length = binding_request(transaction_id, &[]);
+        wrong_length[2..4].copy_from_slice(&12_u16.to_be_bytes());
+        wrong_length.extend_from_slice(&ATTR_FINGERPRINT.to_be_bytes());
+        wrong_length.extend_from_slice(&8_u16.to_be_bytes());
+        wrong_length.extend_from_slice(&[0_u8; 8]);
+        assert_eq!(
+            check_fingerprint(&wrong_length),
+            FingerprintVerdict::NotLast
+        );
+
+        // A datagram shorter than its header claims is not our business here:
+        // `parse` reports `Truncated` and the caller drops it, so the fingerprint
+        // check must not slice past the buffer (and must not panic).
+        let mut truncated = with_fingerprint(transaction_id, &[]);
+        truncated.truncate(truncated.len() - 3);
+        assert_eq!(check_fingerprint(&truncated), FingerprintVerdict::Absent);
+    }
+
+    #[test]
+    fn fingerprint_value_is_the_rfc_xor_of_the_crc() {
+        // The attribute is `CRC32(message) ^ 0x5354554e`; spelling the constant
+        // out here keeps a refactor from quietly dropping the XOR.
+        let transaction_id = [0x62; 12];
+        let request = with_fingerprint(transaction_id, &[]);
+        let message = parse(&request).unwrap();
+        let fingerprint = attributes(message.body)
+            .find(|attribute| attribute.attr_type == ATTR_FINGERPRINT)
+            .expect("FINGERPRINT");
+        let value = u32::from_be_bytes(fingerprint.value.try_into().unwrap());
+
+        // The CRC covers the message as sent minus the attribute; the header
+        // Length already counts the attribute (RFC 5389 §15.5).
+        let prefix = &request[..request.len() - 8];
+        assert_eq!(value, crate::crc32::crc32(prefix) ^ FINGERPRINT_XOR);
+        assert_eq!(value, fingerprint_value(prefix));
+    }
+
+    #[test]
+    fn rfc8489_attributes_are_ignored_without_authentication() {
+        // The RFC 8489 auth cluster must not turn a probe into a 420: the three
+        // comprehension-required types are in the known-attribute table, and
+        // PASSWORD-ALGORITHMS (0x8002) is comprehension-optional, so §7.3.1
+        // ignores it whether or not the table names it.
+        let mut body = Vec::new();
+        push_attribute(&mut body, ATTR_MESSAGE_INTEGRITY_SHA256, &[0_u8; 32]);
+        push_attribute(&mut body, ATTR_PASSWORD_ALGORITHM, &[0_u8; 4]);
+        push_attribute(&mut body, ATTR_USERHASH, &[0_u8; 32]);
+        push_attribute(&mut body, 0x8002, &[0_u8; 8]);
+        assert_eq!(unknown_attributes(&body), Vec::<u16>::new());
+        for attr_type in [
+            ATTR_MESSAGE_INTEGRITY_SHA256,
+            ATTR_PASSWORD_ALGORITHM,
+            ATTR_USERHASH,
+        ] {
+            assert!(is_known_attribute(attr_type), "{attr_type:#06x}");
+        }
+    }
+
+    #[test]
+    fn alternate_server_response_is_a_300_with_the_plain_address_layout() {
+        let transaction_id = TransactionId([0x63; 12]);
+        // IPv4: 20 header + 24 ERROR-CODE + 12 ALTERNATE-SERVER.
+        let server: SocketAddr = "192.0.2.9:3478".parse().unwrap();
+        let response = alternate_server_response(&transaction_id, BINDING_REQUEST, server);
+        assert_eq!(response.len(), 56);
+        assert_eq!(
+            u16::from_be_bytes([response[0], response[1]]),
+            BINDING_ERROR_RESPONSE
+        );
+        let message = parse(&response).unwrap();
+        assert_eq!(message_class(message.msg_type), MessageClass::ErrorResponse);
+        let error = attributes(message.body)
+            .find(|attribute| attribute.attr_type == ATTR_ERROR_CODE)
+            .expect("ERROR-CODE");
+        assert_eq!(
+            (error.value[2], error.value[3]),
+            (3, 0),
+            "class/number of 300"
+        );
+        assert_eq!(&error.value[4..], b"Try Alternate");
+        let alternate = attributes(message.body)
+            .find(|attribute| attribute.attr_type == ATTR_ALTERNATE_SERVER)
+            .expect("ALTERNATE-SERVER");
+        // Same layout as MAPPED-ADDRESS: 0 | family | port | address, not XORed.
+        assert_eq!(alternate.value[0], 0);
+        assert_eq!(alternate.value[1], FAMILY_IPV4);
+        assert_eq!(
+            &alternate.value[2..],
+            hex_bytes("0d96 c000 0209").as_slice()
+        );
+        assert_eq!(decode_address_value(alternate.value), Some(server));
+
+        // IPv6: family 0x02 and the full 16-byte address.
+        let server: SocketAddr = "[2001:db8::9]:3478".parse().unwrap();
+        let response = alternate_server_response(&transaction_id, BINDING_REQUEST, server);
+        let message = parse(&response).unwrap();
+        let alternate = attributes(message.body)
+            .find(|attribute| attribute.attr_type == ATTR_ALTERNATE_SERVER)
+            .expect("ALTERNATE-SERVER");
+        assert_eq!(alternate.value[1], FAMILY_IPV6);
+        assert_eq!(decode_address_value(alternate.value), Some(server));
+
+        // The request method is kept, like every other error response.
+        let response = alternate_server_response(&transaction_id, 0x0003, server);
+        assert_eq!(u16::from_be_bytes([response[0], response[1]]), 0x0113);
+    }
+
+    #[test]
+    fn server_error_response_is_forty_bytes_and_says_nothing_internal() {
+        let transaction_id = TransactionId([0x64; 12]);
+        let response = server_error_response(&transaction_id, BINDING_REQUEST);
+        // 20 header + 20 ERROR-CODE (4 value bytes + 11-byte reason + 1 pad).
+        assert_eq!(response.len(), 40);
+        assert_eq!(
+            u16::from_be_bytes([response[0], response[1]]),
+            BINDING_ERROR_RESPONSE
+        );
+        let message = parse(&response).unwrap();
+        assert_eq!(message_class(message.msg_type), MessageClass::ErrorResponse);
+        let error = attributes(message.body)
+            .find(|attribute| attribute.attr_type == ATTR_ERROR_CODE)
+            .expect("ERROR-CODE");
+        assert_eq!((error.value[2], error.value[3]), (5, 0));
+        assert_eq!(&error.value[4..], b"Server Error");
+        // Only the fixed reason text: no paths, no errno, no backtrace.
+        assert_eq!(
+            response,
+            error_response(
+                &transaction_id,
+                BINDING_REQUEST,
+                ERROR_SERVER_ERROR,
+                "Server Error"
+            )
+        );
     }
 
     #[test]

@@ -12,9 +12,10 @@
 //! 与 `protocol.rs` 里的同类测试互补：那里验「我们 vs `stun-types` 的单个属性」，
 //! 这里验「RFC 原文字节」以及「一条完整消息里所有属性同时对得上」。
 //!
-//! 有意**不**做的事：§2.1/§2.2/§2.3 的 `MESSAGE-INTEGRITY` / `FINGERPRINT` 只断言
-//! 存在与长度。本服务器不做鉴权（见 `prd.md` 非目标），所以既不校验 HMAC，
-//! 也不会在自己的响应里带这两个属性 —— 拿它当「我们支持鉴权」是误读。
+//! 有意**不**做的事：§2.1/§2.2/§2.3 的 `MESSAGE-INTEGRITY` 只断言存在与长度 ——
+//! 本服务器不做鉴权（见 `prd.md` 非目标），所以既不校验 HMAC，也不会在自己的响应里
+//! 带这个属性。`FINGERPRINT` 不同：`--check-fingerprint` 会校验它，见
+//! `rfc5769_fingerprints_are_valid_and_our_crc32_agrees`。
 
 use std::net::SocketAddr;
 
@@ -30,6 +31,14 @@ fn hex_bytes(hex: &str) -> Vec<u8> {
         .step_by(2)
         .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex"))
         .collect()
+}
+
+/// Our 12-byte transaction id as `stun-types` models it (a 128-bit value whose
+/// low 96 bits are the id).
+fn reference_transaction_id(id: [u8; 12]) -> stun_types::message::TransactionId {
+    let mut wide = [0_u8; 16];
+    wide[4..].copy_from_slice(&id);
+    stun_types::message::TransactionId::from(u128::from_be_bytes(wide))
 }
 
 /// RFC 5769 §2.1：Sample Request（108 字节，Message Length 88）。
@@ -218,6 +227,72 @@ fn rfc5769_2_4_long_term_auth_request_is_not_turned_into_420() {
         protocol::unknown_attributes(message.body).is_empty(),
         "USERNAME/REALM/NONCE/MESSAGE-INTEGRITY 不得触发 420"
     );
+}
+
+#[test]
+fn rfc5769_fingerprints_are_valid_and_our_crc32_agrees() {
+    // RFC 5769 §2.1–§2.3 的 FINGERPRINT 是**外部产物**：本服务只在
+    // `--check-fingerprint` 开启时校验它，所以这里的判据是「标准字节判定为合法」。
+    // 同时也是 `crc32` 模块的端到端向量（§2.4 没有 FINGERPRINT）。
+    for (name, hex) in [
+        ("§2.1 request", RFC5769_2_1),
+        ("§2.2 IPv4 response", RFC5769_2_2),
+        ("§2.3 IPv6 response", RFC5769_2_3),
+    ] {
+        let bytes = hex_bytes(hex);
+        assert_eq!(
+            protocol::check_fingerprint(&bytes),
+            protocol::FingerprintVerdict::Valid,
+            "{name} 的 FINGERPRINT 必须被判为合法"
+        );
+        // 反向：把值改一位就必须是 Mismatch（证明判定不是恒真）。
+        let mut tampered = bytes.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert_eq!(
+            protocol::check_fingerprint(&tampered),
+            protocol::FingerprintVerdict::Mismatch,
+            "{name} 改一位后必须被判为不匹配"
+        );
+    }
+}
+
+#[test]
+fn stun_types_decodes_our_300_and_500_error_responses() {
+    // 互操作矩阵新增的两类错误响应：第三方解码器必须能读出错误码与地址，
+    // 否则「拒绝也有明确语义」只对我们自己成立。
+    use stun_types::attribute::{AlternateServer, ErrorCode};
+    use stun_types::message::{
+        BINDING, Message as ReferenceMessage, MessageClass as ReferenceClass,
+    };
+
+    let transaction_id = TransactionId([0x7e; 12]);
+    let server: SocketAddr = "192.0.2.9:3478".parse().unwrap();
+    let response =
+        protocol::alternate_server_response(&transaction_id, protocol::BINDING_REQUEST, server);
+    let reference = ReferenceMessage::from_bytes(&response).expect("stun-types 读不了我们的 300");
+    assert!(reference.has_class(ReferenceClass::Error));
+    assert!(reference.has_method(BINDING));
+    assert_eq!(
+        reference.transaction_id(),
+        reference_transaction_id(transaction_id.0)
+    );
+    let error = reference.attribute::<ErrorCode>().expect("ERROR-CODE");
+    assert_eq!(error.code(), 300);
+    assert_eq!(error.reason(), "Try Alternate");
+    let alternate = reference
+        .attribute::<AlternateServer>()
+        .expect("ALTERNATE-SERVER");
+    assert_eq!(alternate.server(), server);
+
+    let response = protocol::server_error_response(&transaction_id, protocol::BINDING_REQUEST);
+    let reference = ReferenceMessage::from_bytes(&response).expect("stun-types 读不了我们的 500");
+    assert!(reference.has_class(ReferenceClass::Error));
+    let error = reference.attribute::<ErrorCode>().expect("ERROR-CODE");
+    assert_eq!(error.code(), 500);
+    assert_eq!(error.reason(), "Server Error");
+    // 固定文案 / 固定 40 字节：不随内部错误变化。
+    assert_eq!(response.len(), 40);
 }
 
 /// `stun-types` 2.0.5 与我们的双向一致：它编的请求我们解、我们编的响应它解。

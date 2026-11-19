@@ -8,7 +8,8 @@
 //! 1. 分帧：`peek_frame_len`（TCP 用它决定读多少，错一字节就可能读挂连接）
 //! 2. 解析：`parse` + 属性迭代器（`attributes` 的越界保护）
 //! 3. 解码：`decode_xor_mapped_address` / `decode_address_value`（攻击者可控 value）
-//! 4. 决策：`unknown_attributes` / `padding_len` / `response_port` / `change_request`
+//! 4. 决策：`unknown_attributes` / `padding_len` / `response_port` / `change_request` /
+//!    `check_fingerprint`（`--check-fingerprint` 开启时攻击者可达）
 //! 5. 编码：`binding_success_response` / `unknown_attributes_response` / `error_response`
 //!    （用数据派生的地址与长度；断言产出的字节仍能被自己的解析器读回）
 //!
@@ -19,6 +20,12 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use libfuzzer_sys::fuzz_target;
+
+#[path = "../../src/crc32.rs"]
+// `protocol.rs` 里 `use crate::crc32::crc32;`：fuzz 目标按路径单独引入源码时，
+// 必须先把 crc32 放到 crate 根，否则 `cargo fuzz build` 会 unresolved import。
+#[allow(dead_code)]
+mod crc32;
 
 #[path = "../../src/protocol.rs"]
 // 只用到解析/编码相关的几个入口，其余 pub 函数在 fuzz 二进制里「未使用」是正常的。
@@ -46,6 +53,10 @@ fn peer_from(data: &[u8]) -> SocketAddr {
 fuzz_target!(|data: &[u8]| {
     // 1. 分帧：任何输入都不能 panic。
     let _ = protocol::peek_frame_len(data);
+
+    // 1b. FINGERPRINT 校验（`--check-fingerprint` 的攻击者可达路径）：纯函数，
+    //     对任意字节都必须只回 verdict，不能 panic 或越界切片。
+    let _ = protocol::check_fingerprint(data);
 
     // 2. 解析：不合法就结束（这是绝大多数输入的自然结局）。
     let Ok(message) = protocol::parse(data) else {
