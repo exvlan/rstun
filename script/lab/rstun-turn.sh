@@ -5,16 +5,24 @@
 # `rstun-abuse.sh` 的门禁）。
 #
 # 用法：
-#   bash script/lab/rstun-turn.sh                  # 全部项
+#   bash script/lab/rstun-turn.sh                  # 全部项（lean 构建：tls/dtls 标 SKIP）
 #   bash script/lab/rstun-turn.sh --port 34980     # 端口基准（默认 34980）
-#   bash script/lab/rstun-turn.sh --no-build       # 复用 target/debug/rstun
+#   bash script/lab/rstun-turn.sh --no-build       # 复用 target/debug/rstun（探测其 feature）
+#   bash script/lab/rstun-turn.sh --tls --dtls     # 只跑 TLS/DTLS 项（自动 --features full 构建）
 #   bash script/lab/rstun-turn.sh --only relay     # 只跑一项
-#     （startup|relay|auth|lifecycle|wrong-user|wildcard|permission-limit|quota|ports|cleanup|frozen|coturn）
+#     （startup|relay|auth|lifecycle|wrong-user|wildcard|permission-limit|quota|
+#       ports|tls|dtls|rest|bandwidth|cleanup|frozen|coturn）
 #   bash script/lab/rstun-turn.sh --keep           # 保留日志（默认只清进程）
 #
+# 构建：默认 lean（`cargo build`，无 tls/dtls feature）。`--tls` / `--dtls` /
+# `--only tls|dtls|coturn` 会自动用 `cargo build --features full` 构建；`--no-build`
+# 时探测现有二进制是否带 feature。lean 下 tls/dtls 项记 SKIP（不是失败），
+# coturn 项的 TLS/DTLS 对照行同样跳过。
+#
 # 依赖：cargo/rustc（本仓）、python3（探针，只用标准库）、`turnutils_uclient`
-# （coturn 自带客户端）。`turnserver` 缺失时 coturn 项记 SKIP 并说明；其余项用
-# 本仓探针 + uclient，缺 uclient 的项同理 SKIP。
+# （coturn 自带客户端）、`openssl`（TLS/DTLS 项自签证书 + 握手探针）。
+# `turnserver` 缺失时 coturn 项记 SKIP 并说明；其余项用本仓探针 + uclient，
+# 缺 uclient/openssl 的项同理 SKIP。
 #
 # 退出码：0 = 全部 ok；1 = 至少一项 FAIL；2 = 参数/环境错误。
 # 日志：$RSTUN_TURN_DIR（默认 /tmp/opencode/rstun-turn），每项一个 .log。
@@ -36,6 +44,11 @@ RELAY_LO=49700
 RELAY_HI=49799
 BUILD=true
 ONLY=""
+T2_ONLY=()
+# 空的 = lean 构建；需要 secure 传输的项会把它设成 `--features full`。
+CARGO_FEATURES=()
+# 当前二进制是否带 tls/dtls（building 时由 CARGO_FEATURES 决定，--no-build 时探测）。
+HAVE_SECURE=false
 
 USER_NAME="turnuser"
 USER_PASS="turnpass"
@@ -47,7 +60,7 @@ FAILED=()
 SKIPPED=()
 PASSED=()
 
-ALL_ITEMS=(startup relay auth lifecycle wrong-user wildcard permission-limit quota ports cleanup frozen coturn)
+ALL_ITEMS=(startup relay auth lifecycle wrong-user wildcard permission-limit quota ports tls dtls rest bandwidth cleanup frozen coturn)
 
 usage() {
   sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
@@ -58,6 +71,8 @@ while [[ $# -gt 0 ]]; do
     --port) BASE="${2:?--port 需要一个端口}"; shift ;;
     --port=*) BASE="${1#*=}" ;;
     --no-build) BUILD=false ;;
+    --tls) T2_ONLY+=(tls) ;;
+    --dtls) T2_ONLY+=(dtls) ;;
     --only) ONLY="${2:?--only 需要一项名字}"; shift ;;
     --only=*) ONLY="${1#*=}" ;;
     --keep) : ;;
@@ -81,7 +96,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [[ -n "$ONLY" ]]; then
   case "$ONLY" in
-    startup | relay | auth | lifecycle | wrong-user | wildcard | permission-limit | quota | ports | cleanup | frozen | coturn) : ;;
+    startup | relay | auth | lifecycle | wrong-user | wildcard | permission-limit | quota | ports | tls | dtls | rest | bandwidth | cleanup | frozen | coturn) : ;;
     *) echo "--only 未知项: $ONLY（可用：${ALL_ITEMS[*]}）" >&2; exit 2 ;;
   esac
 fi
@@ -181,16 +196,78 @@ uclient_ok() { # logfile
   grep -a -q "lost packets 0" "$1"
 }
 
+# ---------- TLS/DTLS 证书（TLS/DTLS 项与 coturn 对照共用）----------
+
+CERT_DIR="$WORK/certs"
+TLS_PORT=$((BASE + 3))
+DTLS_PORT=$((BASE + 4))
+REST_SECRET="rest-secret"
+COTURN_CERT="$CERT_DIR/cert.pem"
+COTURN_PKEY="$CERT_DIR/key.pem"
+
+# 自签 ECDSA P-256 证书：ECDSA（不是 RSA）因为 webrtc-dtls 只接受 ECDSA/Ed25519；
+# PKCS#8 因为它的 PEM 读取器读不了 SEC1/PKCS#1。
+make_cert() {
+  mkdir -p "$CERT_DIR"
+  [[ -f "$CERT_DIR/cert.pem" && -f "$CERT_DIR/key.pem" ]] && return 0
+  command -v openssl >/dev/null 2>&1 || return 1
+  openssl ecparam -name prime256v1 -genkey -noout -out "$CERT_DIR/sec1.pem" 2>/dev/null &&
+    openssl pkcs8 -topk8 -nocrypt -in "$CERT_DIR/sec1.pem" -out "$CERT_DIR/key.pem" 2>/dev/null &&
+    openssl req -new -x509 -key "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" -days 2 \
+      -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+}
+
+# RSA-2048 自签证书（TLS 可以用；DTLS 只收 ECDSA/Ed25519）。用于两条反向用例：
+#   · full + RSA + 只开 TLS → **必须能启动并中继**（B1：不能因为 DTLS 的密钥限制拒绝 TLS）；
+#   · full + RSA + 开 DTLS → 必须拒绝启动。
+make_rsa_cert() {
+  mkdir -p "$CERT_DIR"
+  [[ -f "$CERT_DIR/rsa-cert.pem" && -f "$CERT_DIR/rsa-key.pem" ]] && return 0
+  command -v openssl >/dev/null 2>&1 || return 1
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "$CERT_DIR/rsa-key.pem" 2>/dev/null &&
+    openssl req -new -x509 -key "$CERT_DIR/rsa-key.pem" -out "$CERT_DIR/rsa-cert.pem" \
+      -days 2 -subj "/CN=localhost" 2>/dev/null
+}
+
+# 二进制是否带 tls/dtls feature？用「启动 + 读错误信息」探测，不猜。
+# 返回 0 = 带（能起 TLS 监听），1 = lean。
+probe_secure_support() {
+  make_cert || return 1
+  local log="$LOG_DIR/feature-probe.log"
+  timeout 3 "$BIN" server --listen "127.0.0.1:$((BASE + 45))" --turn \
+    --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --turn-tls-listen "127.0.0.1:$((BASE + 46))" \
+    --tls-cert "$CERT_DIR/cert.pem" --tls-key "$CERT_DIR/key.pem" \
+    >"$log" 2>&1
+  ! grep -qa 'build with the .tls. feature' "$log"
+}
+
+# 这些项需要 secure 传输 → BUILD=true 时自动加 `--features full`。
+needs_secure_build() {
+  [[ ${#T2_ONLY[@]} -gt 0 ]] && return 0
+  case "$ONLY" in tls | dtls | coturn) return 0 ;; esac
+  return 1
+}
+
 # ---------- build ----------
 
 rm -f "$WORK/pids"
+if $BUILD && [[ ${#CARGO_FEATURES[@]} -eq 0 ]] && needs_secure_build; then
+  CARGO_FEATURES=(--features full)
+fi
 if $BUILD; then
-  log "building $BIN"
-  if ! (cd "$ROOT" && cargo build >"$LOG_DIR/build.log" 2>&1); then
+  log "building $BIN ${CARGO_FEATURES[*]:-（lean）}"
+  if ! (cd "$ROOT" && cargo build "${CARGO_FEATURES[@]}" >"$LOG_DIR/build.log" 2>&1); then
     log "FAIL: build (see $LOG_DIR/build.log)"
     exit 1
   fi
+  [[ " ${CARGO_FEATURES[*]:-} " == *" full "* ]] && HAVE_SECURE=true
+elif probe_secure_support; then
+  HAVE_SECURE=true
 fi
+log "secure transports (tls/dtls): $([ "$HAVE_SECURE" = true ] && echo available || echo lean-build)"
 HEALTH_PORT=$((BASE + 1))
 USERS_FILE="$WORK/users.txt"
 cat >"$USERS_FILE" <<EOF
@@ -425,6 +502,271 @@ PY
   stop_server "$name"
 }
 
+# ---------- 6b. TLS: turns: completes a relay (T2) ----------
+
+run_tls() {
+  local name=tls
+  if [[ "$HAVE_SECURE" != true ]]; then
+    skip "$name" "lean 构建没有 tls feature（用 --tls，或 cargo build --features full）"
+    return
+  fi
+  make_cert || { skip "$name" "openssl unavailable"; return; }
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+  start_server "$name" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --health-listen "127.0.0.1:$HEALTH_PORT" \
+    --turn-tls-listen "127.0.0.1:$TLS_PORT" \
+    --tls-cert "$CERT_DIR/cert.pem" --tls-key "$CERT_DIR/key.pem"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy (see $LOG_DIR/$name.log)"
+    stop_server "$name"
+    return
+  fi
+
+  # 1) A real TLS handshake (independent of the TURN stack).
+  timeout 10 openssl s_client -connect "127.0.0.1:$TLS_PORT" -servername localhost -brief \
+    </dev/null >"$LOG_DIR/$name-sclient.log" 2>&1
+  local handshake=ok
+  grep -qa "CONNECTION ESTABLISHED" "$LOG_DIR/$name-sclient.log" || handshake=failed
+
+  # 2) TURN over TLS: uclient's secure TCP mode (`-S -t`) completes the relay.
+  turnutils_uclient -S -t -u "$USER_NAME" -w "$USER_PASS" -p "$TLS_PORT" -n 5 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient.log" 2>&1
+  local relay=ok
+  uclient_ok "$LOG_DIR/$name-uclient.log" || relay=failed
+  local bytes_in bytes_out
+  bytes_in="$(metric 'rstun_turn_bytes_total{direction="in"}')"
+  bytes_out="$(metric 'rstun_turn_bytes_total{direction="out"}')"
+
+  # 3) Bad configuration: a listener without material must refuse to start.
+  # A dedicated port: the running server already holds $BASE, and a bind error
+  # would mask the configuration error this check is about.
+  "$BIN" server --listen "127.0.0.1:$((BASE + 40))" --turn --realm "$REALM" \
+    --auth-secret "$SECRET" --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --turn-tls-listen "127.0.0.1:$TLS_PORT" >"$LOG_DIR/$name-no-cert.log" 2>&1
+  local no_cert=$?
+  "$BIN" server --listen "127.0.0.1:$((BASE + 40))" --turn --realm "$REALM" \
+    --auth-secret "$SECRET" --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --turn-tls-listen "127.0.0.1:$TLS_PORT" \
+    --tls-cert "$WORK/no-such-cert.pem" --tls-key "$CERT_DIR/key.pem" \
+    >"$LOG_DIR/$name-bad-path.log" 2>&1
+  local bad_path=$?
+  local bad_ok=ok
+  { [[ $no_cert -ne 0 ]] && grep -qa "need --tls-cert and --tls-key" "$LOG_DIR/$name-no-cert.log"; } ||
+    bad_ok=failed
+  { [[ $bad_path -ne 0 ]] && grep -qa "cannot read --tls-cert" "$LOG_DIR/$name-bad-path.log"; } ||
+    bad_ok=failed
+  # A key that does not match the certificate is caught by rustls at startup
+  # (`KeyMismatch`), so the listener never serves a pair clients cannot verify.
+  if [[ ! -f "$CERT_DIR/other-key.pem" ]]; then
+    openssl ecparam -name prime256v1 -genkey -noout -out "$CERT_DIR/other-sec1.pem" 2>/dev/null &&
+      openssl pkcs8 -topk8 -nocrypt -in "$CERT_DIR/other-sec1.pem" -out "$CERT_DIR/other-key.pem" 2>/dev/null
+  fi
+  "$BIN" server --listen "127.0.0.1:$((BASE + 40))" --turn --realm "$REALM" \
+    --auth-secret "$SECRET" --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --turn-tls-listen "127.0.0.1:$TLS_PORT" \
+    --tls-cert "$CERT_DIR/cert.pem" --tls-key "$CERT_DIR/other-key.pem" \
+    >"$LOG_DIR/$name-mismatch.log" 2>&1
+  local mismatch=$?
+  { [[ $mismatch -ne 0 ]] && grep -qa "do not form a usable pair" "$LOG_DIR/$name-mismatch.log"; } ||
+    bad_ok=failed
+
+  stop_server "$name"
+
+  # 4) B1: a **full** build with an RSA certificate and **only** `--turn-tls-listen`
+  #    must start and relay. DTLS's stricter key rules (PKCS#8 + ECDSA P-256/
+  #    Ed25519) may not be applied when no DTLS listener was requested — RSA is
+  #    what Let's Encrypt hands out, so this is the common `turns:` deployment.
+  local rsa_relay=ok
+  if make_rsa_cert; then
+    start_server "$name-rsa" --listen "127.0.0.1:$BASE" \
+      --turn --realm "$REALM" --auth-secret "$SECRET" \
+      --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+      --relay-ports "$RELAY_LO-$RELAY_HI" \
+      --health-listen "127.0.0.1:$HEALTH_PORT" \
+      --turn-tls-listen "127.0.0.1:$TLS_PORT" \
+      --tls-cert "$CERT_DIR/rsa-cert.pem" --tls-key "$CERT_DIR/rsa-key.pem"
+    if wait_health "$HEALTH_PORT"; then
+      turnutils_uclient -S -t -u "$USER_NAME" -w "$USER_PASS" -p "$TLS_PORT" -n 3 -m 2 -y 127.0.0.1 \
+        >"$LOG_DIR/$name-rsa-uclient.log" 2>&1
+      uclient_ok "$LOG_DIR/$name-rsa-uclient.log" || rsa_relay=failed
+    else
+      rsa_relay=failed
+    fi
+    stop_server "$name-rsa"
+  else
+    rsa_relay=skip
+  fi
+
+  if [[ $handshake == ok && $relay == ok && "$bad_ok" == ok && "$rsa_relay" == ok &&
+    -n "$bytes_in" && "$bytes_in" -gt 0 && -n "$bytes_out" && "$bytes_out" -gt 0 ]]; then
+    ok "$name" "s_client handshake ok, uclient -S -t relay in=$bytes_in out=$bytes_out, bad configs + key mismatch refused, RSA cert with TLS-only relays"
+  else
+    fail "$name" "handshake=$handshake relay=$relay bad_config=$bad_ok rsa_tls_only=$rsa_relay bytes in=$bytes_in out=$bytes_out"
+  fi
+}
+
+# ---------- 6c. DTLS: openssl handshake + a real DTLS relay (T2) ----------
+
+run_dtls() {
+  local name=dtls
+  if [[ "$HAVE_SECURE" != true ]]; then
+    skip "$name" "lean 构建没有 dtls feature（用 --dtls，或 cargo build --features full）"
+    return
+  fi
+  make_cert || { skip "$name" "openssl unavailable"; return; }
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+  start_server "$name" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --health-listen "127.0.0.1:$HEALTH_PORT" \
+    --turn-dtls-listen "127.0.0.1:$DTLS_PORT" \
+    --tls-cert "$CERT_DIR/cert.pem" --tls-key "$CERT_DIR/key.pem"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy (see $LOG_DIR/$name.log)"
+    stop_server "$name"
+    return
+  fi
+
+  # 1) DTLS 1.2 handshake with openssl (independent implementation).
+  timeout 10 openssl s_client -dtls1_2 -connect "127.0.0.1:$DTLS_PORT" -brief \
+    </dev/null >"$LOG_DIR/$name-sclient.log" 2>&1
+  local handshake=ok
+  grep -qa "CONNECTION ESTABLISHED" "$LOG_DIR/$name-sclient.log" || handshake=failed
+
+  # 2) TURN over DTLS: uclient's secure UDP mode (`-S`) completes the relay,
+  #    which exercises Allocate + permission + ChannelData inside DTLS records.
+  turnutils_uclient -S -u "$USER_NAME" -w "$USER_PASS" -p "$DTLS_PORT" -n 5 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient.log" 2>&1
+  local relay=ok
+  uclient_ok "$LOG_DIR/$name-uclient.log" || relay=failed
+  local bytes_in bytes_out
+  bytes_in="$(metric 'rstun_turn_bytes_total{direction="in"}')"
+  bytes_out="$(metric 'rstun_turn_bytes_total{direction="out"}')"
+
+  # 3) A listener without material refuses to start.
+  "$BIN" server --listen "127.0.0.1:$((BASE + 40))" --turn --realm "$REALM" \
+    --auth-secret "$SECRET" --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --turn-dtls-listen "127.0.0.1:$DTLS_PORT" >"$LOG_DIR/$name-no-cert.log" 2>&1
+  local no_cert=$?
+  local bad_ok=ok
+  { [[ $no_cert -ne 0 ]] && grep -qa "need --tls-cert and --tls-key" "$LOG_DIR/$name-no-cert.log"; } ||
+    bad_ok=failed
+
+  # 4) An RSA key is fine for TLS but unusable for DTLS: the start must fail
+  #    loudly instead of serving a listener no client can handshake with.
+  make_rsa_cert || true
+  "$BIN" server --listen "127.0.0.1:$((BASE + 40))" --turn --realm "$REALM" \
+    --auth-secret "$SECRET" --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --turn-dtls-listen "127.0.0.1:$DTLS_PORT" \
+    --tls-cert "$CERT_DIR/rsa-cert.pem" --tls-key "$CERT_DIR/rsa-key.pem" \
+    >"$LOG_DIR/$name-rsa.log" 2>&1
+  local rsa=$?
+  { [[ $rsa -ne 0 ]] && grep -qa "ECDSA P-256 or Ed25519" "$LOG_DIR/$name-rsa.log"; } ||
+    bad_ok=failed
+
+  if [[ $handshake == ok && $relay == ok && "$bad_ok" == ok &&
+    -n "$bytes_in" && "$bytes_in" -gt 0 && -n "$bytes_out" && "$bytes_out" -gt 0 ]]; then
+    ok "$name" "s_client -dtls1_2 handshake ok, uclient -S relay in=$bytes_in out=$bytes_out, RSA key refused"
+  else
+    fail "$name" "handshake=$handshake relay=$relay bad_config=$bad_ok bytes in=$bytes_in out=$bytes_out"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 6d. REST credentials: valid / expired / wrong secret (T2) ----------
+
+run_rest() {
+  local name=rest
+  start_turn "$name" "--rest-secret" "$REST_SECRET"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  # Independent python oracle: it computes the password from the coturn rule.
+  if ! python3 "$PROBE" rest --server "127.0.0.1:$BASE" --rest-secret "$REST_SECRET" \
+    >"$LOG_DIR/$name-probe.log" 2>&1; then
+    fail "$name" "probe assertions failed (see $LOG_DIR/$name-probe.log)"
+    stop_server "$name"
+    return
+  fi
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    stop_server "$name"
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+  # uclient's own `-W` computes the same username/password: a second independent
+  # implementation of the coturn rule.
+  turnutils_uclient -W "$REST_SECRET" -u alice -p "$BASE" -n 3 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-valid.log" 2>&1
+  local valid=ok
+  uclient_ok "$LOG_DIR/$name-valid.log" || valid=failed
+  turnutils_uclient -W "wrong-secret" -u alice -p "$BASE" -n 3 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-wrong.log" 2>&1
+  local wrong=ok
+  grep -qa "Cannot complete Allocation" "$LOG_DIR/$name-wrong.log" || wrong=failed
+  # Stored long-term credentials keep working next to the REST secret.
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 3 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-stored.log" 2>&1
+  local stored=ok
+  uclient_ok "$LOG_DIR/$name-stored.log" || stored=failed
+
+  if [[ $valid == ok && $wrong == ok && $stored == ok ]]; then
+    ok "$name" "probe: valid 200 / expired 401 / wrong secret 401 / ':' label 200; uclient -W valid+wrong; stored user ok"
+  else
+    fail "$name" "uclient valid=$valid wrong=$wrong stored=$stored (see $LOG_DIR/$name-*.log)"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 6e. bandwidth: the cap drops payload but keeps the allocation ----------
+
+run_bandwidth() {
+  local name=bandwidth
+  start_turn "$name" "--turn-bandwidth" "2000"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    stop_server "$name"
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+  # 100 messages of ~100 B every 10 ms (~10 KB/s) against a 2 KB/s cap.
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 100 -m 2 -y -z 10 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient.log" 2>&1
+  local lost dropped_in
+  lost="$(grep -ao "Total lost packets [0-9]*" "$LOG_DIR/$name-uclient.log" | awk '{print $4}' | head -n 1)"
+  dropped_in="$(metric 'rstun_turn_bytes_dropped_total{direction="in"}')"
+  # The allocation must survive the throttling: a fresh small relay still works.
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 2 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-after.log" 2>&1
+  local after=ok
+  uclient_ok "$LOG_DIR/$name-after.log" || after=failed
+  local healthy=ok
+  wait_health "$HEALTH_PORT" || healthy=failed
+
+  if [[ -n "$lost" && "$lost" -gt 0 && -n "$dropped_in" && "$dropped_in" -gt 0 &&
+    "$after" == ok && "$healthy" == ok ]]; then
+    ok "$name" "lost=$lost dropped_in=${dropped_in}B, allocation survived (follow-up relay ok)"
+  else
+    fail "$name" "lost=$lost dropped_in=$dropped_in after=$after healthy=$healthy (see $LOG_DIR/$name-*.log)"
+  fi
+  stop_server "$name"
+}
+
 # ---------- 7. cleanup: TTL expiry releases the relay socket ----------
 
 run_cleanup() {
@@ -613,9 +955,17 @@ run_coturn() {
   local coturn_port=$((BASE + 30))
   local coturn_lo=$((RELAY_HI + 1))
   local coturn_hi=$((RELAY_HI + 100))
+  local coturn_tls=$((coturn_port + 2))
+  # coturn's TLS/DTLS only make sense when our binary can serve them too: on a
+  # lean build those comparison rows are skipped, the rest still runs.
+  local cert_args=()
+  if [[ "$HAVE_SECURE" == true ]] && make_cert; then
+    cert_args=(--cert "$COTURN_CERT" --pkey "$COTURN_PKEY" --tls-listening-port="$coturn_tls")
+  fi
   (cd "$WORK/coturn" && exec turnserver -n \
     --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
     --listening-port="$coturn_port" \
+    "${cert_args[@]}" \
     --min-port="$coturn_lo" --max-port="$coturn_hi" \
     --lt-cred-mech --realm="$REALM" --user="$USER_NAME:$USER_PASS" \
     --user=otheruser:otherpass \
@@ -630,7 +980,14 @@ run_coturn() {
   fi
 
   # Our server, same parameters (two users: the 441 comparison needs both).
-  start_turn_users "$name-rstun"
+  # `turns:` is enabled when a certificate could be made, so the TLS/DTLS rows
+  # below compare the same client against both servers' secure transports.
+  local rstun_tls_args=()
+  if [[ ${#cert_args[@]} -gt 0 ]]; then
+    rstun_tls_args=(--turn-tls-listen "127.0.0.1:$TLS_PORT" --turn-dtls-listen "127.0.0.1:$DTLS_PORT" \
+      --tls-cert "$CERT_DIR/cert.pem" --tls-key "$CERT_DIR/key.pem")
+  fi
+  start_turn_users "$name-rstun" "${rstun_tls_args[@]}"
   if ! wait_health "$HEALTH_PORT"; then
     fail "$name" "rstun did not become healthy"
     stop_server "$name-rstun"
@@ -674,10 +1031,36 @@ run_coturn() {
     >"$LOG_DIR/$name-rstun-uclient.log" 2>&1
   local rstun_exit=$?
 
+  # TLS/DTLS: the same `turnutils_uclient` secure modes against both servers.
+  local coturn_tls_result=SKIP rstun_tls_result=SKIP
+  local coturn_dtls_result=SKIP rstun_dtls_result=SKIP
+  if [[ ${#cert_args[@]} -gt 0 ]]; then
+    if command -v turnutils_uclient >/dev/null 2>&1; then
+      turnutils_uclient -S -t -u "$USER_NAME" -w "$USER_PASS" -p "$coturn_tls" -n 3 -m 2 -y 127.0.0.1 \
+        >"$LOG_DIR/$name-coturn-tls.log" 2>&1
+      uclient_ok "$LOG_DIR/$name-coturn-tls.log" && coturn_tls_result=ok || coturn_tls_result=failed
+      turnutils_uclient -S -t -u "$USER_NAME" -w "$USER_PASS" -p "$TLS_PORT" -n 3 -m 2 -y 127.0.0.1 \
+        >"$LOG_DIR/$name-rstun-tls.log" 2>&1
+      uclient_ok "$LOG_DIR/$name-rstun-tls.log" && rstun_tls_result=ok || rstun_tls_result=failed
+      turnutils_uclient -S -u "$USER_NAME" -w "$USER_PASS" -p "$coturn_tls" -n 3 -m 2 -y 127.0.0.1 \
+        >"$LOG_DIR/$name-coturn-dtls.log" 2>&1
+      uclient_ok "$LOG_DIR/$name-coturn-dtls.log" && coturn_dtls_result=ok || coturn_dtls_result=failed
+      turnutils_uclient -S -u "$USER_NAME" -w "$USER_PASS" -p "$DTLS_PORT" -n 3 -m 2 -y 127.0.0.1 \
+        >"$LOG_DIR/$name-rstun-dtls.log" 2>&1
+      uclient_ok "$LOG_DIR/$name-rstun-dtls.log" && rstun_dtls_result=ok || rstun_dtls_result=failed
+    fi
+    [[ "$coturn_tls_result" == ok && "$rstun_tls_result" == ok && \
+      "$coturn_dtls_result" == ok && "$rstun_dtls_result" == ok ]] || ok_all=false
+  else
+    log "  TLS/DTLS:       SKIP（lean 构建）"
+  fi
+
   log "coturn comparison (same client, same steps):"
   log "  relay probe:    $(diff -q "$LOG_DIR/$name-coturn-relay.log" "$LOG_DIR/$name-rstun-relay.log" >/dev/null && echo identical || echo DIFFERENT)"
   log "  wrong-user:     $(diff -q "$LOG_DIR/$name-coturn-wrong-user.log" "$LOG_DIR/$name-rstun-wrong-user.log" >/dev/null && echo identical || echo DIFFERENT)"
   log "  uclient:        coturn exit=$coturn_exit  rstun exit=$rstun_exit"
+  log "  TLS  (uclient -S -t): coturn=$coturn_tls_result  rstun=$rstun_tls_result"
+  log "  DTLS (uclient -S):    coturn=$coturn_dtls_result  rstun=$rstun_dtls_result"
   log "  allocation:     $(grep -a '^ok: allocate' "$LOG_DIR/$name-coturn-lifecycle.log" | sed 's/^ok: //')  (both servers)"
   log "  refresh:        $(grep -a '^ok: refresh-' "$LOG_DIR/$name-rstun-lifecycle.log" | sed 's/^ok: //' | tr '\n' ';')"
   local coturn_release rstun_release
@@ -687,14 +1070,50 @@ run_coturn() {
   log "  judgement:      rstun follows RFC 8656 §7.2 (437 for an unknown allocation);"
   log "                  coturn re-creates it (lenient, not RFC-mandated). All other steps identical."
 
+  # REST credentials: coturn cannot mix `use-auth-secret` with `--user`, so the
+  # comparison uses a second coturn instance and our server with --rest-secret.
+  local rest_result=SKIP
+  stop_server "$name-rstun"
+  local coturn_rest=$((coturn_port + 4))
+  (cd "$WORK/coturn" && exec turnserver -n \
+    --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
+    --listening-port="$coturn_rest" \
+    --min-port="$((coturn_hi + 1))" --max-port="$((coturn_hi + 100))" \
+    --use-auth-secret --static-auth-secret="$REST_SECRET" \
+    --realm="$REALM" --allow-loopback-peers --no-multicast-peers --no-cli \
+    --log-file=stdout) >"$LOG_DIR/$name-coturn-rest.log" 2>&1 &
+  local coturn_rest_pid=$!
+  PIDS+=("$coturn_rest_pid")
+  start_turn "$name-rstun-rest" "--rest-secret" "$REST_SECRET"
+  if wait_health "$HEALTH_PORT"; then
+    sleep 1
+    python3 "$PROBE" rest --server "127.0.0.1:$coturn_rest" --rest-secret "$REST_SECRET" \
+      >"$LOG_DIR/$name-coturn-rest-probe.log" 2>&1
+    local coturn_rest_probe=$?
+    python3 "$PROBE" rest --server "127.0.0.1:$BASE" --rest-secret "$REST_SECRET" \
+      >"$LOG_DIR/$name-rstun-rest-probe.log" 2>&1
+    local rstun_rest_probe=$?
+    if diff -u "$LOG_DIR/$name-coturn-rest-probe.log" "$LOG_DIR/$name-rstun-rest-probe.log" \
+      >"$LOG_DIR/$name-rest-diff.log" 2>&1 &&
+      [[ $coturn_rest_probe -eq 0 && $rstun_rest_probe -eq 0 ]]; then
+      rest_result=identical
+    else
+      rest_result=DIFFERENT
+    fi
+  fi
+  log "  REST probe:     $rest_result (valid / expired 401 / wrong secret 401 / ':' label)"
+  [[ "$rest_result" == identical ]] || ok_all=false
+  stop_server "$name-rstun-rest"
+
+  local secure_note="TLS+DTLS relays ok on both"
+  [[ "$coturn_tls_result" == SKIP ]] && secure_note="TLS/DTLS SKIP (lean build)"
   if $ok_all && [[ $coturn_exit -eq 0 && $rstun_exit -eq 0 ]]; then
-    ok "$name" "relay behaviour identical; lifecycle identical except coturn's lenient refresh"
+    ok "$name" "relay/lifecycle/441 identical; ${secure_note}; REST behaviour identical"
   else
     fail "$name" "see $LOG_DIR/$name-*.log"
   fi
-  stop_server "$name-rstun"
-  kill -TERM "$coturn_pid" 2>/dev/null
-  wait "$coturn_pid" 2>/dev/null
+  kill -TERM "$coturn_pid" "$coturn_rest_pid" 2>/dev/null
+  wait "$coturn_pid" "$coturn_rest_pid" 2>/dev/null
 }
 
 # ---------- run ----------
@@ -710,13 +1129,22 @@ run_item() {
     permission-limit) run_permission_limit ;;
     quota) run_quota ;;
     ports) run_ports ;;
+    tls) run_tls ;;
+    dtls) run_dtls ;;
+    rest) run_rest ;;
+    bandwidth) run_bandwidth ;;
     cleanup) run_cleanup ;;
     frozen) run_frozen ;;
     coturn) run_coturn ;;
   esac
 }
 
-if [[ -n "$ONLY" ]]; then
+if [[ ${#T2_ONLY[@]} -gt 0 ]]; then
+  # `--tls` / `--dtls` are shortcuts for the T2 transports (both may be given).
+  for item in "${T2_ONLY[@]}"; do
+    run_item "$item"
+  done
+elif [[ -n "$ONLY" ]]; then
   run_item "$ONLY"
 else
   for item in "${ALL_ITEMS[@]}"; do

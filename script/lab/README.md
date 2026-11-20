@@ -13,6 +13,8 @@
 | [`rstun-interop.sh`](./rstun-interop.sh) | 互操作矩阵单入口：8 个项，可单项跑也可一次跑完 |
 | [`rstun-interop-probe.py`](./rstun-interop-probe.py) | 只用 python3 标准库的协议探针（逐条 `ok:` / `FAIL:` 断言） |
 | [`rstun-abuse.sh`](./rstun-abuse.sh) | 抗滥用对照：关/开限速、单源洪水、28/40 字节反射尝试、allow/deny、TCP 洪水 |
+| [`rstun-turn.sh`](./rstun-turn.sh) | TURN 验收（17 项）：中继 / 生命周期 / 441 / 508 / 486 / **TLS / DTLS** / **REST 凭据** / **带宽配额** / 回收 / 字节冻结 / coturn 对照。默认 lean 构建（tls/dtls 项 SKIP）；`--tls`/`--dtls` 自动 `--features full` 构建 |
+| [`rstun-turn-probe.py`](./rstun-turn-probe.py) | 有状态 TURN 客户端（标准库）：`lifecycle` / `relay` / `auth` / `wrong-user` / `loopback` / `permission-limit` / `rest`，同一步骤可对 coturn 与 rstun 各跑一次再 diff |
 
 结论与原始证据摘录见 [`docs/interop-matrix.md`](../../docs/interop-matrix.md)。
 
@@ -27,6 +29,18 @@ bash script/lab/rstun-interop.sh full          # all + fuzz(600s) + ci
 ```
 
 单项：`probe` / `pion` / `webrtc-stun` / `coturn` / `stun-types` / `rfc5769` / `fuzz` / `ci`。
+
+TURN 验收（自起自停；TLS/DTLS 用 `openssl` 自签证书，REST 用探针 + `uclient -W`）：
+
+```bash
+bash script/lab/rstun-turn.sh              # 全部 17 项（lean 构建；tls/dtls 记 SKIP 并说明）
+bash script/lab/rstun-turn.sh --tls        # 只跑 TLS（自动 --features full 构建；s_client + uclient -S -t）
+bash script/lab/rstun-turn.sh --dtls       # 只跑 DTLS（自动 --features full；s_client -dtls1_2 + uclient -S）
+bash script/lab/rstun-turn.sh --only rest  # REST：有效 / 过期 401 / 错 secret 401 / label 含 ':'
+bash script/lab/rstun-turn.sh --only coturn # 与本地 turnserver 同参数对跑（含 TLS/DTLS/REST）
+#   项名：startup|relay|auth|lifecycle|wrong-user|wildcard|permission-limit|quota|ports|
+#         tls|dtls|rest|bandwidth|cleanup|frozen|coturn
+```
 
 抗滥用对照（自起自停、退出码可判定、每组一个日志）：
 
@@ -66,7 +80,8 @@ bash script/lab/rstun-abuse.sh --port 34881 --no-build
 | `rstun-abuse` | `cargo` + `python3`（只用标准库） | — |
 | `pion` | `go`（夹具在 `test/interop/pion/`，`go mod tidy` 在临时目录跑） | SKIP |
 | `webrtc-stun` | `cargo`（夹具在 `test/interop/webrtc-stun/`） | SKIP |
-| `coturn` | `turnserver` + `turnutils_stunclient`（Debian: `apt-get install coturn`） | SKIP |
+| `coturn` / `rstun-turn` | `turnserver` + `turnutils_stunclient` + `turnutils_uclient`（Debian: `apt-get install coturn`） | SKIP |
+| `rstun-turn` 的 TLS/DTLS 项 | 另需 `openssl`（自签证书、`s_client` 握手探针） | TLS/DTLS 项 SKIP |
 | `fuzz` | `cargo-fuzz` + `nightly` 工具链 | SKIP |
 
 容器（`docker`/`podman`）**不需要**：coturn 用原生进程起，不触容器边界。

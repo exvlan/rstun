@@ -23,6 +23,7 @@ printed, so `diff` between two servers is meaningful.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import os
@@ -76,6 +77,7 @@ class Probe:
         self.key = hashlib.md5(
             f"{self.user}:{self.realm}:{self.password}".encode()
         ).digest()
+        self.timeout = args.timeout
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.settimeout(args.timeout)
         self.nonce = ""
@@ -173,6 +175,13 @@ class Probe:
         frame = self.build_request(method, transaction, attributes, authenticate=authenticate)
         reply = self.exchange(frame)
         return self._parse(reply, transaction)
+
+    def reconnect(self) -> None:
+        """New source port = new TURN 5-tuple (per-case isolation)."""
+        self.socket.close()
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.settimeout(self.timeout)
+        self.nonce = ""
 
     def set_identity(self, user: str, password: str) -> None:
         """Switch credentials on the same socket (same 5-tuple)."""
@@ -726,6 +735,83 @@ def canonical_auth(probe: Probe, wait: float) -> None:
                     f"code={probe._error_code(attributes)}")
 
 
+def rest_password(secret: str, username: str) -> str:
+    """coturn `use-auth-secret`: base64(HMAC-SHA1(secret, username))."""
+    digest = hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()
+    return base64.b64encode(digest).decode()
+
+
+def canonical_rest(probe: Probe, secret: str, label: str) -> None:
+    """TURN REST API credentials: valid / expired / wrong secret / `:` label.
+
+    Independent of the server's own implementation: the password is computed
+    here from the documented coturn rule, so a shared mistake cannot hide.
+    """
+    def case(name: str, expiry_offset: int, secret_used: str, *, expect_ok: bool = True) -> tuple[bool, int | None]:
+        # Every case uses a **fresh 5-tuple**: an existing allocation must not
+        # shadow the credential check (coturn answers 437 before 401 in that
+        # shape, which would hide the thing this mode is about).
+        probe.reconnect()
+        probe.challenge()
+        username = f"{int(time.time()) + expiry_offset}:{label}"
+        probe.set_identity(username, rest_password(secret_used, username))
+        transaction = probe._transaction()
+        reply = probe.exchange(probe.allocate_frame(transaction))
+        msg_type, attributes, _ = probe._parse(reply, transaction)
+        code = probe._error_code(attributes)
+        success = msg_type & 0x0110 == 0x0100
+        if expect_ok:
+            probe.check(name, success and code is None, f"code={code}")
+        else:
+            probe.check(name, code == 401 and not success, f"code={code}")
+        return success, code
+
+    def release() -> None:
+        probe.request(
+            METHOD_REFRESH,
+            [probe._attribute(ATTR_LIFETIME, struct.pack("!I", 0))],
+            authenticate=True,
+        )
+
+    valid, _ = case("rest-valid", 600, secret)
+    if valid:
+        release()
+
+    # Expired: 401, never 438 — the nonce is fine, the username is not.
+    probe.reconnect()
+    probe.challenge()
+    username = f"{int(time.time()) - 10}:{label}"
+    probe.set_identity(username, rest_password(secret, username))
+    transaction = probe._transaction()
+    reply = probe.exchange(probe.allocate_frame(transaction))
+    msg_type, attributes, _ = probe._parse(reply, transaction)
+    code = probe._error_code(attributes)
+    probe.check(
+        "rest-expired-401",
+        code == 401 and msg_type & 0x0110 != 0x0100,
+        f"code={code}",
+    )
+
+    # Wrong secret: the derived password differs, so the MAC cannot match.
+    case("rest-wrong-secret-401", 600, "not-the-secret", expect_ok=False)
+
+    # The label is opaque and may itself contain the separator: coturn splits
+    # on the **first** `:` only, and so must we (design §9 risk row).
+    probe.reconnect()
+    probe.challenge()
+    colon_label = f"{label}:with:colons"
+    username = f"{int(time.time()) + 600}:{colon_label}"
+    probe.set_identity(username, rest_password(secret, username))
+    transaction = probe._transaction()
+    reply = probe.exchange(probe.allocate_frame(transaction))
+    msg_type, attributes, _ = probe._parse(reply, transaction)
+    code = probe._error_code(attributes)
+    success = msg_type & 0x0110 == 0x0100
+    probe.check("rest-label-with-colons", success and code is None, f"code={code}")
+    if success:
+        release()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="minimal TURN client probe")
     parser.add_argument(
@@ -738,6 +824,7 @@ def main() -> int:
             "wrong-user",
             "loopback",
             "permission-limit",
+            "rest",
         ),
     )
     parser.add_argument("--server", required=True, help="host:port of the TURN server")
@@ -755,6 +842,10 @@ def main() -> int:
         "--lenient-refresh", action="store_true",
         help="record (do not fail) Refresh-after-release, for the coturn comparison",
     )
+    parser.add_argument(
+        "--rest-secret", default="", help="TURN REST API secret (rest mode)")
+    parser.add_argument(
+        "--rest-label", default="alice", help="REST username label (rest mode)")
     parser.add_argument(
         "--wait", type=float, default=0.0,
         help="seconds to hold the nonce before using it (auth mode)",
@@ -782,6 +873,11 @@ def main() -> int:
             canonical_loopback(probe)
         elif args.mode == "permission-limit":
             canonical_permission_limit(probe)
+        elif args.mode == "rest":
+            if not args.rest_secret:
+                print("FAIL: rest mode needs --rest-secret")
+                return 1
+            canonical_rest(probe, args.rest_secret, args.rest_label)
         else:
             probe.challenge()
             probe.key = b"definitely-not-the-password"
