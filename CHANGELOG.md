@@ -58,6 +58,60 @@
   coturn 会「复活」该 allocation（宽松实现）；其余中继步骤逐行一致。
 - **无新增运行期依赖**：`cargo tree -e normal --depth 1` 仍是 9 个。
 
+### TURN T2（`turns:` / DTLS / REST 凭据 / 带宽配额）
+
+- **两种构建（feature gate）**：`default = []` → **lean**（STUN + TURN UDP/TCP + REST + 带宽，
+  9 个直接依赖、release ~3.6 MB）；`--features full`（=`tls` + `dtls`）→ 再加 `turns:`(TLS) 与
+  DTLS（13 个直接依赖、未 strip 的 release 7.9 MB、201 个唯一 crate）。
+  TLS/DTLS 的监听、材料解析、连接处理与
+  单测全部 `#[cfg(feature = …)]`；四个 flag 仍出现在 `--help`（帮助不随构建变化），lean 下给出
+  它们会**拒绝启动**并指明缺哪个 feature（`cargo build --features tls,dtls`）。`--rest-secret`
+  与 `--turn-bandwidth` 不 gate：lean 的 UDP/TCP TURN 一样能用。
+- **TLS 监听（`--turn-tls-listen` + `--tls-cert`/`--tls-key`，`tls` feature）**：在 T1 的 TCP 分帧之上套
+  TLS 1.2/1.3（`tokio-rustls`，provider 固定 ring）。证书/私钥**启动时**解析：路径不可读、
+  不配对、有监听没材料 → **启动失败**（不降级明文）；TLS 与明文不共用端口。握手 5s 超时、
+  失败计数进退出日志（`handshake_failed`），日志不含证书内容。
+- **DTLS 监听（`--turn-dtls-listen`，`dtls` feature）**：`webrtc-dtls` 0.12（纯 Rust）实现 DTLS 1.2；
+  **一个 datagram = 一个 STUN/TURN 消息或一个 `ChannelData`**（与 UDP 同构，无 4 字节对齐），
+  5 元组的客户端传输记为 `Dtls`。握手在每客户端任务里做（5s），**不阻塞 accept**；
+  私钥须 PKCS#8 + ECDSA P-256/Ed25519（上游限制，启动时明确报错）。
+- **REST 临时凭据（`--rest-secret`）**：coturn `use-auth-secret` 兼容，
+  `username=<expiry>:<label>`、`password=base64(HMAC-SHA1(secret, username))`（标准 base64）。
+  过期 → `401`（不是 438）；错 secret → `401`；**与长期凭据并存时 REST 优先**，label 可含 `:`。
+  复用 `auth` 的 HMAC 与长期 key 推导，不新增依赖。
+- **带宽配额（`--turn-bandwidth`，默认 1 MiB/s、0=不限）**：每 allocation 双向令牌桶，
+  容量 1 秒；超限丢包并计数（`rstun_turn_bytes_dropped_total{direction=in|out}`），
+  allocation 与通话不受影响。新增退出日志字段 `bytes_dropped_in/out`。
+- **依赖与体积（实测）**：full 构建里直接依赖 9 → 13（`tokio-rustls`、`rustls-pemfile`、
+  `webrtc-dtls`、`webrtc-util`；最后一个只是把上游同版本传递依赖提升为直接依赖，不新增 crate）、
+  唯一 crate 65 → 201、未 strip 的 release 二进制 **3.5 MB → 7.9 MB**
+  （LTO+strip 后的发布/镜像二进制：2.35 MB → 4.80 MB）。**默认 lean 构建不受影响**：
+  仍是 9 个直接依赖、未 strip release **3.77 MB**（+0.25 MB 来自 REST 与带宽代码）。
+  设计估计 +1.2 MB，实测更高 —— 这正是最终选择 feature gate 的原因。
+- **`cargo audit`**：`RUSTSEC-2026-0387`（`crypto-bigint 0.5.5` 常量时间时序差异，修复版本与
+  `elliptic-curve 0.13` 不兼容）进 `.cargo/audit.toml` 允许清单，附「仅 full 构建、仅
+  `--turn-dtls-listen` 可达、每次发版前复查」的说明；`cargo audit` 退出码恢复 0。另有 3 条
+  unmaintained 警告（`bincode`/`pin-utils`/`rustls-pemfile`，均在 `tls`/`dtls` 链上），不影响退出码。
+- **验收**：`script/lab/rstun-turn.sh` 扩到 **17 项**，新增 `tls` / `dtls` / `rest` / `bandwidth`
+  与 `--tls`/`--dtls` 快捷参数（会自动 `--features full` 构建；lean 二进制下 tls/dtls 记 SKIP
+  并说明，不是失败）；`coturn` 项扩展为同参数对跑 TLS（`uclient -S -t`）、
+  DTLS（`uclient -S`）与 REST（`use-auth-secret` 的独立实例 + 逐行 diff 探针）。
+  探针新增 `rest` 模式（有效 / 过期 401 / 错 secret 401 / 含 `:` 的 label），每个用例用
+  新的源端口（独立 5 元组），避免「已有 allocation」遮蔽凭据判定。
+- **默认关闭零差异**：不配 T2 开关时 TURN 行为与 T1 一致；`frozen` 项仍是 3 配置 × 17 请求
+  与 T1 基线逐字节相同（lean 与 full 两种构建都跑）。
+- **B1 修复**：DTLS 的密钥规则（PKCS#8 + ECDSA P-256/Ed25519）此前在 full 构建里**无条件**
+  应用，导致「只开 `--turn-tls-listen` + Let's Encrypt RSA 证书」被错误拒绝。现在只在该次启动
+  真的配了 `--turn-dtls-listen` 时才解析/校验 DTLS 材料（`SecureMaterial.dtls: Option<_>`）；
+  RSA 证书可以用于 `turns:`，同时开 DTLS 时仍然报错退出。lab `tls` 项新增该用例，单测
+  `full_build_accepts_an_rsa_certificate_when_dtls_is_off` 覆盖两个方向。
+- **CI 供应链审计**：Linux `test` 作业加 `cargo audit`（`rustsec/audit-check`，锁 commit SHA，
+  ignore 列表与 `.cargo/audit.toml` 同步）。
+- **发布/CI**：每个平台产出**两份**（lean `rstun-<platform>-<version>.zip`、full
+  `rstun-full-<platform>-<version>.zip`，资产 4 → 8，release 作业断言恰好 8 个）；镜像改为
+  `--features full` 构建（容器是 `turns:` 的主要用途）；CI 的 `test` 作业按
+  `--no-default-features` / `--all-features` 各跑一次 `cargo test` + `clippy`。
+
 ### 运维面（readiness / metrics / `RSTUN_*` / 优雅 drain / 部署清单）
 
 - **`--health-listen <addr>`（默认关闭）**：可选的最小 HTTP/1.1 端点（**手写，未引入

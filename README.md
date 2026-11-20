@@ -1,15 +1,17 @@
 # rstun
 
 独立 STUN/TURN 服务器：RFC 5389 Binding，加可选的 RFC 5780 NAT 行为发现，以及
-可选的 RFC 8656 UDP 中继（`--turn`，强制长期凭据）。
+可选的 RFC 8656 中继（`--turn`，强制长期凭据；UDP / TCP / `turns:`(TLS) / DTLS）。
 一个 crate、一个二进制、一个镜像，`cargo install` 就能跑，不依赖任何宿主项目。
+两种构建：**lean**（默认，STUN + TURN UDP/TCP + REST + 带宽）与 **full**（再加 `turns:` 与 DTLS）。
 
-**范围声明（先读）**：本服务只做**小规模、静态用户**的 STUN/TURN —— RFC 5389 Binding
+**范围声明（先读）**：本服务只做**小规模**的 STUN/TURN —— RFC 5389 Binding
 （+ 可选的 RFC 5780 NAT 行为发现）+ **可选的**鉴权（RFC 5389 §10 短期/长期凭据 +
-RFC 8489 §9.2 的 SHA256/USERHASH，**默认关闭**）+ **可选的 RFC 8656 UDP 中继**
-（`--turn`，**默认关闭、缺长期凭据拒绝启动**）。TURN 的 T2 范围（TLS/DTLS、REST 临时凭据、
-带宽配额、TCP allocation/RFC 6062）**不做**；需要这些能力时请用 coturn。没有租户、
-配置文件或数据库。
+RFC 8489 §9.2 的 SHA256/USERHASH，**默认关闭**）+ **可选的 RFC 8656 中继**
+（`--turn`，**默认关闭、缺长期凭据拒绝启动**）：UDP / TCP 客户端传输、`turns:`（TLS）、
+DTLS 1.2、TURN REST 临时凭据（coturn `use-auth-secret`）、每 allocation 带宽配额。
+**不做**：TCP allocation（RFC 6062）、ACME/OCSP、租户/数据库/配置文件。
+需要这些时请用 coturn。
 
 **命名**：crate 与二进制都叫 `rstun`。**绝对不能改叫 `stun`** —— Debian 的 `stun-client`
 包已经占用 `/usr/bin/stun`，同名会直接撞包/覆盖。
@@ -20,12 +22,14 @@ CLI 分两级：`rstun server [flags]` 起服务（flag 语义自首个版本起
 
 ```
 $ rstun --help
-Standalone STUN/TURN server (RFC 5389 Binding; RFC 5780 with --alt-listen; RFC 8656 UDP relay with --turn)
+Standalone STUN/TURN server (RFC 5389 Binding; RFC 5780 with --alt-listen; RFC 8656 relay over
+UDP/TCP, turns: (TLS) and DTLS with --turn)
 
 Usage: rstun <COMMAND>
 
 Commands:
-  server  Serve STUN Binding over UDP (and TCP with --tcp); TURN UDP relay with --turn
+  server  Serve STUN Binding over UDP (and TCP with --tcp); TURN relay with --turn (UDP/TCP, turns:
+          with the `tls` feature, DTLS with the `dtls` feature)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -33,7 +37,8 @@ Options:
   -V, --version  Print version
 
 $ rstun server --help
-Serve STUN Binding over UDP (and TCP with --tcp); TURN UDP relay with --turn
+Serve STUN Binding over UDP (and TCP with --tcp); TURN relay with --turn (UDP/TCP, turns: with the
+`tls` feature, DTLS with the `dtls` feature)
 
 Usage: rstun server [OPTIONS]
 
@@ -77,7 +82,7 @@ Options:
           - answer: `400 Bad Request` (RFC 5389 §15.5 makes a bad fingerprint a bad message)
           - drop:   No response at all — for deployments that do not want to answer probes with a
             broken fingerprint (still counted, see `ServerStats`)
-
+          
           [default: answer]
 
       --alternate-server <ADDR>
@@ -147,26 +152,66 @@ Options:
           long-term only: refuse PASSWORD-ALGORITHM=MD5 (401 unless the client uses SHA256). Needs
           --realm
 
+      --health-listen <ADDR>
+          serve `GET /healthz` (readiness) and `GET /metrics` (Prometheus text) on this TCP address,
+          e.g. 127.0.0.1:9100. Off by default: without it no HTTP listener, no extra task and no
+          change to the STUN paths
+
+      --health-max-connections <N>
+          cap on concurrent connections to the ops endpoint (default 64). A connection over the cap
+          gets an immediate 503 and is closed, never queued — queueing would keep the fd the flood
+          is trying to exhaust. Only meaningful with --health-listen
+
+      --drain-timeout <SECONDS>
+          how long a SIGTERM may take to drain in-flight work before exiting anyway (seconds,
+          default 5; 0 = stop immediately). The exit code stays 0
+
       --turn
-          enable the TURN (RFC 8656) UDP relay on the STUN sockets. Requires long-term credentials:
-          --realm, --auth-secret and at least one user
+          enable the TURN (RFC 8656) relay on the STUN sockets (UDP/TCP client transports;
+          turns:/DTLS need the tls/dtls build features). Requires long-term credentials: --realm,
+          --auth-secret and at least one user
 
       --relay-ports <LO-HI>
-          TURN relay port range, inclusive (default 49152-65535). Choose a range outside
-          net.ipv4.ip_local_port_range
+          TURN relay port range, inclusive (`LO-HI`, default 49152-65535). Choose a range outside
+          `net.ipv4.ip_local_port_range`
 
       --max-allocations-per-user <N>
-          cap on concurrent TURN allocations per authenticated user (default 8)
+          TURN: cap on concurrent allocations per authenticated user (default 8)
 
       --max-allocations-per-ip <N>
-          cap on concurrent TURN allocations per client IP (default 16)
+          TURN: cap on concurrent allocations per client IP (default 16)
 
       --permission-limit <N>
-          cap on TURN permissions per allocation (default 10)
+          TURN: cap on permissions per allocation (default 10)
 
       --allocation-lifetime <SECONDS>
-          TURN allocation lifetime in seconds (default 600, max 3600). Also caps whatever LIFETIME a
-          client asks for
+          TURN: allocation lifetime in seconds (default 600, max 3600). Also caps whatever LIFETIME
+          a client asks for
+
+      --turn-tls-listen <ADDR>
+          TURN over TLS (`turns:`) listen address, repeatable. Needs --tls-cert, --tls-key and a
+          build with the `tls` feature (cargo build --features tls,dtls); TLS and plaintext never
+          share a port (no ALPN sniffing)
+
+      --turn-dtls-listen <ADDR>
+          TURN over DTLS (1.2) listen address, repeatable. Needs --tls-cert, --tls-key (ECDSA P-256
+          or Ed25519: what webrtc-dtls supports) and a build with the `dtls` feature
+
+      --tls-cert <PATH>
+          PEM certificate chain for --turn-tls-listen / --turn-dtls-listen
+
+      --tls-key <PATH>
+          PEM private key for --turn-tls-listen / --turn-dtls-listen (unencrypted PKCS#8, e.g.
+          `openssl genpkey`)
+
+      --rest-secret <SECRET>
+          TURN REST API shared secret (coturn `use-auth-secret`): username = `<expiry>:<label>`,
+          password = base64(HMAC-SHA1(secret, username)). Needs --realm and --auth-secret; wins over
+          stored users
+
+      --turn-bandwidth <BYTES/S>
+          TURN: per-allocation bandwidth cap in bytes/second, each direction (default 1 MiB/s; 0 =
+          unlimited). Over the cap packets are dropped
 
   -h, --help
           Print help (see a summary with '-h')
@@ -194,7 +239,7 @@ Options:
 | `Binding Request` + `PADDING`（RFC 5780 §7.6）                                                      | 响应**带同样长度**的 `PADDING`（永远不超过请求长度），用于 MTU / 分片探测；`PADDING` 恒为最后一个属性                                                                                       |
 | `Binding Request` + `RESPONSE-PORT` + `PADDING`                                                     | `400 Bad Request`（RFC 5780 §6："the server MUST return an error response of type 400"；§7.5 `MUST NOT process` 与 §10 `are rejected` 同指这条）                                            |
 | `Binding Request` + 未知的 **comprehension-required** 属性（如 `0x0033`）                           | `420 Unknown Attribute`（`0x0111`）+ `ERROR-CODE 420` + `UNKNOWN-ATTRIBUTES`（`0x000A`，每个类型 2 字节，值长度恰为 `2×N`；不足 4 字节的由通用 TLV padding 补齐且**不计入** Length，§15.9） |
-| 其它 method 的 **request**（如 TURN `Allocate` `0x003`，且**未开** `--turn`）                                         | 该 method **自己的** `4xx` 错误响应 + `ERROR-CODE 400 Bad Request`（RFC 5389 §7.3.1）。开 `--turn` 时 TURN 方法由 TURN 状态机处理（见「[TURN](#turnudp-中继turn)」）                            |
+| 其它 method 的 **request**（如 TURN `Allocate` `0x003`，且**未开** `--turn`）                                         | 该 method **自己的** `4xx` 错误响应 + `ERROR-CODE 400 Bad Request`（RFC 5389 §7.3.1）。开 `--turn` 时 TURN 方法由 TURN 状态机处理（见「[TURN](#turn)」）                            |
 | `Binding Request` + `FINGERPRINT`（**`--check-fingerprint` 开启**）                                  | 合法 → 普通 200；CRC 不符 → `400`（`--fingerprint-action drop` 时静默丢弃并计数）；**不在末位 → 一律 `400`**。默认关闭：不开开关时 `FINGERPRINT` 照旧被忽略，字节与 `26.410.100` 一致 |
 | **任意** `Binding Request`（配置了 `--alternate-server <ip:port>`）                                  | `300 Try Alternate` + `ALTERNATE-SERVER`（`0x8023`，明文地址布局），从收到请求的 socket 回；**重定向优先于 RFC 5780**（带 `CHANGE-REQUEST`/`RESPONSE-PORT` 也回 300）；非 Binding 方法仍是 400 |
 | 内部失败（`send_to` 失败，且错误不属于客户端地址问题）                                              | `500 Server Error`（固定文案、固定 **40 字节**），`io::Error` 细节只进日志                                                                                                                  |
@@ -383,9 +428,16 @@ SOFTWARE、FINGERPRINT、ICE 簇、鉴权簇、420、`PADDING`、`RESPONSE-PORT`
 
 ### 未实现（有意）
 
-- TURN 的 **T2 范围**：TLS/DTLS 监听、REST 临时凭据、带宽配额、TCP allocation（RFC 6062）。
-  T1 已实现 UDP 中继（见「[TURN](#turnudp-中继turn)」）：`Allocate`/`Refresh`/
-  `CreatePermission`/`ChannelBind`/`ChannelData`，强制长期凭据，默认关闭。
+TURN 侧能做的都已经做了（UDP/TCP/`turns:`/DTLS 中继、REST 临时凭据、带宽配额，见
+「[TURN](#turn)」）。真正缺的是下面这几项，且都是**刻意**不做：
+
+- **TCP allocation（RFC 6062）**：`REQUESTED-TRANSPORT=6` 一律 `442`。客户端**连接**可以是
+  UDP/TCP/`turns:`/DTLS，但「中继本身走 TCP」这一半没有实现。
+- **ACME / OCSP stapling / 证书热加载**：证书与私钥是启动时读入的一次性输入，换证书要重启；
+  签发与续期交给宿主的 certbot/acme.sh 等工具。
+- **多实例共享 allocation**：状态只在进程内存里（重启清零）。多实例部署靠 LB 源地址亲和；
+  `--auth-secret` 与 `--rest-secret` 可以共享（nonce 与 REST 凭据都是无状态的），
+  但 allocation 表不共享。
 - 鉴权的**服务端状态**部分：没有用户数据库、没有按 realm 路由、没有 nonce 黑名单
   （nonce 无状态，靠 HMAC + 过期时间；要吊销就换 `--auth-secret`）。
 - **nonce 的绑定范围**：只有 `HMAC(secret, expiry|client_ip)`，**不绑源端口**、不含
@@ -697,15 +749,19 @@ recv → 名单（deny 优先 → 直接拒；allow 命中 → 跳过每源桶�
   满了回收最久未用的条目，所以**不能**用它做长期审计。
 - 不做内容 DPI，也不按协议模式封禁。
 
-## TURN（UDP 中继，`--turn`）
+<a id="turn"></a>
+
+## TURN（`--turn`：UDP / TCP / `turns:` / DTLS）
 
 > `--allocation-lifetime` 同时是**默认授予值**与**上限**：客户端不带 `LIFETIME`、或给的值小于 600 时得到 600，
 > 超过上限时得到上限（`--allocation-lifetime 2` 正是回收测试用的形状）。
 > TURN 的**成功**响应带 `SOFTWARE`，失败响应（401/437/441/486/508）不带——RFC 8656 §6.1 对失败响应是 SHOULD，
 > 这里按「与 STUN 共享 401/438 编码、保持默认关闭字节冻结」取舍。
 
-T1 范围：RFC 8656 的 **UDP 中继闭环**。TURN **默认关闭**；开启即强制长期凭据 —— 缺
-`--realm` / `--auth-secret` / 用户时**启动失败（exit 1）**，不存在「匿名开放中继」形态。
+RFC 8656 的中继闭环：UDP / TCP 客户端传输、`turns:`（TLS）、DTLS 1.2、TURN REST 临时凭据、
+每 allocation 带宽配额。TURN **默认关闭**；开启即强制长期凭据（或 `--rest-secret`）—— 缺
+`--realm` / `--auth-secret` / 用户/secret 时**启动失败（exit 1）**，不存在「匿名开放中继」形态。
+**不配 T2 的任何开关时，行为与 T1 逐字节一致**（回归脚本 `frozen` 项：3 配置 × 17 请求）。
 
 ```bash
 rstun server \
@@ -719,7 +775,7 @@ rstun server \
 
 | 项 | 行为 |
 | --- | --- |
-| 方法 | `Allocate` / `Refresh` / `CreatePermission` / `ChannelBind`；`Send`/`Data` indication；`ChannelData`（UDP 与 TCP 客户端传输，relay 本身恒为 UDP）|
+| 方法 | `Allocate` / `Refresh` / `CreatePermission` / `ChannelBind`；`Send`/`Data` indication；`ChannelData`（UDP / TCP / TLS / DTLS 客户端传输，relay 本身恒为 UDP）|
 | 鉴权 | 四个 request 方法都必须带 `MESSAGE-INTEGRITY`（长期凭据，复用 STUN 的 realm/nonce 实现）：无 MI → `401` + `REALM`/`NONCE`；nonce 过期 → `438` + 新 `NONCE`；错口令/未知用户 → `401`。**401/438 同样计入限速桶** |
 | 生命周期 | `Allocate` 默认授予 **600s**（`LIFETIME=0`/缺省都按默认）；请求值低于默认时按 RFC 8656 §7.2 取默认，高于 `--allocation-lifetime` 上限被截断；`REFRESH LIFETIME=0` 立即释放；**`Refresh` 缺 `LIFETIME` 也按默认续期**（§8.2）；permission TTL **5 分钟**、channel TTL **10 分钟**；到期由 1s 扫描任务回收 |
 | 5 元组 | `(client addr, client transport, server addr)`；**同一 transaction id** 的重传 `Allocate` 幂等返回同一 relay；**新 transaction id → `437`**；**同一 5 元组换用户 → `441 Wrong Credentials`**（不得暴露/改动他人 allocation，`LIFETIME=0` 也不删）；释放后再 `Refresh` → `437` |
@@ -727,6 +783,11 @@ rstun server \
 | 响应属性 | 成功响应带 `SOFTWARE`（RFC 8656 §14.10 SHOULD），401/438 挑战不带；`ChannelBind` 隐式创建的 permission 与 `CreatePermission` 共用同一个上限 |
 | 数据面 | `Send` 仅在 permission 覆盖 peer 时转发（否则静默丢弃）；relay 收到 peer 数据时，命中 channel → `ChannelData`，否则 → `Data` indication；`ChannelData` 不解析 STUN；**UDP 上声明长度大于实际报文的 `ChannelData` 静默丢弃**（不转发截断内容）；TCP 客户端写队列有界（64 帧，溢出丢 relayed 数据）|
 | 其它 transport | `REQUESTED-TRANSPORT=6`（TCP allocation / RFC 6062）→ `442`；`EVEN-PORT`（含 R=1 reservation token）支持；`DONT-FRAGMENT` 等未实现的可理解属性 → `420` |
+| TLS（`--turn-tls-listen`）| **仅 full 构建**（`tls` feature；lean 给出该 flag 会拒绝启动并说明）。在 TCP 分帧之上套 TLS 1.2/1.3（`tokio-rustls`，ring provider）。`--tls-cert`/`--tls-key` 在**启动时**解析：路径不可读、证书/私钥不配对、给了监听却没给材料 → **启动失败**（绝不降级明文）。握手 5s 超时、失败计数（退出日志 `handshake_failed`），日志不含证书内容。TLS 与明文**不共用端口** |
+| DTLS（`--turn-dtls-listen`）| **仅 full 构建**（`dtls` feature，含 `tls`）。DTLS 1.2（`webrtc-dtls`，纯 Rust）。**一个 datagram = 一个 STUN/TURN 消息或一个 `ChannelData`**（与 UDP 同构，无 4 字节对齐）；5 元组的 client transport 记为 `Dtls`；握手在每客户端独立任务里做（5s 超时），不阻塞 accept。私钥必须是 **PKCS#8** 且算法为 **ECDSA P-256 / Ed25519**（`webrtc-dtls` 的限制，启动时明确报错）|
+| REST 临时凭据（`--rest-secret`）| coturn `use-auth-secret` 兼容：`username = <expiry-unix>:<label>`、`password = base64(HMAC-SHA1(secret, username))`（**标准 base64**，带 `=` 填充）。过期 → `401`（不是 438：nonce 仍有效，换凭据而不是换 nonce）；HMAC 不匹配 → `401`。**与长期凭据并存时 REST 优先**（用户名能解出时间戳即走 REST，不再查用户表）；`<expiry>:<label>` 的 label 可含 `:`（按**第一个** `:` 切分，coturn 同）|
+| 带宽配额（`--turn-bandwidth`）| 每 allocation 两个令牌桶（client→peer / peer→client），容量 = 1 秒的字节数，默认 **1 MiB/s**、`0` = 不限。超限**丢该包并计数**，allocation 与通话不受影响；与端口/分配配额独立 |
+| 观测（T2 增量）| `rstun_turn_bytes_dropped_total{direction=in\|out}`（带宽丢包字节）；退出日志另有 `handshake_failed`。T2 不新增其它指标，握手失败不进 `/metrics` 以免改变标签集合 |
 | 防回环 | 拒绝：`unspecified` / `multicast` / 本进程**监听地址** / 该 allocation 自己的 relay / **loopback peer**（仅当请求到达的 socket 本身绑定在回环地址时放行，供本地开发与 `-y` 矩阵）→ `403`。`--listen 0.0.0.0` 或公网监听下回环 peer 一律拒绝（否则「peer=127.0.0.1:<监听端口>」漏检）。同一进程内**其它 allocation 的 relay 地址允许** —— `turnutils_uclient -y` / 同 NAT WebRTC 的正常路径。**已知盲区**：宿主自身公网 IP 无法在不引入接口枚举依赖的情况下判定 |
 | 回收 | allocation 过期 / `LIFETIME=0` → abort relay 读任务 → 关闭 socket → 端口归还池；测试断言过期后 `ss -lun` 在 relay 段内无监听 |
 | 观测 | `/metrics`：`rstun_turn_allocations`（gauge）、`rstun_turn_bytes_total{direction=in\|out}`、`rstun_turn_allocations_total{result=created\|expired}`、`rstun_turn_rejected_total{reason=quota\|ports\|family\|loopback}`；退出日志打印同一组数字。**未开 `--turn` 时这些指标不出现** |
@@ -739,7 +800,26 @@ rstun server \
   relay 段 `49152-65535` 重叠。生产建议显式给一个不重叠的 `--relay-ports`（或调整内核范围），
   否则内核可能先占用 relay 段里的端口，表现为偶发 `508`。
 - **多实例**：同一 `--auth-secret` 的实例互认 nonce；allocation 状态**不共享**（客户端会被
-  `401` 后的重试带到同一实例，靠 LB 一致性哈希/源地址亲和）。T1 不做 REST 临时凭据。
+  `401` 后的重试带到同一实例，靠 LB 一致性哈希/源地址亲和）。REST 临时凭据是**无状态**的：
+  同一 `--rest-secret` 的实例都能校验，适合水平扩展。
+- **`turns:`/DTLS 端口与证书**：TLS/DTLS 监听**不占** relay 端口段，也不与 `--listen` 共用端口
+  （RFC 8656 允许独立端口；共用需 ALPN/嗅探，本实现不做）。防火墙要同时放行 TLS 的 **TCP** 与
+  DTLS 的 **UDP**；常见失败是「只放了 TCP 5349，DTLS 握手超时」。证书热加载**不做**（重启生效）。
+  DTLS 私钥必须是 PKCS#8（`openssl genpkey`），证书算法 ECDSA P-256 或 Ed25519；自签证书在浏览器
+  里需要手动信任（`chrome://flags` 或导入系统信任库），否则 `turns:` 会在 ICE 阶段直接失败。
+- **REST 时钟**：`username` 里的过期时间是**服务器本地时钟**（unix 秒）。过期判定严格
+  （`now >= expiry` 即拒绝），部署前请确认 NTP：客户端与服务器的偏差会直接变成「凭据提前/延后失效」。
+  生成示例：
+
+  ```bash
+  expiry=$(( $(date +%s) + 3600 )); user="$expiry:alice"
+  pass=$(printf %s "$user" | openssl dgst -sha1 -hmac "$REST_SECRET" -binary | base64)
+  # 或在 python 里：
+  python3 -c 'import base64,hmac,hashlib,sys,time; u=f"{int(time.time())+3600}:alice"; print(u, base64.b64encode(hmac.new(sys.argv[1].encode(), u.encode(), hashlib.sha1).digest()).decode())' "$REST_SECRET"
+  ```
+- **带宽配额口径**：桶容量 = 1 秒的 `--turn-bandwidth`，所以首秒可以突发一整桶；持续速率超过
+  配额的部分才会被丢弃。低于单个报文的配额（例如 `--turn-bandwidth 100` 配 1200 字节包）会让
+  该方向**全丢** —— 需要更细的粒度请把值设到 ≥ 一个典型报文。
 - **通道号范围**：接受 `0x4000–0x7FFF`。RFC 8656 §12.1 定义到 `0x7FFE`；`0x7FFF` 是为 coturn
   兼容而放行（其解析器接受该值）。
 - **指标口径**：`rstun_turn_bytes_total` 只计 relay payload（不含 STUN / ChannelData 头），
@@ -749,44 +829,83 @@ rstun server \
   高 churn 下可能多拒绝一次 `486`，下一次扫描恢复。
 - **防回环已知盲区**：不枚举宿主接口，故「peer = 宿主自身公网 IP:端口」无法识别；
   需要该能力时应改用 coturn 或引入接口枚举（T2 评估，新增依赖需单独立项）。
-- 不支持（T2 或更晚）：TLS/DTLS、REST 临时凭据、带宽配额、TCP allocation（RFC 6062）、
-  `DONT-FRAGMENT`、`REQUESTED-ADDRESS-FAMILY`。
+- 不支持：TCP allocation（RFC 6062）、ACME/OCSP、`DONT-FRAGMENT`、
+  `REQUESTED-ADDRESS-FAMILY`、证书热加载。
+- **DTLS 已知限制**（来自 `webrtc-util` 的监听实现）：每个远端地址的会话在监听器生命周期内
+  只创建一次；一个 5s 内没完成握手的客户端，其后续重试会被丢弃到已关闭的会话里，直到进程重启。
+  这是「握手超时」的代价，写在这里免得被当成随机故障。
 
 验收：
 
 ```bash
-bash script/lab/rstun-turn.sh            # 12 项：启动失败/中继/401+438/生命周期/441/通配回环/permission 508/486/端口 508/回收/字节冻结/coturn 对照
+bash script/lab/rstun-turn.sh            # 17 项（lean 构建：tls/dtls 标 SKIP）
+                                         #   启动失败/中继/401+438/生命周期/441/通配回环/permission 508/486/端口 508/
+                                         #   TLS/DTLS/REST/带宽/回收/字节冻结/coturn 对照
+bash script/lab/rstun-turn.sh --tls      # 只跑 TLS（自动 --features full 构建；s_client 握手 + uclient -S -t 中继）
+bash script/lab/rstun-turn.sh --dtls     # 只跑 DTLS（自动 --features full；s_client -dtls1_2 + uclient -S 中继）
+bash script/lab/rstun-turn.sh --tls --dtls   # 两项都跑
 ```
+
+### 浏览器验收（`turns:`，人工）
+
+`rstun-turn.sh --tls` 覆盖协议层：`openssl s_client` 握手、`turnutils_uclient -S -t` 中继、
+与本地 coturn 同参数对跑、坏证书/坏密钥对拒绝启动。**浏览器这一层没有自动化** —— ICE 是否
+真的选中 relay candidate、对称 NAT 下能不能通，只能人工确认（本仓库当前**未声称已验证**）。
+
+步骤见 [`docs/browser-acceptance.md`](docs/browser-acceptance.md)：
+自签证书如何让 Chrome 信任（或 `--ignore-certificate-errors-spki-list`）、最小 demo 页的
+`iceServers` / `iceTransportPolicy: "relay"`、trickle ICE 的观察点（`typ relay`、
+`candidateType === "relay"`、服务端 `bytes_total` 增长）、对称 NAT 拓扑建议与常见失败。
+若动手跑过，请把日期与两端 candidate 类型补进该文档的「状态」行 —— 没跑就保持「未执行」。
 
 ## 与 coturn 的差异
 
 |      | `rstun`                                                                                                                                                                                         | coturn                                        |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| 定位 | 只做 STUN/TURN 的**最小服务**：Binding + **NAT 行为发现** + TURN UDP 中继（`--turn`，强制长期凭据） | 完整 STUN/TURN（中继）+ 鉴权 + 多租户 |
-| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）+ 鉴权（短期/长期，默认关闭）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`；RFC 8656 UDP 中继（T1：无 TLS/DTLS、无 REST 凭据、无 TCP allocation） | RFC 5389 / 5780 全量 / TURN（5766、turns 等） |
+| 定位 | 只做 STUN/TURN 的**最小服务**：Binding + **NAT 行为发现** + TURN 中继（`--turn`，强制长期凭据/REST） | 完整 STUN/TURN（中继）+ 鉴权 + 多租户 |
+| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）+ 鉴权（短期/长期，默认关闭）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`；RFC 8656 中继（UDP/TCP 客户端传输、`turns:` TLS、DTLS 1.2、REST 凭据、带宽配额；**无 TCP allocation**） | RFC 5389 / 5780 全量 / TURN（含 TCP allocation、ACME 等） |
 | 配置 | 纯命令行参数（无配置文件） | 上百行 `turnserver.conf`、数据库/鉴权后端 |
-| 鉴权 | 短期 / 长期凭据 + RFC 8489 SHA256、USERHASH；用户来自 `--auth-user` 或 `--auth-file`，**无数据库**；TURN 复用同一套长期凭据 | 长期凭据 + 数据库/Redis/文件后端，TURN 也受保护 |
+| 鉴权 | 短期 / 长期凭据 + RFC 8489 SHA256、USERHASH；用户来自 `--auth-user` 或 `--auth-file`，**无数据库**；TURN 复用同一套长期凭据，或 `--rest-secret`（可并存，REST 优先）| 长期凭据 + 数据库/Redis/文件后端，TURN 也受保护；`use-auth-secret` 与静态用户**互斥** |
 | 依赖 | 纯 Rust，无 OpenSSL/libevent | 依赖 libevent/OpenSSL + 系统配置 |
 | 部署 | 单二进制 / 一个几十 MB 的镜像 | 发行版包 / 官方镜像 + 配置卷 |
-| 用途 | 需要「公网 STUN 映射 + NAT 行为发现」，以及**小规模、静态用户**的 UDP 中继 | 需要完整 TURN（TLS/DTLS、REST 凭据、多租户）的基础设施 |
+| 用途 | 需要「公网 STUN 映射 + NAT 行为发现」，以及**小规模**的 TURN 中继（中继本身恒为 UDP） | 需要完整 TURN（TCP allocation、多租户、ACME）的基础设施 |
 
-结论：**需要 TLS/DTLS、REST 临时凭据、带宽配额或 TCP allocation 时仍然用 coturn**。
-本服务的 TURN 只覆盖 RFC 8656 的 UDP 中继最小闭环，用户清单是静态文件 / 单个 flag。
+结论：**需要 TCP allocation（RFC 6062）、ACME 自动证书或多租户数据库时仍然用 coturn**。
+本服务的 TURN 覆盖 UDP/TCP/`turns:`/DTLS 中继、REST 临时凭据与带宽配额，用户清单是
+静态文件 / 单个 flag / 一个共享 secret。
+
+TLS/DTLS/REST 的行为已与本地 coturn **同参数对跑**（`rstun-turn.sh` 的 `coturn` 项）：
+`turnutils_uclient` 的 `-S -t`（TLS）与 `-S`（DTLS）两侧都完成中继；REST 探针输出逐行一致
+（有效 / 过期 401 / 错 secret 401 / 含 `:` 的 label）。唯一有意差异：coturn 的
+`use-auth-secret` **不能**与静态用户共存，本服务允许并存且 REST 优先。
 
 ## 构建与运行
 
 本地（需要 Rust 1.95，见 `rust-toolchain.toml`）：
 
 ```bash
-cargo build --release
+cargo build --release                    # lean（默认）：STUN + TURN(UDP/TCP) + REST + 带宽
+cargo build --release --features full    # full：再加 turns:(TLS) 与 DTLS 1.2
 ./target/release/rstun server --listen 0.0.0.0:3478 --tcp
 ```
 
-安装：
+`--features tls` / `--features dtls` 是细分开关（`dtls` 会带上 `tls`，两者共用证书解析）。
+两种构建的 `--version` 相同（一个 release 一个版本号），区分靠启动日志的
+`features="lean"` / `features="tls,dtls"` 字段。
+**不带 feature 时**给 `--turn-tls-listen` / `--turn-dtls-listen` 会明确拒绝启动：
+
+```
+ERROR rstun: invalid TURN configuration --turn-tls-listen / --tls-cert / --tls-key need a build
+with the `tls` feature (cargo build --features tls,dtls)
+```
+
+安装（`cargo install` 装的是 **lean**；要 `turns:`/DTLS 请 `--features full`）：
 
 ```bash
-cargo install --path .     # 从源码树装到 ~/.cargo/bin/rstun
-cargo install rstun        # 在 crates.io 发布之后
+cargo install --path .                    # lean，从源码树
+cargo install --path . --features full    # 完整版
+cargo install rstun                       # crates.io 发布之后（lean）
+cargo install rstun --features full       # crates.io 之后（完整版）
 ```
 
 容器（context = 仓库根）：
@@ -801,7 +920,11 @@ docker stop rstun           # SIGTERM → 打印 received/answered/dropped 后�
 ```
 
 镜像细节：多阶段（`rust:1-slim` 构建 → `debian:stable-slim` 运行），非 root（uid 10001），
-`ENTRYPOINT ["rstun"]`，`EXPOSE 3478/udp 3478/tcp`，`STOPSIGNAL SIGTERM`。
+`ENTRYPOINT ["rstun"]`，`EXPOSE 3478/udp 3478/tcp 5349/tcp 5349/udp`，`STOPSIGNAL SIGTERM`。
+**镜像是 full 构建**（Dockerfile 里 `--features full`）：容器是最常见的部署形态，`turns:`/DTLS
+不该要求用户重编镜像；镜像里的二进制经 LTO + strip 后约 **4.8 MB**（lean 同参数约 2.35 MB；
+未 strip 的本地 `cargo build --release --features full` 是 7.9 MB，别拿它对比镜像）。只要 lean 时用
+Release 里的 `rstun-<platform>-<version>.zip`。
 
 镜像内的 `--version` 由**构建期** `RSTUN_BUILD_VERSION` 决定（`src/main.rs` 的 `option_env!`）。
 不传 `--build-arg` 时回落 crate 版本（`26.410.100`），所以本地 `docker build` 的行为不变：
@@ -837,8 +960,8 @@ docker run -d --name rstun --network host rstun:dev server \
 
 | 产出          | 内容                                                                                                                                 |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Release       | tag **`rstun-v<version>`** + 四端资产 `rstun-<platform>-<version>.zip`（Linux x86_64/aarch64 musl、macOS x86_64、Windows x86_64）     |
-| 镜像          | **`ghcr.io/<owner>/rstun:<version>`**（双架构 amd64+arm64；版本不含 `-` 的稳定版追加 `latest`）                                      |
+| Release       | tag **`rstun-v<version>`** + **八**个资产：四个平台（Linux x86_64/aarch64 musl、macOS x86_64、Windows x86_64）× 两种构建 —— lean `rstun-<platform>-<version>.zip`、full `rstun-full-<platform>-<version>.zip` |
+| 镜像          | **`ghcr.io/<owner>/rstun:<version>`**（双架构 amd64+arm64，**full** 构建；版本不含 `-` 的稳定版追加 `latest`）                        |
 
 - `prepare` 作业先校验 `version` 形如 `^\d+\.\d+\.\d+(-[...])?$`，且**必须等于 `Cargo.toml` 的
   `version`** —— 不一致直接失败，避免「tag 说 A、二进制说 B」。
@@ -850,6 +973,10 @@ docker run -d --name rstun --network host rstun:dev server \
   （`script/ci/rstun-smoke.sh`），native 与容器各跑一次。
 - 镜像推的就是**冒烟通过的那一份**：两个架构各自 build → 推 `:<version>-amd64` /
   `:<version>-arm64` → `docker manifest create/annotate/push` 合成 `:<version>`。
+- 每个平台**编译两次**（lean 先落盘、full 再覆盖 `target/release/rstun`），两次都自检
+  `--version`；Linux 上 full 产物还多跑一次 TLS 冒烟（自签 ECDSA 证书起 `turns:` 监听 +
+  `openssl s_client` 握手 + 另一实例的明文 Binding），`release` 作业断言资产数恰为 8，
+  少一个就拒绝发版。
 
 ## 运维面（readiness / metrics / env / 优雅退出 / 部署清单）
 
@@ -1062,19 +1189,68 @@ nft add rule inet filter input tcp dport 3478 accept   # 仅 --tcp 时需要
 
 ## 依赖面
 
-运行期依赖 **9** 个 crates.io 包，没有任何 path 依赖：
+两种构建，依赖面不同。**下面的数字都可以用标注的命令复现**（2026-11-20，Linux x86_64，
+Rust 1.95）：
+
+| 指标 | lean（默认） | full（`--features full`） | 命令 |
+| --- | --- | --- | --- |
+| 直接依赖 | **9** | **13** | `cargo tree -e normal --depth 1 [--all-features] \| tail -n +2 \| wc -l` |
+| 依赖树行数（含重复的 feature 合并） | 89 | 345 | `cargo tree -e normal [--all-features] \| wc -l` |
+| 唯一 crate 数 | 65 | 201 | `cargo tree -e normal [--all-features] --format '{p}' \| sed 's/^[│├└─ \t]*//' \| sort -u \| wc -l` |
+| release 二进制（未 strip） | **3.77 MB** | **7.93 MB** | `cargo build --release [--features full] && ls -l target/release/rstun` |
+| 镜像/发布用的二进制（LTO + strip） | **2.35 MB** | **4.80 MB** | 见 Dockerfile 的 `CARGO_PROFILE_RELEASE_{LTO,CODEGEN_UNITS,STRIP}` |
+
+> `cargo metadata --format-version 1 | jq '.packages\|length'` 也能跑（本仓 87），但它数的是
+> **Cargo.lock 里的全部包**——含 dev-dependencies 与未启用的 optional 依赖，不区 feature，
+> 所以不适合回答「这份二进制带了多少依赖」。上表按 feature 分别计。
 
 ```
+lean：
 clap  socket2  tokio  tracing  tracing-subscriber
-hmac  sha1  sha2  md-5            ← 鉴权（RFC 5389 §10 / RFC 8489 §9.2）
+hmac  sha1  sha2  md-5              ← 鉴权（RFC 5389 §10 / RFC 8489 §9.2）
+
+full（= lean + 这 4 个）：
+tokio-rustls  rustls-pemfile        ← turns:（TLS 监听；rustls 的 ring provider）
+webrtc-dtls  webrtc-util            ← DTLS 1.2（纯 Rust；util 只用来调它的 Conn/Listener）
 （dev-only: stun-types 2.0.5 —— 只用做编解码的参考实现 oracle，不进二进制）
 ```
+
+feature 定义（`Cargo.toml`）：
+
+```toml
+default = []
+tls  = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+dtls = ["tls", "dep:webrtc-dtls", "dep:webrtc-util"]   # DTLS 与 TLS 共用证书解析
+full = ["tls", "dtls"]
+```
+
+- **lean 构建里没有 TLS/DTLS 代码**（`#[cfg(feature = ...)]`），也不链接那 4 个 crate 与
+  它们带来的 ~136 个传递 crate（65 → 201）。`--turn-tls-listen` / `--turn-dtls-listen` /
+  `--tls-cert` / `--tls-key` **仍然出现在 `--help`**（帮助文本不随构建变化），但给了就
+  **拒绝启动**并说明缺哪个 feature。
+- `--rest-secret` 与 `--turn-bandwidth` **不 gate**：它们与传输无关，lean 构建的
+  UDP/TCP TURN 一样能用。
+- `webrtc-util` 是 `webrtc-dtls` 已有的同版本依赖，只是从传递依赖提升为直接依赖
+  （否则 `Conn`/`Listener` 的方法无法调用），**不新增任何 crate**。
+- `tokio-rustls` 显式关掉默认特性、只开 `ring`：`rustls` 同时编进两个 provider 时
+  `CryptoProvider::get_default()` 会在运行期 panic，而 `webrtc-dtls` 固定用 ring。
+
+### 供应链（`cargo audit`）
+
+`cargo audit` 对**两种构建**都是干净的（退出码 0，CI 的 Linux `test` 作业会跑）：唯一一条漏洞
+公告已进 `.cargo/audit.toml` 的允许清单，另有 3 条 unmaintained 警告（不影响退出码）。
+
+| 公告 | crate | 来源 | 处置 |
+| --- | --- | --- | --- |
+| `RUSTSEC-2026-0387`（常量时间实现存在时序差异）| `crypto-bigint 0.5.5` | `webrtc-dtls → p256/p384 → elliptic-curve 0.13` | **允许清单**（`.cargo/audit.toml`）：修复版本 `crypto-bigint >=0.7.6` 与 `elliptic-curve 0.13` 不兼容，只能等上游。默认 lean 构建**不含**该依赖；full 构建里只有显式启用 `--turn-dtls-listen` 才执行到该代码。每次发版前复查 |
+| `RUSTSEC-2025-0141`（unmaintained）| `bincode 1.3.3` | `webrtc-dtls` | 只用于 DTLS 内部握手状态序列化（warning） |
+| `RUSTSEC-2026-0441`（unmaintained）| `pin-utils 0.1.1` | `webrtc-dtls` 传递依赖 | 无运行期影响（warning） |
+| `RUSTSEC-2025-0134`（unmaintained）| `rustls-pemfile 2.2.0` | 本仓直接依赖（仅 `tls` feature） | 只做 PEM 解析；替代品尚不稳定（warning） |
 
 `hmac` / `sha1` / `sha2` / `md-5` 都是 **RustCrypto**，纯 Rust、无 C 依赖（不需要
 OpenSSL/libssl-dev）。引入它们的原因：鉴权要 HMAC-SHA1、HMAC-SHA256 与 MD5 三种算法，
 而「不手写密码学」是硬约束 —— 自己实现 S 盒/压缩函数只会得到一堆难测的代码。
-**底线是「不写算法」而不是「不加依赖」**：这四个 crate 加起来仍比 `ring`/`openssl` 小得多，
-且 `cargo tree -e normal --depth 1` 一眼能看完。
+**底线是「不写算法」而不是「不加依赖」**：这四个 crate 加起来仍比 `ring`/`openssl` 小得多。
 
 `stun-types` 在 `[dev-dependencies]` 里，`cargo tree -e normal` 看不到它。编解码是手写的：
 `stun-types` 缺全部 RFC 5780 属性，把运行时交给第三方库也换不来协议覆盖，只会多几层依赖。
@@ -1082,7 +1258,9 @@ OpenSSL/libssl-dev）。引入它们的原因：鉴权要 HMAC-SHA1、HMAC-SHA25
 ## 测试
 
 ```bash
-cargo test          # 198 个单测：3 crc32 + 30 protocol + 7 rfc5780 + 82 server + 27 limit + 13 auth + 8 interop + 28 ops
+cargo test                        # lean（默认）：235 个单测
+cargo test --all-features         # full（TLS/DTLS 用例 + 证书材料校验）：235 个
+# 3 crc32 + 30 protocol + 7 rfc5780 + 87 server + 27 limit + 19 auth + 8 interop + 33 ops + 20 TURN
 ```
 
 覆盖：
