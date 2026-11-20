@@ -235,8 +235,13 @@ jobs:
           plain_pid=$!
           sleep 1
 
+          # Capture first, grep second: piping a long-running openssl into
+          # `grep -q` makes grep exit on the first match, openssl take SIGPIPE,
+          # and `pipefail` fail the step even though the handshake succeeded.
           timeout 10 openssl s_client -connect "127.0.0.1:34791" -servername localhost -brief \
-            </dev/null | grep -q "CONNECTION ESTABLISHED"
+            </dev/null >"$WORK/sclient.log" 2>&1
+          grep -qa "CONNECTION ESTABLISHED" "$WORK/sclient.log" \
+            || { echo "::error::turns: handshake failed"; cat "$WORK/sclient.log"; exit 1; }
           echo "TLS handshake ok"
           bash script/ci/rstun-smoke.sh "127.0.0.1:34792" --retries 10
           echo "full build: plain Binding ok"
