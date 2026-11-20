@@ -63,7 +63,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 hmac = "0.12"
 md-5 = "0.10"
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # ---- TURN T2：`turns:`（TLS，RFC 8656 §5）与 DTLS 客户端传输（feature = tls / dtls）----
 # 全部 optional：默认构建（lean）不编译、不链接、不引入它们的传递依赖。
