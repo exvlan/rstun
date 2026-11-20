@@ -1,4 +1,4 @@
-# TURN 契约（RFC 8656 UDP 中继 T1）
+# TURN 契约（RFC 8656 中继：T1 UDP/TCP + T2 TLS/DTLS/REST/带宽）
 
 > 来源：2026-11-20 `rstun-turn-udp` 冷复核。三个阻塞项（441 / 通配监听防回环 / permission
 > 容量绕过）与两项 RFC 对齐（Refresh 缺 LIFETIME、容量超限 508）已修复。任何改动
@@ -76,6 +76,42 @@
 外部对照：`script/lab/rstun-turn.sh` 的 `wrong-user` / `lifecycle` / `relay` / `coturn` 项用同一
 探针分别对 rstun 与本地 `turnserver` 跑，输出应逐行一致（唯一允许差异：coturn 在
 `LIFETIME=0` 后会把 allocation「复活」，rstun 按 RFC 回 437）。
+
+## 5b. T2 契约（`turns:` / DTLS / REST / 带宽）
+
+| 项 | 契约 |
+| --- | --- |
+| TLS | `--turn-tls-listen` + `--tls-cert`/`--tls-key`；材料在**启动时**解析，缺失/不可读/不配对 → exit 1（**不降级明文**）；TLS 与明文**不共用端口**；握手 **5s** 超时，失败计数（退出日志 `handshake_failed`），日志不含证书内容 |
+| DTLS | `--turn-dtls-listen` + 同材料；DTLS **1.2**（`webrtc-dtls`）；**一个 datagram = 一个 STUN/TURN 消息或一个 `ChannelData`**（无 4 字节对齐）；5 元组 client transport = `ClientTransport::Dtls`；握手在每客户端任务里（5s），不阻塞 accept |
+| DTLS 私钥 | 必须 PKCS#8 + **ECDSA P-256 / Ed25519**（`webrtc-dtls` 的硬限制）；启动时明确报错，不得静默跳过 DTLS |
+| **材料校验范围** | DTLS 的密钥规则**只在该次启动真的配了 `--turn-dtls-listen` 时**才应用。只开 `--turn-tls-listen` 时 RSA 证书必须被接受（Let's Encrypt 的默认形态）；`--features tls`（无 dtls）单独构建同理。反例：同时配 DTLS 监听 + RSA → 启动失败 |
+| TLS 5 元组 | 与明文 TCP 相同（`ClientTransport::Tcp`）；区分靠监听端口 |
+| REST | `--rest-secret`；`username=<expiry>:<label>`（按**第一个** `:` 切分，label 可含 `:`）、`password=base64(HMAC-SHA1(secret, username))`（**标准 base64，带 padding**）；过期 → **401**（不是 438）；错 secret → 401；**REST 优先于用户表**（能解出时间戳即不查表）；`--rest-secret` 需要 `--realm` + `--auth-secret`，可以没有静态用户 |
+| 带宽 | `--turn-bandwidth` 字节/秒，**每方向**一个令牌桶，容量 = 1 秒，默认 1 MiB/s，`0` = 不限；超限**丢该包 + 计数**，allocation 不销毁；与端口/分配配额独立 |
+| 指标 | T2 只新增 `rstun_turn_bytes_dropped_total{direction}`；握手失败**不进 `/metrics`**（保持标签集合），只进退出日志 |
+| 默认关闭 | 不配任何 T2 开关时与 T1 逐字节一致（`frozen` 项 3 配置 × 17 请求）|
+| **构建 feature** | `default = []`（lean）／`tls`／`dtls`（含 `tls`）／`full`。TLS/DTLS 的监听、材料解析、连接处理与单测全部 `#[cfg(feature = …)]`；**四个 flag 始终定义**（`--help` 不随构建变化），lean 下给出 → 启动失败且错误含 `` `tls` ``／`` `dtls` `` feature 名与 `--features tls,dtls`。`--rest-secret` / `--turn-bandwidth` **不 gate** |
+
+### Tests Required（T2 断言点）
+
+1. `turnutils_uclient -S -t`（TLS）与 `-S`（DTLS）两侧完成中继（对 rstun 与 coturn 同参数）。
+2. `openssl s_client`（TLS）与 `-dtls1_2`（DTLS）握手成功。
+3. 有监听无材料 / 证书路径不可读 → 启动失败并给出可操作错误。
+4. REST：有效 200、过期 401、错 secret 401、label 含 `:` 200；静态用户仍可用；
+   REST 与用户表同名时 REST 优先（同名用户的表口令必须被拒）。
+5. 带宽：超过配额后 `rstun_turn_bytes_dropped_total{direction="in"}` 增长，
+   allocation 存活（随后的小流量仍能中继），`/healthz` 仍 200。
+6. `TokenBucket` 单测：满桶、恰好耗尽、空桶丢弃、连续补充、容量上限。
+7. **两种构建**：`cargo test`（lean）与 `cargo test --all-features` 都必须全绿；
+   `cargo tree -e normal --depth 1` 在 lean 下是 9、`--all-features` 下是 13。
+8. **RSA 证书 + 仅 TLS**：full 构建下 `--turn-tls-listen` + RSA 私钥必须能启动并完成 TLS 中继
+   （lab `tls` 项第 4 步；单测 `full_build_accepts_an_rsa_certificate_when_dtls_is_off`）；
+   同一份 RSA 材料再开 `--turn-dtls-listen` → 启动失败。
+9. **lean 构建拒绝 secure flag**：`--turn-tls-listen` → 错误含 `` `tls` feature ``；
+   `--turn-dtls-listen` → 错误含 `` `dtls` feature ``（`#[cfg(not(feature = …))]` 单测）。
+10. **脚本**：`rstun-turn.sh` 默认用 lean 构建，`tls`/`dtls` 项记 SKIP 并说明；
+   `--tls`/`--dtls`（或 `--only tls|dtls|coturn`）自动 `--features full` 构建；
+   `--no-build` 时探测二进制是否带 feature（读启动错误里的 feature 名，不猜）。
 
 ## 6. Wrong vs Correct
 

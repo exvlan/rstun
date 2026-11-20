@@ -57,6 +57,18 @@
 - **Base**：只测「自己客户端 + 自己服务端」的 USERHASH（共享错误约定会自证）。
 - **Bad**：`USERHASH` 取 `digest[..16]` —— 对 RFC 合规客户端全部 401，且自家测试仍绿。
 
+## 5b. TURN REST 临时凭据（`--rest-secret`）
+
+| 项 | 契约 |
+| --- | --- |
+| 用户名 | `<expiry-unix>:<label>`，按**第一个** `:` 切分；label 可含 `:`；前缀非纯数字 → 不是 REST 名，走用户表 |
+| 口令 | `base64(HMAC-SHA1(secret, username))`，**标准 base64**（`+/` 且带 `=`），不是 nonce 的 base64url |
+| key 推导 | 与长期凭据完全相同：`MD5(username:realm:password)` / `SHA256(...)` |
+| 过期 | 严格 `now >= expiry` → **401**（不是 438：nonce 仍有效，换的是凭据）|
+| 优先级 | REST 名**不查用户表**（缓存/同名用户的表口令都不接受）；非 REST 名完全保持原顺序（未知用户 → 401 先于 nonce 检查）|
+| 前置 | `--rest-secret` 需要 `--realm` + `--auth-secret`；可以没有静态用户；空 secret 启动失败 |
+| 测试向量 | `rest_password(b"turn-test-secret", "1700000000:alice") == "AHuE7M4O2lyk3ebHJ95FoVRfR5A="` |
+
 ## 6. Tests Required（断言点）
 
 1. HMAC-SHA1（RFC 2202）、HMAC-SHA256（RFC 4231）、MD5（RFC 1321）、RFC 5769 §2.4 长凭据向量。
@@ -67,6 +79,8 @@
 6. `--auth-require-sha256`：MD5 → 401、SHA256 → 200。
 7. `PADDING` + 鉴权：MI 在 PADDING 之前、PADDING 仍最后。
 8. 不配凭据：17 请求 × 4 配置与旧二进制逐字节一致（68 组）。
+9. REST：有效 200 / 过期 401 / 错 secret 401 / 无冒号名走用户表 / 同名用户 REST 优先；
+   `base64_encode` 与 RFC 4648 向量一致。
 
 ## 7. Wrong vs Correct
 
