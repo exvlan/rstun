@@ -215,3 +215,13 @@ for DTLS` 拒绝。修法：新增 `needs_dtls: bool` 参数，只在该次启�
 - `Cargo.toml` 的 `exclude` 增加 `tests/**`（原只有 `test/**`）：`cargo package --list` 不再
   包含夹具；`cargo package`（verify）仍成功 —— `include_str!` 在 `#[cfg(test)]` 内，发布构建
   不会展开。
+
+## 浏览器验收状态（R4，2026-11-20）
+
+- 自动化尝试：**环境阻断**。in-app 浏览器只把页面加载代理到 OpenCode 主机；WebRTC 的 UDP/TCP 走浏览器自身网络，
+  到不了绑在 OpenCode 主机 `127.0.0.1` 的 TURN 监听。
+- 证据：页面内 `Image` 探测 `http://127.0.0.1:9001/healthz` → `unreachable`；UDP 中继候选 0 个；
+  `turns:` 报 `onicecandidateerror code=701`；服务端 `/metrics` 的 `rstun_requests_total{transport="udp"} = 0`。
+- 记录：`docs/browser-acceptance.md` 的「尝试记录」。
+- 结论：需在「与 TURN 同主机/同网络」或「TURN 绑浏览器可达地址 + 受信证书」的环境人工执行；
+  **不得视为已验证**，也不阻塞 T2 的其余验收（TLS/DTLS/REST/带宽的第三方工具与 coturn 对照均已通过）。
