@@ -24,6 +24,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [鉴权契约](./auth.md) | 短期/长期 key 派生、USERHASH 32B、nonce 无状态、400 vs 401、响应签名与顺序 | Done |
 | [运维面契约](./ops.md) | health/metrics 端点契约、整条连接总时限、并发上限、env 优先级、drain 语义 | Done |
 | [质量门禁契约](./quality-gates.md) | 基准口径（p99 不可按 ±10% 复现）、混沌整数界 ≥3σ、缺计数硬失败、覆盖率排除、定时任务权限 | Done |
+| [分发契约](./distribution.md) | 行为表单一真源、check-docs 守什么/不守什么、deb 走 musl、SBOM 全图、deny 与 audit 双门禁 | Done |
 | [TURN 契约](./turn.md) | 5 元组/tid 幂等、441、Refresh 默认寿命、permission 容量 508、防回环（含通配与已知盲区）、有界 TCP 队列 | Done |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 
