@@ -20,9 +20,11 @@
 //! attribute this server does not implement, `400 Bad Request` for any other
 //! method (unless `--turn` handles it), ignore indications/responses, and (with
 //! `--auth-user` / `--realm`) RFC 5389 §10 / RFC 8489 §9.2 authentication.
-//! With `--turn` the RFC 8656 UDP relay is enabled ([`turn`]): Allocate /
-//! Refresh / CreatePermission / ChannelBind + Send/Data + ChannelData, always
-//! behind long-term credentials (startup fails without them). Without `--turn`
+//! With `--turn` the RFC 8656 relay is enabled ([`turn`]): Allocate / Refresh /
+//! CreatePermission / ChannelBind + Send/Data + ChannelData, always behind
+//! long-term credentials or TURN REST credentials (startup fails without them).
+//! The relay itself is always UDP; the **client** transport may be UDP, TCP,
+//! `turns:` (TLS, `tls` feature) or DTLS (`dtls` feature). Without `--turn`
 //! nothing TURN-related is parsed, allocated or emitted.
 //!
 //! With `--alt-listen` the server additionally speaks RFC 5780 (§5 behaviour
@@ -71,7 +73,8 @@ pub mod rfc5780;
 /// T1 互操作证据：RFC 5769 向量 + `stun-types` 双向（只在测试构建里编译）。
 #[cfg(test)]
 mod tests_interop;
-/// TURN（RFC 8656）UDP 中继：`--turn` 显式开启，强制长期凭据。
+/// TURN（RFC 8656）中继：`--turn` 显式开启，强制长期/REST 凭据。
+/// 中继本身恒为 UDP；客户端传输可以是 UDP / TCP / `turns:`(TLS) / DTLS。
 mod turn;
 
 use protocol::MessageClass;
@@ -112,6 +115,18 @@ const DEFAULT_DRAIN_TIMEOUT_SECONDS: u64 = 5;
 /// `Binding` method, the only one this server implements.
 const BINDING_METHOD: u16 = 0x0001;
 
+/// Which optional transports this binary was compiled with. The startup log
+/// prints it so an operator (or a bug report) can tell the lean artifact from
+/// the full one without running `cargo tree` — the `--version` string is the same
+/// in both builds on purpose (one release, one version).
+const BUILD_FEATURES: &str = if cfg!(feature = "dtls") {
+    "tls,dtls"
+} else if cfg!(feature = "tls") {
+    "tls"
+} else {
+    "lean"
+};
+
 /// Command line of `rstun`.
 ///
 /// Two levels on purpose: `rstun server [flags]` leaves room for future
@@ -125,7 +140,7 @@ const BINDING_METHOD: u16 = 0x0001;
 #[command(
     name = "rstun",
     version = BUILD_VERSION,
-    about = "Standalone STUN/TURN server (RFC 5389 Binding; RFC 5780 with --alt-listen; RFC 8656 UDP relay with --turn)",
+    about = "Standalone STUN/TURN server (RFC 5389 Binding; RFC 5780 with --alt-listen; RFC 8656 relay over UDP/TCP, turns: (TLS) and DTLS with --turn)",
     long_about = None,
     arg_required_else_help = true,
     subcommand_required = true,
@@ -137,7 +152,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Command {
-    /// Serve STUN Binding over UDP (and TCP with --tcp); TURN UDP relay with --turn
+    /// Serve STUN Binding over UDP (and TCP with --tcp); TURN relay with --turn
+    /// (UDP/TCP, turns: with the `tls` feature, DTLS with the `dtls` feature)
     Server(Args),
 }
 
@@ -294,7 +310,8 @@ struct Args {
     #[arg(long, value_name = "SECONDS")]
     drain_timeout: Option<u64>,
 
-    /// enable the TURN (RFC 8656) UDP relay on the STUN sockets. Requires
+    /// enable the TURN (RFC 8656) relay on the STUN sockets (UDP/TCP client
+    /// transports; turns:/DTLS need the tls/dtls build features). Requires
     /// long-term credentials: --realm, --auth-secret and at least one user
     #[arg(long)]
     turn: bool,
@@ -320,6 +337,38 @@ struct Args {
     /// whatever LIFETIME a client asks for
     #[arg(long, value_name = "SECONDS")]
     allocation_lifetime: Option<u64>,
+
+    /// TURN over TLS (`turns:`) listen address, repeatable. Needs --tls-cert,
+    /// --tls-key and a build with the `tls` feature (cargo build --features
+    /// tls,dtls); TLS and plaintext never share a port (no ALPN sniffing)
+    #[arg(long, value_name = "ADDR")]
+    turn_tls_listen: Vec<SocketAddr>,
+
+    /// TURN over DTLS (1.2) listen address, repeatable. Needs --tls-cert,
+    /// --tls-key (ECDSA P-256 or Ed25519: what webrtc-dtls supports) and a
+    /// build with the `dtls` feature
+    #[arg(long, value_name = "ADDR")]
+    turn_dtls_listen: Vec<SocketAddr>,
+
+    /// PEM certificate chain for --turn-tls-listen / --turn-dtls-listen
+    #[arg(long, value_name = "PATH")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key for --turn-tls-listen / --turn-dtls-listen
+    /// (unencrypted PKCS#8, e.g. `openssl genpkey`)
+    #[arg(long, value_name = "PATH")]
+    tls_key: Option<PathBuf>,
+
+    /// TURN REST API shared secret (coturn `use-auth-secret`):
+    /// username = `<expiry>:<label>`, password = base64(HMAC-SHA1(secret,
+    /// username)). Needs --realm and --auth-secret; wins over stored users
+    #[arg(long, value_name = "SECRET")]
+    rest_secret: Option<String>,
+
+    /// TURN: per-allocation bandwidth cap in bytes/second, each direction
+    /// (default 1 MiB/s; 0 = unlimited). Over the cap packets are dropped
+    #[arg(long, value_name = "BYTES/S")]
+    turn_bandwidth: Option<u64>,
 }
 
 /// What an invalid `FINGERPRINT` gets (`--fingerprint-action`).
@@ -910,6 +959,9 @@ fn build_auth(args: &Args) -> Result<Option<auth::Auth>, String> {
         None => Duration::from_secs(auth::DEFAULT_NONCE_LIFETIME),
     };
 
+    // `--rest-secret` is a long-term credential source of its own: it still
+    // needs a realm (it is part of the key derivation) and a nonce signing
+    // secret, but no stored user.
     match (&args.realm, &args.auth_secret) {
         (Some(realm), Some(secret)) => {
             if realm.is_empty() {
@@ -918,23 +970,38 @@ fn build_auth(args: &Args) -> Result<Option<auth::Auth>, String> {
             if secret.is_empty() {
                 return Err("--auth-secret must not be empty".to_string());
             }
-            if users.is_empty() {
+            if users.is_empty() && args.rest_secret.is_none() {
                 return Err(
-                    "--realm needs at least one user (--auth-user/--auth-pass or --auth-file)"
+                    "--realm needs at least one user (--auth-user/--auth-pass or --auth-file) \
+                     or --rest-secret"
                         .to_string(),
                 );
             }
-            Ok(Some(auth::Auth::long_term(
+            let mut auth = auth::Auth::long_term(
                 realm.clone(),
                 secret.as_bytes().to_vec(),
                 users,
                 nonce_lifetime,
                 args.auth_require_sha256,
-            )))
+            );
+            if let Some(rest) = &args.rest_secret {
+                if rest.is_empty() {
+                    return Err("--rest-secret must not be empty".to_string());
+                }
+                auth = auth.with_rest_secret(rest.as_bytes().to_vec());
+            }
+            Ok(Some(auth))
         }
-        (Some(_), None) => Err("--realm needs --auth-secret (it signs the NONCE)".to_string()),
+        (Some(_), None) => Err(
+            "--realm needs --auth-secret (it signs the NONCE, including the 401 that a REST \
+             client receives)"
+                .to_string(),
+        ),
         (None, Some(_)) => Err("--auth-secret only makes sense together with --realm".to_string()),
         (None, None) => {
+            if args.rest_secret.is_some() {
+                return Err("--rest-secret needs --realm and --auth-secret".to_string());
+            }
             if args.auth_require_sha256 {
                 return Err(
                     "--auth-require-sha256 needs --realm (it is a long-term concept)".to_string(),
@@ -962,16 +1029,66 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
         || args.max_allocations_per_user.is_some()
         || args.max_allocations_per_ip.is_some()
         || args.permission_limit.is_some()
-        || args.allocation_lifetime.is_some();
+        || args.allocation_lifetime.is_some()
+        || args.turn_bandwidth.is_some()
+        || !args.turn_tls_listen.is_empty()
+        || !args.turn_dtls_listen.is_empty()
+        || args.tls_cert.is_some()
+        || args.tls_key.is_some();
     if !args.turn {
         if any_turn_flag {
             return Err(
                 "--relay-ports / --max-allocations-* / --permission-limit / \
-                 --allocation-lifetime need --turn"
+                 --allocation-lifetime / --turn-bandwidth / --turn-tls-listen / \
+                 --turn-dtls-listen / --tls-cert / --tls-key need --turn"
                     .to_string(),
             );
         }
+        if args.rest_secret.is_some() {
+            return Err("--rest-secret needs --turn (TURN REST API credentials)".to_string());
+        }
         return Ok(None);
+    }
+    // Feature gate first: with `default = []` the flags still exist (help text
+    // never changes with the build), but a lean build cannot serve them. Saying
+    // so is more useful than "missing certificate" — the operator needs to know
+    // they are running the wrong artifact.
+    #[cfg(not(feature = "tls"))]
+    if !args.turn_tls_listen.is_empty() || args.tls_cert.is_some() || args.tls_key.is_some() {
+        return Err(
+            "--turn-tls-listen / --tls-cert / --tls-key need a build with the `tls` feature \
+             (cargo build --features tls,dtls)"
+                .to_string(),
+        );
+    }
+    #[cfg(not(feature = "dtls"))]
+    if !args.turn_dtls_listen.is_empty() {
+        return Err("--turn-dtls-listen needs a build with the `dtls` feature \
+             (cargo build --features tls,dtls)"
+            .to_string());
+    }
+    // TLS/DTLS are a pair of flags each: a listener without material would
+    // silently serve plaintext, which is exactly what design §3.2 forbids.
+    if !args.turn_tls_listen.is_empty() || !args.turn_dtls_listen.is_empty() {
+        match (&args.tls_cert, &args.tls_key) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {
+                return Err(
+                    "--turn-tls-listen / --turn-dtls-listen need --tls-cert and --tls-key"
+                        .to_string(),
+                );
+            }
+            (Some(_), None) => return Err("--tls-cert needs --tls-key".to_string()),
+            (None, Some(_)) => return Err("--tls-key needs --tls-cert".to_string()),
+        }
+    }
+    if args.tls_cert.is_some()
+        && args.turn_tls_listen.is_empty()
+        && args.turn_dtls_listen.is_empty()
+    {
+        return Err(
+            "--tls-cert / --tls-key need --turn-tls-listen or --turn-dtls-listen".to_string(),
+        );
     }
     let Some(auth) = auth else {
         return Err(
@@ -1002,6 +1119,9 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
     }
     if let Some(seconds) = args.allocation_lifetime {
         config.lifetime = Duration::from_secs(seconds);
+    }
+    if let Some(bandwidth) = args.turn_bandwidth {
+        config.bandwidth = bandwidth;
     }
     config.validate()?;
     Ok(Some(config))
@@ -1119,6 +1239,29 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
         // `OnceLock` only accepts the first value; startup is the only writer.
         stats.set_turn(turn.clone());
     }
+    // TLS/DTLS material is read **before** anything is served: a bad path or an
+    // unusable pair must never degrade into "plaintext on the turns port".
+    // Absent in a lean build (`default = []`): `build_turn` already refused the
+    // flags there, so there is nothing to read.
+    #[cfg(feature = "tls")]
+    let secure = if args.turn_tls_listen.is_empty() && args.turn_dtls_listen.is_empty() {
+        None
+    } else {
+        let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) else {
+            // `build_turn` already refused this; keep the invariant local.
+            tracing::error!(
+                "rstun: --turn-tls-listen / --turn-dtls-listen need --tls-cert and --tls-key"
+            );
+            return ExitCode::FAILURE;
+        };
+        match load_secure_material(cert, key, !args.turn_dtls_listen.is_empty()) {
+            Ok(material) => Some(material),
+            Err(message) => {
+                tracing::error!(%message, "rstun: invalid TLS configuration");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     // Every listener shares one view of the bound sockets: that is what makes
     // `CHANGE-REQUEST` able to answer from a different one.
     let context = Arc::new(ServerContext {
@@ -1146,6 +1289,83 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
         },
     };
 
+    // `turns:` listeners are bound up front with the same "all or nothing" rule
+    // as the STUN sockets: a port already taken is a refused start, not a
+    // server that silently has one transport less than announced.
+    #[cfg(feature = "tls")]
+    let mut tls_listeners = Vec::new();
+    #[cfg(feature = "tls")]
+    if let Some(material) = &secure {
+        for address in &args.turn_tls_listen {
+            match tcp_listener(*address) {
+                Ok(listener) => tls_listeners.push((*address, listener, material.acceptor.clone())),
+                Err(error) => {
+                    tracing::error!(%address, %error, "rstun: failed to bind --turn-tls-listen");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    #[cfg(feature = "tls")]
+    for (local, listener, acceptor) in tls_listeners {
+        let (task, health) = spawn_listener(
+            format!("tls {local}"),
+            serve_turn_tls(
+                listener,
+                acceptor,
+                context.clone(),
+                software.clone(),
+                stats.clone(),
+            ),
+        );
+        tasks.push(task);
+        listeners.push(health);
+    }
+    // DTLS: the parent UDP listener is bound here; the handshake happens per
+    // client in its own task (see `serve_turn_dtls`). The accept filter keeps a
+    // non-DTLS datagram from allocating a session at all.
+    #[cfg(feature = "dtls")]
+    if !args.turn_dtls_listen.is_empty()
+        && let Some(material) = &secure
+    {
+        // `load_secure_material(…, needs_dtls = !turn_dtls_listen.is_empty())`
+        // guarantees this; failing loudly beats serving a listener every client
+        // would fail to handshake with.
+        let Some(dtls_config) = material.dtls.clone() else {
+            tracing::error!("rstun: DTLS listener without DTLS material (internal bug)");
+            return ExitCode::FAILURE;
+        };
+        for address in &args.turn_dtls_listen {
+            let mut config = webrtc_util::conn::conn_udp_listener::ListenConfig {
+                accept_filter: Some(Box::new(|packet: &[u8]| {
+                    // ContentType::Handshake == 22 (RFC 6347 §4.1); a record
+                    // header is 13 bytes. Anything else is not a handshake.
+                    let looks_like_handshake = packet.len() >= 13 && packet[0] == 22;
+                    Box::pin(async move { looks_like_handshake })
+                })),
+                ..Default::default()
+            };
+            let listener = match config.listen(*address).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    tracing::error!(%address, %error, "rstun: failed to bind --turn-dtls-listen");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let (task, health) = spawn_listener(
+                format!("dtls {address}"),
+                serve_turn_dtls(
+                    listener,
+                    dtls_config.clone(),
+                    context.clone(),
+                    software.clone(),
+                    stats.clone(),
+                ),
+            );
+            tasks.push(task);
+            listeners.push(health);
+        }
+    }
     for (local, socket) in udp {
         let (task, health) = spawn_listener(
             format!("udp {local}"),
@@ -1240,11 +1460,32 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
             max_allocations_per_ip = config.max_allocations_per_ip,
             permission_limit = config.permission_limit,
             lifetime_seconds = config.lifetime.as_secs(),
-            "rstun: TURN UDP relay enabled (long-term credentials required)"
+            bandwidth = config.bandwidth,
+            "rstun: TURN relay enabled (long-term credentials required)"
         );
+        #[cfg(feature = "tls")]
+        if !args.turn_tls_listen.is_empty() {
+            tracing::info!(
+                listeners = ?args.turn_tls_listen,
+                "rstun: TURN over TLS enabled (turns:)"
+            );
+        }
+        #[cfg(feature = "dtls")]
+        if !args.turn_dtls_listen.is_empty() {
+            tracing::info!(
+                listeners = ?args.turn_dtls_listen,
+                "rstun: TURN over DTLS enabled"
+            );
+        }
+        if let Some(auth) = &context.auth
+            && auth.has_rest_secret()
+        {
+            tracing::info!("rstun: TURN REST API credentials enabled (--rest-secret)");
+        }
     }
     tracing::info!(
         software = %software,
+        features = BUILD_FEATURES,
         listeners = listener_count,
         "rstun: started, Ctrl-C to stop"
     );
@@ -1342,6 +1583,9 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
             rejected_ports = counts.rejected_ports,
             rejected_family = counts.rejected_family,
             rejected_loopback = counts.rejected_loopback,
+            bytes_dropped_in = counts.bytes_dropped_in,
+            bytes_dropped_out = counts.bytes_dropped_out,
+            handshake_failed = counts.handshake_failed,
             "rstun: TURN counters"
         );
     }
@@ -2149,10 +2393,16 @@ async fn respond_to_datagram(
 ) {
     // TURN 先于 STUN：`--turn` 关闭时 `handle` 不会被调用（`None`），字节与
     // 26.410.100 一致。开启后 ChannelData / TURN method 在此分流，Binding 仍走原路。
-    let decision = match stats
-        .turn()
-        .and_then(|turn| turn.handle(datagram, peer, local, Transport::Udp, context, None))
-    {
+    let decision = match stats.turn().and_then(|turn| {
+        turn.handle(
+            datagram,
+            peer,
+            local,
+            turn::ClientTransport::Udp,
+            context,
+            None,
+        )
+    }) {
         Some(decision) => decision,
         None => decide_guarded(
             datagram,
@@ -2491,16 +2741,47 @@ async fn serve_tcp_turn(
     _inflight: Option<limit::Permit>,
 ) -> std::io::Result<()> {
     let local = stream.local_addr()?;
+    serve_turn_stream(
+        stream,
+        peer,
+        local,
+        turn::ClientTransport::Tcp,
+        context,
+        turn,
+        software,
+        stats,
+        _inflight,
+    )
+    .await
+}
+
+/// One TURN-capable connection over **any byte stream**: plain TCP or TLS
+/// (`turns:`, design §3.2/§4). The framing is identical, so the only thing the
+/// caller chooses is the 5-tuple's client transport.
+#[allow(clippy::too_many_arguments)]
+async fn serve_turn_stream<S>(
+    stream: S,
+    peer: SocketAddr,
+    local: SocketAddr,
+    transport: turn::ClientTransport,
+    context: Arc<ServerContext>,
+    turn: Arc<turn::Turn>,
+    software: &str,
+    stats: &ServerStats,
+    _inflight: Option<limit::Permit>,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
     let mut drain = stats.subscribe_drain();
     if stats.is_draining() {
         return Ok(());
     }
-    let (mut reader, writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
     // Bounded on purpose (see `turn::TCP_SINK_CAPACITY`): an authenticated
     // client that stops reading must not grow an unbounded server-side queue.
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(turn::TCP_SINK_CAPACITY);
     let writer_task = tokio::spawn(async move {
-        let mut writer = writer;
         while let Some(bytes) = receiver.recv().await {
             if writer.write_all(&bytes).await.is_err() {
                 break;
@@ -2508,10 +2789,11 @@ async fn serve_tcp_turn(
         }
         let _ = writer.shutdown().await;
     });
-    let result = tcp_turn_loop(
+    let result = stream_turn_loop(
         &mut reader,
         peer,
         local,
+        transport,
         &context,
         &turn,
         software,
@@ -2520,24 +2802,28 @@ async fn serve_tcp_turn(
         &mut drain,
     )
     .await;
-    turn.release_connection(peer, local);
+    turn.release_connection(peer, local, transport);
     drop(sender);
     writer_task.abort();
     result
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn tcp_turn_loop(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
+async fn stream_turn_loop<R>(
+    reader: &mut R,
     peer: SocketAddr,
     local: SocketAddr,
+    transport: turn::ClientTransport,
     context: &ServerContext,
     turn: &turn::Turn,
     software: &str,
     stats: &ServerStats,
     sender: &tokio::sync::mpsc::Sender<Vec<u8>>,
     drain: &mut tokio::sync::watch::Receiver<bool>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
     loop {
         let mut prefix = [0_u8; 4];
         let read = tokio::select! {
@@ -2567,14 +2853,7 @@ async fn tcp_turn_loop(
                     return Ok(());
                 }
             }
-            turn.handle_channel_data(
-                channel,
-                &data,
-                peer,
-                local,
-                turn::ClientTransport::Tcp,
-                context,
-            );
+            turn.handle_channel_data(channel, &data, peer, local, transport, context);
             stats.count_ignored(Transport::Tcp);
             continue;
         }
@@ -2612,8 +2891,7 @@ async fn tcp_turn_loop(
         }
 
         let in_flight = stats.enter();
-        let decision = match turn.handle(&frame, peer, local, Transport::Tcp, context, Some(sender))
-        {
+        let decision = match turn.handle(&frame, peer, local, transport, context, Some(sender)) {
             Some(decision) => decision,
             None => decide_guarded(
                 &frame,
@@ -2662,6 +2940,497 @@ async fn tcp_turn_loop(
         }
         drop(in_flight);
     }
+}
+
+// ---------------------------------------------------------------------------
+// TURN over TLS / DTLS (T2; behind the `tls` / `dtls` features)
+// ---------------------------------------------------------------------------
+//
+// `default = []`: the lean build has none of the code below, none of the four
+// crates and none of their transitive dependencies. `--features full` (or
+// `tls` / `dtls`) compiles it in; the flags themselves are defined either way
+// so `--help` never changes with the build.
+
+/// One TLS/DTLS handshake budget. Without a bound a silent peer could hold a
+/// connection slot (and, for DTLS, a session in the listener's table) forever.
+/// TLS: rustls has no handshake deadline of its own; DTLS: `DTLSConn::new` is
+/// wrapped in this timeout inside a per-client task, so a stuck handshake can
+/// never block `accept()`.
+#[cfg(feature = "tls")]
+const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Server-side TLS + DTLS material, parsed **once** at startup so a bad path or
+/// an unusable key pair is a refused start rather than a silent plaintext
+/// fallback (design §3.2 / §9).
+///
+/// `dtls` is `Some` only when the `dtls` feature is on **and** a
+/// `--turn-dtls-listen` address was given. The DTLS side has stricter rules
+/// (PKCS#8, ECDSA P-256/Ed25519) than TLS, so validating it unconditionally
+/// would refuse a perfectly good `turns:`-only deployment that happens to use an
+/// RSA certificate — which is the normal Let's Encrypt shape.
+#[cfg(feature = "tls")]
+struct SecureMaterial {
+    acceptor: tokio_rustls::TlsAcceptor,
+    #[cfg(feature = "dtls")]
+    dtls: Option<webrtc_dtls::config::Config>,
+}
+
+/// Load `--tls-cert` / `--tls-key` into the stacks this start actually serves.
+///
+/// `needs_dtls` must be `true` only when a `--turn-dtls-listen` address was
+/// given: the DTLS side has two extra constraints that `webrtc-dtls` enforces
+/// (the private key must be unencrypted **PKCS#8**, and its algorithm must be
+/// ECDSA P-256 or Ed25519), and applying them to a TLS-only start would reject
+/// every RSA certificate for nothing.
+#[cfg(feature = "tls")]
+fn load_secure_material(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    needs_dtls: bool,
+) -> Result<SecureMaterial, String> {
+    // A `tls`-only build has no DTLS path at all; `build_turn` already refused
+    // `--turn-dtls-listen` there, so the flag is simply not consulted.
+    #[cfg(not(feature = "dtls"))]
+    let _ = needs_dtls;
+
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|error| format!("cannot read --tls-cert {}: {error}", cert_path.display()))?;
+    let certs: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut &cert_pem[..])
+            .collect::<Result<_, _>>()
+            .map_err(|error| {
+                format!(
+                    "--tls-cert {} is not valid PEM: {error}",
+                    cert_path.display()
+                )
+            })?;
+    if certs.is_empty() {
+        return Err(format!(
+            "--tls-cert {} contains no CERTIFICATE block",
+            cert_path.display()
+        ));
+    }
+
+    let key_pem = std::fs::read(key_path)
+        .map_err(|error| format!("cannot read --tls-key {}: {error}", key_path.display()))?;
+    let key = rustls_pemfile::private_key(&mut &key_pem[..])
+        .map_err(|error| format!("--tls-key {} is not valid PEM: {error}", key_path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "--tls-key {} contains no private key block",
+                key_path.display()
+            )
+        })?;
+
+    let tls_config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), key.clone_key())
+        .map_err(|error| {
+            format!(
+                "--tls-cert {} / --tls-key {} do not form a usable pair: {error}",
+                cert_path.display(),
+                key_path.display()
+            )
+        })?;
+
+    // DTLS needs the private key as PKCS#8 DER and only signs with ECDSA P-256
+    // or Ed25519. Both are `webrtc-dtls` limits, so they are checked here —
+    // at startup, where the operator can fix them (design §9). Skipped entirely
+    // when no DTLS listener was requested: TLS itself accepts RSA.
+    #[cfg(feature = "dtls")]
+    let dtls = if !needs_dtls {
+        None
+    } else {
+        use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+
+        let pkcs8 = match &key {
+            PrivateKeyDer::Pkcs8(pkcs8) => pkcs8.secret_pkcs8_der().to_vec(),
+            _ => {
+                return Err(format!(
+                    "--tls-key {} must be an unencrypted PKCS#8 private key \
+                     (openssl genpkey -algorithm EC ...): the DTLS stack cannot read \
+                     PKCS#1/SEC1 keys",
+                    key_path.display()
+                ));
+            }
+        };
+        let certificate = webrtc_dtls::crypto::Certificate::from_pem(&dtls_pem(&pkcs8, &certs))
+            .map_err(|error| {
+                format!(
+                    "--tls-cert {} / --tls-key {} are not usable for DTLS: {error} \
+                     (DTLS needs an ECDSA P-256 or Ed25519 key)",
+                    cert_path.display(),
+                    key_path.display()
+                )
+            })?;
+        // `webrtc-dtls` validates the key algorithm when a *client* arrives, not
+        // when the listener is built: an RSA key would look like "DTLS never
+        // connects". Refuse the start instead (design §9: no silent degradation).
+        match certificate.private_key.kind {
+            webrtc_dtls::crypto::CryptoPrivateKeyKind::Ecdsa256(_)
+            | webrtc_dtls::crypto::CryptoPrivateKeyKind::Ed25519(_) => {}
+            _ => {
+                return Err(format!(
+                    "--tls-key {} cannot be used for DTLS: webrtc-dtls signs with ECDSA P-256 \
+                     or Ed25519 only (TLS itself accepts this key, DTLS does not)",
+                    key_path.display()
+                ));
+            }
+        }
+        Some(webrtc_dtls::config::Config {
+            certificates: vec![certificate],
+            ..Default::default()
+        })
+    };
+
+    Ok(SecureMaterial {
+        acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)),
+        #[cfg(feature = "dtls")]
+        dtls,
+    })
+}
+
+/// `webrtc-dtls` reads a PEM bundle whose **first** block is tagged
+/// `PRIVATE_KEY`, followed by `CERTIFICATE` blocks. Standard PEM tools write
+/// `PRIVATE KEY`, so the DER we already parsed is re-wrapped here instead of
+/// asking operators for a second, non-standard file.
+#[cfg(feature = "dtls")]
+fn dtls_pem(
+    private_key: &[u8],
+    certs: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+) -> String {
+    fn block(out: &mut String, tag: &str, der: &[u8]) {
+        out.push_str("-----BEGIN ");
+        out.push_str(tag);
+        out.push_str("-----\n");
+        let encoded = auth::base64_encode(der);
+        for line in encoded.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+            out.push('\n');
+        }
+        out.push_str("-----END ");
+        out.push_str(tag);
+        out.push_str("-----\n");
+    }
+
+    let mut pem = String::new();
+    block(&mut pem, "PRIVATE_KEY", private_key);
+    for cert in certs {
+        block(&mut pem, "CERTIFICATE", cert.as_ref());
+    }
+    pem
+}
+
+/// Accept `turns:` connections: TLS handshake (5 s budget), then the same
+/// TURN-over-stream framing as plaintext TCP.
+#[cfg(feature = "tls")]
+async fn serve_turn_tls(
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    context: Arc<ServerContext>,
+    software: Arc<str>,
+    stats: Arc<ServerStats>,
+) -> std::io::Result<()> {
+    let local = listener.local_addr()?;
+    let Some(turn) = stats.turn().cloned() else {
+        return Ok(());
+    };
+    tracing::info!(%local, "rstun: TURN TLS listener ready");
+    let mut drain = stats.subscribe_drain();
+    if stats.is_draining() {
+        return Ok(());
+    }
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = drain.changed() => break,
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                stats.count_socket_error(Transport::Tcp);
+                tracing::warn!(%local, %error, "rstun: TURN TLS accept failed");
+                tokio::time::sleep(RECV_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
+        let permit = match context.acquire_inflight() {
+            None => None,
+            Some(Ok(permit)) => Some(permit),
+            Some(Err(refusal)) => {
+                stats.count_dropped(Transport::Tcp);
+                tracing::debug!(
+                    %local,
+                    %peer,
+                    reason = refusal.reason(),
+                    counter = refusal.counter(),
+                    "rstun: TURN TLS connection refused by abuse guard"
+                );
+                drop(stream);
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let context = context.clone();
+        let software = software.clone();
+        let stats = stats.clone();
+        let turn = turn.clone();
+        let in_flight = stats.enter();
+        tokio::spawn(async move {
+            match tokio::time::timeout(SECURE_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => {
+                    if let Err(error) = serve_turn_stream(
+                        tls,
+                        peer,
+                        local,
+                        turn::ClientTransport::Tcp,
+                        context,
+                        turn,
+                        &software,
+                        &stats,
+                        permit,
+                    )
+                    .await
+                    {
+                        tracing::debug!(%peer, %error, "rstun: TURN TLS connection closed");
+                    }
+                }
+                Ok(Err(error)) => {
+                    // Never log key material — the error is rustls' own text.
+                    if let Some(turn) = stats.turn() {
+                        turn.count_handshake_failure();
+                    }
+                    tracing::debug!(%peer, %error, "rstun: TURN TLS handshake failed");
+                }
+                Err(_elapsed) => {
+                    if let Some(turn) = stats.turn() {
+                        turn.count_handshake_failure();
+                    }
+                    tracing::debug!(%peer, "rstun: TURN TLS handshake timed out");
+                }
+            }
+            drop(in_flight);
+        });
+    }
+    tracing::info!(%local, "rstun: TURN TLS listener stopped (draining)");
+    Ok(())
+}
+
+/// Accept DTLS clients on one UDP socket.
+///
+/// The handshake happens **here**, in a per-client task with its own 5 s
+/// budget: `webrtc-dtls`'s own `listen()` performs it inside `accept()`, which
+/// would let one silent peer block every other client (design §9). The parent
+/// listener only creates a session per remote that sends a DTLS handshake
+/// record, so a stray datagram does not allocate anything.
+#[cfg(feature = "dtls")]
+async fn serve_turn_dtls<L>(
+    listener: L,
+    config: webrtc_dtls::config::Config,
+    context: Arc<ServerContext>,
+    software: Arc<str>,
+    stats: Arc<ServerStats>,
+) -> std::io::Result<()>
+where
+    L: webrtc_util::conn::Listener + Send + Sync + 'static,
+{
+    let local = listener
+        .addr()
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let Some(turn) = stats.turn().cloned() else {
+        return Ok(());
+    };
+    tracing::info!(%local, "rstun: TURN DTLS listener ready");
+    let mut drain = stats.subscribe_drain();
+    if stats.is_draining() {
+        return Ok(());
+    }
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = drain.changed() => break,
+            accepted = listener.accept() => accepted,
+        };
+        let (conn, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::warn!(%local, %error, "rstun: TURN DTLS accept failed");
+                tokio::time::sleep(RECV_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
+        let permit = match context.acquire_inflight() {
+            None => None,
+            Some(Ok(permit)) => Some(permit),
+            Some(Err(refusal)) => {
+                stats.count_dropped(Transport::Udp);
+                tracing::debug!(
+                    %local,
+                    %peer,
+                    reason = refusal.reason(),
+                    counter = refusal.counter(),
+                    "rstun: TURN DTLS connection refused by abuse guard"
+                );
+                let _ = conn.close().await;
+                continue;
+            }
+        };
+        let config = config.clone();
+        let context = context.clone();
+        let software = software.clone();
+        let stats = stats.clone();
+        let turn = turn.clone();
+        let in_flight = stats.enter();
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                SECURE_HANDSHAKE_TIMEOUT,
+                webrtc_dtls::conn::DTLSConn::new(conn, config, false, None),
+            )
+            .await
+            {
+                Ok(Ok(dtls)) => {
+                    serve_turn_dtls_connection(
+                        Arc::new(dtls),
+                        peer,
+                        local,
+                        context,
+                        turn,
+                        software,
+                        stats,
+                        permit,
+                    )
+                    .await;
+                }
+                Ok(Err(error)) => {
+                    turn.count_handshake_failure();
+                    tracing::debug!(%peer, %error, "rstun: TURN DTLS handshake failed");
+                }
+                Err(_elapsed) => {
+                    turn.count_handshake_failure();
+                    tracing::debug!(%peer, "rstun: TURN DTLS handshake timed out");
+                }
+            }
+            drop(in_flight);
+        });
+    }
+    tracing::info!(%local, "rstun: TURN DTLS listener stopped (draining)");
+    Ok(())
+}
+
+/// One DTLS "connection": a per-5-tuple transport whose datagrams each carry
+/// exactly one STUN/TURN message or one `ChannelData` (design §3.1).
+///
+/// The read side and the write side share the `webrtc-util` `Conn`; the writer
+/// runs in its own task because the relay reader must not borrow the request
+/// loop.
+#[cfg(feature = "dtls")]
+#[allow(clippy::too_many_arguments)]
+async fn serve_turn_dtls_connection(
+    conn: Arc<dyn webrtc_util::conn::Conn + Send + Sync>,
+    peer: SocketAddr,
+    local: SocketAddr,
+    context: Arc<ServerContext>,
+    turn: Arc<turn::Turn>,
+    software: Arc<str>,
+    stats: Arc<ServerStats>,
+    _inflight: Option<limit::Permit>,
+) {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(turn::TCP_SINK_CAPACITY);
+    let writer_conn = conn.clone();
+    let writer_task = tokio::spawn(async move {
+        while let Some(bytes) = receiver.recv().await {
+            // One `send` = one DTLS application-data record (a datagram on the
+            // wire); relayed payload keeps its message boundary.
+            if writer_conn.send(&bytes).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut drain = stats.subscribe_drain();
+    let mut buffer = vec![0_u8; UDP_RECV_BUFFER];
+    loop {
+        let received = tokio::select! {
+            biased;
+            _ = drain.changed() => break,
+            received = conn.recv(&mut buffer) => received,
+        };
+        let length = match received {
+            Ok(0) => break,
+            Ok(length) => length,
+            Err(error) => {
+                tracing::debug!(%peer, %error, "rstun: TURN DTLS recv failed");
+                break;
+            }
+        };
+        if let Some(Err(refusal)) = context.check_rates(peer) {
+            stats.count_dropped(Transport::Udp);
+            tracing::debug!(
+                %peer,
+                reason = refusal.reason(),
+                counter = refusal.counter(),
+                "rstun: TURN DTLS datagram refused by abuse guard"
+            );
+            continue;
+        }
+        stats.count_received(Transport::Udp);
+        let datagram = &buffer[..length];
+        let decision = match turn.handle(
+            datagram,
+            peer,
+            local,
+            turn::ClientTransport::Dtls,
+            &context,
+            Some(&sender),
+        ) {
+            Some(decision) => decision,
+            None => decide_guarded(
+                datagram,
+                peer,
+                local,
+                Transport::Udp,
+                &context,
+                &software,
+                &stats,
+            ),
+        };
+        match decision {
+            Ok(Decision::Respond(response)) => {
+                if !response_is_encodable(&response) {
+                    stats.count_error(Transport::Udp);
+                    tracing::error!(%peer, "rstun: response violates STUN wire invariants");
+                } else if sender.try_send(response).is_err() {
+                    // Writer backlog: drop the answer like a lost datagram.
+                    stats.count_dropped(Transport::Udp);
+                } else {
+                    stats.count_answered(Transport::Udp);
+                }
+            }
+            Ok(Decision::RespondFrom { bytes, .. }) => {
+                // UDP-only routing (RFC 5780): never reachable on DTLS.
+                if sender.try_send(bytes).is_err() {
+                    stats.count_dropped(Transport::Udp);
+                } else {
+                    stats.count_answered(Transport::Udp);
+                }
+            }
+            Ok(Decision::Ignore(reason)) => {
+                stats.count_ignored(Transport::Udp);
+                tracing::debug!(%peer, reason, "rstun: ignored message")
+            }
+            Err(error) => {
+                stats.count_error(Transport::Udp);
+                tracing::debug!(%peer, %error, "rstun: malformed DTLS STUN message");
+            }
+        }
+    }
+
+    turn.release_connection(peer, local, turn::ClientTransport::Dtls);
+    drop(sender);
+    writer_task.abort();
+    let _ = conn.close().await;
 }
 
 /// Wait for Ctrl-C, and on Unix for SIGTERM as well (systemd stops us that way).
@@ -5775,6 +6544,275 @@ mod tests {
             ..Args::default()
         };
         assert!(build_turn(&args, Some(&long)).is_err());
+    }
+
+    #[test]
+    fn turn_t2_flags_are_validated_before_serving() {
+        let long = long_term_auth(false);
+        // T2-only flags without --turn: refused (same rule as the T1 flags).
+        for args in [
+            Args {
+                turn_bandwidth: Some(0),
+                ..Args::default()
+            },
+            Args {
+                turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+                ..Args::default()
+            },
+            Args {
+                turn_dtls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+                ..Args::default()
+            },
+            Args {
+                tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
+                tls_key: Some(PathBuf::from("/tmp/key.pem")),
+                ..Args::default()
+            },
+            Args {
+                rest_secret: Some("secret".to_string()),
+                ..Args::default()
+            },
+        ] {
+            assert!(build_turn(&args, Some(&long)).is_err());
+        }
+
+        // Bandwidth is a transport-independent knob: the lean build accepts it.
+        let args = Args {
+            turn: true,
+            turn_bandwidth: Some(4096),
+            ..Args::default()
+        };
+        let config = build_turn(&args, Some(&long)).unwrap().expect("enabled");
+        assert_eq!(config.bandwidth, 4096);
+    }
+
+    /// Material handling only exists when the transport was compiled in; the
+    /// lean build's answer to these flags is the feature error (next test).
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_flags_need_certificate_material() {
+        let long = long_term_auth(false);
+        // A listener without material is a refused start, never a silent
+        // plaintext fallback (design §3.2).
+        let args = Args {
+            turn: true,
+            turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+            ..Args::default()
+        };
+        let message = build_turn(&args, Some(&long)).unwrap_err();
+        assert!(message.contains("--tls-cert"), "{message}");
+        let args = Args {
+            turn: true,
+            turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+            tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            ..Args::default()
+        };
+        assert!(build_turn(&args, Some(&long)).is_err(), "--tls-cert alone");
+        let args = Args {
+            turn: true,
+            tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            tls_key: Some(PathBuf::from("/tmp/key.pem")),
+            ..Args::default()
+        };
+        assert!(
+            build_turn(&args, Some(&long)).is_err(),
+            "material without a listener is a half configuration"
+        );
+        // With --turn, each half of a TLS pair alone is still an error.
+        let args = Args {
+            turn: true,
+            turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+            tls_key: Some(PathBuf::from("/tmp/key.pem")),
+            ..Args::default()
+        };
+        assert!(build_turn(&args, Some(&long)).is_err(), "--tls-key alone");
+
+        // The complete pair is accepted and reaches the TURN config.
+        #[cfg(feature = "dtls")]
+        let turn_dtls_listen = vec!["127.0.0.1:5350".parse().unwrap()];
+        #[cfg(not(feature = "dtls"))]
+        let turn_dtls_listen = Vec::new();
+        let args = Args {
+            turn: true,
+            turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+            turn_dtls_listen,
+            tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            tls_key: Some(PathBuf::from("/tmp/key.pem")),
+            turn_bandwidth: Some(4096),
+            ..Args::default()
+        };
+        let config = build_turn(&args, Some(&long)).unwrap().expect("enabled");
+        assert_eq!(config.bandwidth, 4096);
+    }
+
+    /// The lean build must not pretend: the flag exists (help is build-independent)
+    /// but the start is refused with the feature name the operator has to build.
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn lean_build_refuses_tls_flags_with_the_feature_name() {
+        let long = long_term_auth(false);
+        for args in [
+            Args {
+                turn: true,
+                turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+                ..Args::default()
+            },
+            Args {
+                turn: true,
+                tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
+                tls_key: Some(PathBuf::from("/tmp/key.pem")),
+                turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+                ..Args::default()
+            },
+        ] {
+            let message = build_turn(&args, Some(&long)).unwrap_err();
+            assert!(message.contains("`tls` feature"), "{message}");
+            assert!(
+                message.contains("--features tls,dtls"),
+                "the error must say how to fix it: {message}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "dtls"))]
+    #[test]
+    fn build_without_dtls_refuses_dtls_listeners_with_the_feature_name() {
+        let long = long_term_auth(false);
+        let args = Args {
+            turn: true,
+            turn_dtls_listen: vec!["127.0.0.1:5350".parse().unwrap()],
+            ..Args::default()
+        };
+        let message = build_turn(&args, Some(&long)).unwrap_err();
+        assert!(message.contains("`dtls` feature"), "{message}");
+        assert!(
+            message.contains("--features tls,dtls"),
+            "the error must say how to fix it: {message}"
+        );
+    }
+
+    #[test]
+    fn rest_credentials_need_realm_and_nonce_secret_but_no_stored_user() {
+        // `--rest-secret` without `--realm` / `--auth-secret`: refused.
+        let args = Args {
+            rest_secret: Some("secret".to_string()),
+            ..Args::default()
+        };
+        assert!(build_auth(&args).is_err());
+
+        let args = Args {
+            rest_secret: Some("secret".to_string()),
+            realm: Some("example.org".to_string()),
+            ..Args::default()
+        };
+        assert!(
+            build_auth(&args).is_err(),
+            "--rest-secret needs --auth-secret"
+        );
+
+        // Realm + nonce secret + REST secret: no stored user is needed.
+        let args = Args {
+            rest_secret: Some("secret".to_string()),
+            realm: Some("example.org".to_string()),
+            auth_secret: Some("nonce-secret".to_string()),
+            ..Args::default()
+        };
+        let auth = build_auth(&args).unwrap().expect("long-term mode");
+        assert!(auth.has_rest_secret());
+        assert_eq!(auth.user_count(), 0);
+
+        // An empty REST secret is a half configuration.
+        let args = Args {
+            rest_secret: Some(String::new()),
+            realm: Some("example.org".to_string()),
+            auth_secret: Some("nonce-secret".to_string()),
+            ..Args::default()
+        };
+        assert!(build_auth(&args).is_err());
+
+        // And `--turn` accepts REST-only credentials (mode is long-term).
+        let args = Args {
+            turn: true,
+            rest_secret: Some("secret".to_string()),
+            realm: Some("example.org".to_string()),
+            auth_secret: Some("nonce-secret".to_string()),
+            tls_cert: None,
+            ..Args::default()
+        };
+        let auth = build_auth(&args).unwrap().expect("long-term mode");
+        assert!(build_turn(&args, Some(&auth)).unwrap().is_some());
+    }
+
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_pem_uses_the_private_key_tag_webrtc_dtls_expects() {
+        // `webrtc-dtls` requires `PRIVATE_KEY` first, then `CERTIFICATE`
+        // blocks; standard tools write `PRIVATE KEY`, so the DER is re-wrapped.
+        let certs = vec![tokio_rustls::rustls::pki_types::CertificateDer::from(vec![
+            0x30, 0x01, 0x02,
+        ])];
+        let pem = dtls_pem(&[0x30, 0x02, 0x01, 0x03], &certs);
+        assert!(pem.starts_with("-----BEGIN PRIVATE_KEY-----\n"), "{pem}");
+        assert!(pem.contains("-----BEGIN CERTIFICATE-----\n"), "{pem}");
+        assert!(pem.ends_with("-----END CERTIFICATE-----\n"), "{pem}");
+        assert!(
+            !pem.contains("BEGIN PRIVATE KEY"),
+            "tag must be PRIVATE_KEY"
+        );
+    }
+
+    /// **Test-only** self-signed RSA-2048 pair (`CN=rstun-test-invalid`),
+    /// generated for this test: never trusted, never used at runtime. It exists
+    /// so the B1 regression (an RSA certificate is valid for `turns:` but not for
+    /// DTLS) is covered without shelling out to `openssl`, which the Windows and
+    /// macOS CI runners do not have.
+    #[cfg(feature = "dtls")]
+    const TEST_RSA_CERT_PEM: &str = include_str!("../tests/fixtures/rsa-test-only.crt.pem");
+    #[cfg(feature = "dtls")]
+    const TEST_RSA_KEY_PEM: &str = include_str!("../tests/fixtures/rsa-test-only.key.pem");
+
+    /// Write the embedded PEM pair to a private temp dir; returns `(dir, cert, key)`.
+    #[cfg(feature = "dtls")]
+    fn rsa_test_pair() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "rstun-rsa-pair-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, TEST_RSA_CERT_PEM).unwrap();
+        std::fs::write(&key, TEST_RSA_KEY_PEM).unwrap();
+        (dir, cert, key)
+    }
+
+    /// B1: with no `--turn-dtls-listen`, the DTLS-only key rules (PKCS#8 +
+    /// ECDSA P-256/Ed25519) must not be applied. A Let's Encrypt RSA pair must
+    /// start a `turns:`-only server. With DTLS requested the same pair is still
+    /// refused, at startup, with an actionable message.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn full_build_accepts_an_rsa_certificate_when_dtls_is_off() {
+        let (dir, cert, key) = rsa_test_pair();
+        let material = load_secure_material(&cert, &key, false)
+            .expect("an RSA pair is fine for turns: when DTLS is not requested");
+        assert!(
+            material.dtls.is_none(),
+            "no DTLS listener → no DTLS material to build"
+        );
+
+        let Err(error) = load_secure_material(&cert, &key, true) else {
+            panic!("DTLS still cannot sign with RSA: the start must be refused");
+        };
+        assert!(
+            error.contains("ECDSA P-256") && error.contains("DTLS"),
+            "the error must name the DTLS restriction: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `(code, attributes)` of an error response, decoded once.

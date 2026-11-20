@@ -60,6 +60,25 @@ pub const ERROR_STALE_NONCE: u16 = 438;
 /// Default `--nonce-lifetime`: RFC 5389 §10.2 leaves it to the server.
 pub const DEFAULT_NONCE_LIFETIME: u64 = 3600;
 
+/// `--rest-secret` username shape (coturn `use-auth-secret`): the expiry is the
+/// unix timestamp before the first `:`, the rest is an arbitrary label (it may
+/// itself contain `:`, which is why the split is on the **first** separator).
+/// `1700000000:alice` → `Some(1700000000)`; `alice` → `None` (a stored user).
+pub fn rest_username_expiry(username: &str) -> Option<u64> {
+    let (expiry, _label) = username.split_once(':')?;
+    if expiry.is_empty() || !expiry.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    expiry.parse().ok()
+}
+
+/// `password = base64(HMAC-SHA1(secret, username))` — the coturn
+/// `use-auth-secret` rule (standard base64 alphabet, padded; the TURN REST API
+/// is not the URL-safe variant used by the nonce).
+pub fn rest_password(secret: &[u8], username: &str) -> String {
+    base64_encode(&hmac_sha1(secret, username.as_bytes()))
+}
+
 /// `MESSAGE-INTEGRITY` value length (HMAC-SHA1, RFC 5389 §15.4).
 const MI_LEN: usize = 20;
 /// `MESSAGE-INTEGRITY-SHA256` value length (RFC 8489 §14.6).
@@ -227,6 +246,10 @@ pub struct Auth {
     nonce_lifetime: Duration,
     /// `--auth-require-sha256`: refuse MD5 credentials with a 401.
     require_sha256: bool,
+    /// `--rest-secret`: TURN REST API ephemeral credentials (coturn's
+    /// `use-auth-secret`). `None` = the feature is off and a username is always
+    /// looked up in `users`.
+    rest_secret: Option<Vec<u8>>,
     counters: Counters,
 }
 
@@ -242,6 +265,7 @@ impl std::fmt::Debug for Auth {
             .field("secret_len", &self.secret.len())
             .field("nonce_lifetime", &self.nonce_lifetime)
             .field("require_sha256", &self.require_sha256)
+            .field("rest_secret_len", &self.rest_secret.as_ref().map(Vec::len))
             .finish_non_exhaustive()
     }
 }
@@ -256,6 +280,7 @@ impl Auth {
             secret: Vec::new(),
             nonce_lifetime: Duration::from_secs(DEFAULT_NONCE_LIFETIME),
             require_sha256: false,
+            rest_secret: None,
             counters: Counters::default(),
         }
     }
@@ -276,8 +301,25 @@ impl Auth {
             secret,
             nonce_lifetime,
             require_sha256,
+            rest_secret: None,
             counters: Counters::default(),
         }
+    }
+
+    /// Enable TURN REST API ephemeral credentials (`--rest-secret`).
+    ///
+    /// Long-term only: the ephemeral password is fed into the same
+    /// `MD5(username:realm:password)` key derivation every other long-term
+    /// request uses, so a REST client and a stored user differ only in *where*
+    /// the password comes from.
+    pub fn with_rest_secret(mut self, secret: Vec<u8>) -> Self {
+        self.rest_secret = Some(secret);
+        self
+    }
+
+    /// Is the TURN REST API credential path enabled?
+    pub fn has_rest_secret(&self) -> bool {
+        self.rest_secret.is_some()
     }
 
     pub fn mode(&self) -> Mode {
@@ -403,7 +445,24 @@ impl Auth {
             // with a different one would be silently downgrading the client.
             Err(()) => return Err(Rejection::Unauthorized),
         };
-        let user = self.find_user(body)?;
+        // TURN REST API ephemeral credentials (coturn `use-auth-secret`): a
+        // `USERNAME` of the form `<expiry>:<label>` carries its own password
+        // source, so it is **never** looked up in the user table — REST wins
+        // over a stored user with the same name (design §4). A name without a
+        // numeric prefix falls through to the stored credentials, and the
+        // non-REST path keeps its original evaluation order (unknown user →
+        // 401 even when the nonce is stale).
+        let rest_username = if self.rest_secret.is_some() {
+            attribute(body, ATTR_USERNAME)
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .filter(|username| rest_username_expiry(username).is_some())
+        } else {
+            None
+        };
+        let user = match rest_username {
+            Some(_) => None,
+            None => Some(self.find_user(body)?),
+        };
         if attribute(body, ATTR_USERHASH).is_some() {
             // RFC 8489 §9.2.2: USERHASH is defined together with the SHA-256
             // key derivation; pairing it with MD5 would be a client bug.
@@ -428,7 +487,43 @@ impl Auth {
         // PASSWORD-ALGORITHM wins when present (explicit negotiation); without
         // it, the integrity attributes present say which algorithms to check —
         // a client that sends only MESSAGE-INTEGRITY-SHA256 means SHA-256.
-        let algorithms: Vec<KeyAlgorithm> = match requested {
+        let algorithms = self.select_algorithms(requested, has_mi, has_sha256);
+        if self.require_sha256 && algorithms.contains(&KeyAlgorithm::Md5) {
+            return Err(Rejection::Unauthorized);
+        }
+
+        if let Some(username) = rest_username {
+            let secret = self
+                .rest_secret
+                .as_ref()
+                .expect("rest_username is only set when --rest-secret is configured");
+            return self.verify_rest(frame, username, secret, &algorithms, now);
+        }
+        let user = user.expect("the non-REST path resolved a stored user");
+        let mut keys = Vec::with_capacity(algorithms.len());
+        for algorithm in algorithms {
+            let key = long_term_key(algorithm, &user.username, &self.realm, &user.password);
+            if !verify_integrity(frame, &key, algorithm) {
+                return Err(Rejection::Unauthorized);
+            }
+            keys.push((algorithm, key));
+        }
+        Ok(Identity {
+            username: user.username.clone(),
+            keys,
+        })
+    }
+
+    /// Which key derivations to try for this request: an explicit
+    /// `PASSWORD-ALGORITHM` wins, otherwise the integrity attributes present
+    /// say it (a client that sends only `MESSAGE-INTEGRITY-SHA256` means SHA-256).
+    fn select_algorithms(
+        &self,
+        requested: Option<KeyAlgorithm>,
+        has_mi: bool,
+        has_sha256: bool,
+    ) -> Vec<KeyAlgorithm> {
+        match requested {
             Some(algorithm) => vec![algorithm],
             None => {
                 let mut algorithms = Vec::with_capacity(2);
@@ -440,21 +535,42 @@ impl Auth {
                 }
                 algorithms
             }
+        }
+    }
+
+    /// Verify one TURN REST API credential: `password =
+    /// base64(HMAC-SHA1(secret, username))`, then the ordinary long-term key
+    /// derivation on top of it.
+    ///
+    /// Expiry is strict (`now >= expiry` → 401, design §4). The reply for an
+    /// expired credential is a plain 401 and **not** a 438: the nonce is still
+    /// valid, so a new nonce would not help — the client has to mint a new
+    /// username.
+    fn verify_rest(
+        &self,
+        frame: &[u8],
+        username: &str,
+        secret: &[u8],
+        algorithms: &[KeyAlgorithm],
+        now: SystemTime,
+    ) -> Result<Identity, Rejection> {
+        let Some(expiry) = rest_username_expiry(username) else {
+            return Err(Rejection::Unauthorized);
         };
-        if self.require_sha256 && algorithms.contains(&KeyAlgorithm::Md5) {
+        if unix_seconds(now) >= expiry {
             return Err(Rejection::Unauthorized);
         }
-
+        let password = rest_password(secret, username);
         let mut keys = Vec::with_capacity(algorithms.len());
         for algorithm in algorithms {
-            let key = long_term_key(algorithm, &user.username, &self.realm, &user.password);
-            if !verify_integrity(frame, &key, algorithm) {
+            let key = long_term_key(*algorithm, username, &self.realm, &password);
+            if !verify_integrity(frame, &key, *algorithm) {
                 return Err(Rejection::Unauthorized);
             }
-            keys.push((algorithm, key));
+            keys.push((*algorithm, key));
         }
         Ok(Identity {
-            username: user.username.clone(),
+            username: username.to_string(),
             keys,
         })
     }
@@ -889,6 +1005,33 @@ fn unix_seconds(now: SystemTime) -> u64 {
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// Standard base64 (RFC 4648 §4: `+/` alphabet, `=` padded) — what the TURN
+/// REST API specifies for the ephemeral password, and what coturn emits. Kept
+/// next to [`base64url_encode`] instead of pulling a `base64` dependency: two
+/// alphabets, one loop.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        let bits = (u32::from(chunk[0]) << 16) | (u32::from(second) << 8) | u32::from(third);
+        out.push(BASE64[(bits >> 18) as usize & 0x3f] as char);
+        out.push(BASE64[(bits >> 12) as usize & 0x3f] as char);
+        if chunk.len() > 1 {
+            out.push(BASE64[(bits >> 6) as usize & 0x3f] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(BASE64[bits as usize & 0x3f] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 /// URL-safe base64 without padding (RFC 4648 §5) — the nonce alphabet.
 ///
 /// Written out instead of pulling a `base64` dependency: it encodes a 16-byte
@@ -1202,6 +1345,216 @@ mod tests {
         assert_eq!(
             short.check_nonce(&nonce, CLIENT, now + Duration::from_secs(1)),
             NonceState::Expired
+        );
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_padding_rules() {
+        // The standard alphabet (not the nonce's URL-safe one): the TURN REST
+        // API password is consumed by coturn and by `turnutils_uclient -W`.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0xfb, 0xff]), "+/8=");
+        assert_eq!(base64_encode(&[0x00, 0x01, 0x02, 0x03, 0x04]), "AAECAwQ=");
+    }
+
+    #[test]
+    fn rest_password_matches_coturn_use_auth_secret() {
+        // python: base64.b64encode(hmac.new(secret, username, sha1).digest())
+        assert_eq!(
+            rest_password(b"turn-test-secret", "1700000000:alice"),
+            "AHuE7M4O2lyk3ebHJ95FoVRfR5A="
+        );
+        // The label after the first `:` is opaque: it may contain separators.
+        assert_eq!(
+            rest_password(b"turn-test-secret", "1700000000:label:with:colons"),
+            "e4LMlhg2jmZG/q3ikBP/if84ybs="
+        );
+        // Only the first `:` splits: `<expiry>:<label>` with an empty label is
+        // still a REST name, a leading `:` is not.
+        assert_eq!(
+            rest_username_expiry("1700000000:alice"),
+            Some(1_700_000_000)
+        );
+        assert_eq!(rest_username_expiry("1700000000:"), Some(1_700_000_000));
+        assert_eq!(rest_username_expiry("1700000000:a:b"), Some(1_700_000_000));
+        assert_eq!(rest_username_expiry("1700000000"), None);
+        assert_eq!(rest_username_expiry(":alice"), None);
+        assert_eq!(rest_username_expiry("alice:1700000000"), None);
+        assert_eq!(rest_username_expiry("-1:alice"), None);
+        assert_eq!(rest_username_expiry("1_700:alice"), None);
+        assert_eq!(rest_username_expiry("99999999999999999999999:x"), None);
+    }
+
+    /// Long-term request carrying `USERNAME`/`REALM`/`NONCE` and a MAC made
+    /// with `key` — the shape both the stored-user and REST paths verify.
+    fn long_term_request(
+        username: &str,
+        nonce: &str,
+        key: Vec<u8>,
+        algorithm: KeyAlgorithm,
+    ) -> Vec<u8> {
+        let transaction_id = TransactionId([0x5a; 12]);
+        let mut body = Vec::new();
+        protocol::push_attribute(&mut body, ATTR_USERNAME, username.as_bytes());
+        protocol::push_attribute(&mut body, ATTR_REALM, b"example.org");
+        protocol::push_attribute(&mut body, ATTR_NONCE, nonce.as_bytes());
+        protocol::push_attribute(&mut body, 0x0019, &[17, 0, 0, 0]);
+        let frame = protocol::encode_message(
+            protocol::message_type(0x0003, protocol::MessageClass::Request),
+            &transaction_id,
+            &body,
+        );
+        seal(
+            frame,
+            &Identity {
+                username: username.to_string(),
+                keys: vec![(algorithm, key)],
+            },
+        )
+    }
+
+    fn rest_auth() -> Auth {
+        auth().with_rest_secret(b"turn-test-secret".to_vec())
+    }
+
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn rest_credentials_verify_expire_and_do_not_need_a_stored_user() {
+        let auth = rest_auth();
+        let now = at(1_700_000_000);
+        let nonce = auth.issue_nonce(CLIENT, now);
+        let username = "1700000600:alice";
+        let password = rest_password(b"turn-test-secret", username);
+        let key = long_term_key(KeyAlgorithm::Md5, username, "example.org", &password);
+        let frame = long_term_request(username, &nonce, key, KeyAlgorithm::Md5);
+        let message = protocol::parse(&frame).unwrap();
+        assert_eq!(
+            auth.verify(&frame, &message, CLIENT, now),
+            Ok(Identity {
+                username: username.to_string(),
+                keys: vec![(
+                    KeyAlgorithm::Md5,
+                    long_term_key(KeyAlgorithm::Md5, username, "example.org", &password)
+                )],
+            })
+        );
+
+        // Expired: 401, even with a perfectly valid MAC.
+        let later = at(1_700_000_600);
+        let nonce = auth.issue_nonce(CLIENT, later);
+        let frame = long_term_request(
+            username,
+            &nonce,
+            long_term_key(KeyAlgorithm::Md5, username, "example.org", &password),
+            KeyAlgorithm::Md5,
+        );
+        let message = protocol::parse(&frame).unwrap();
+        assert_eq!(
+            auth.verify(&frame, &message, CLIENT, later),
+            Err(Rejection::Unauthorized)
+        );
+
+        // Wrong secret: the derived password (and therefore the key) differs.
+        let wrong = rest_password(b"other-secret", username);
+        let key = long_term_key(KeyAlgorithm::Md5, username, "example.org", &wrong);
+        let frame = long_term_request(username, &nonce, key, KeyAlgorithm::Md5);
+        let message = protocol::parse(&frame).unwrap();
+        assert_eq!(
+            auth.verify(&frame, &message, CLIENT, now),
+            Err(Rejection::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn rest_credentials_take_priority_over_a_stored_user_with_the_same_name() {
+        // A stored user literally named `1700000600:rest` with a different
+        // password: if the table won, the REST MAC below would not verify.
+        let stored = User {
+            username: "1700000600:rest".to_string(),
+            password: "table-password".to_string(),
+        };
+        let auth = Auth::long_term(
+            "example.org".to_string(),
+            b"nonce-secret".to_vec(),
+            vec![stored],
+            Duration::from_secs(DEFAULT_NONCE_LIFETIME),
+            false,
+        )
+        .with_rest_secret(b"turn-test-secret".to_vec());
+        let now = at(1_700_000_000);
+        let nonce = auth.issue_nonce(CLIENT, now);
+        let password = rest_password(b"turn-test-secret", "1700000600:rest");
+        let key = long_term_key(
+            KeyAlgorithm::Md5,
+            "1700000600:rest",
+            "example.org",
+            &password,
+        );
+        let frame = long_term_request("1700000600:rest", &nonce, key, KeyAlgorithm::Md5);
+        let message = protocol::parse(&frame).unwrap();
+        assert!(auth.verify(&frame, &message, CLIENT, now).is_ok());
+        // And the table password is *not* accepted for that name any more.
+        let table = long_term_key(
+            KeyAlgorithm::Md5,
+            "1700000600:rest",
+            "example.org",
+            "table-password",
+        );
+        let frame = long_term_request("1700000600:rest", &nonce, table, KeyAlgorithm::Md5);
+        let message = protocol::parse(&frame).unwrap();
+        assert_eq!(
+            auth.verify(&frame, &message, CLIENT, now),
+            Err(Rejection::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn rest_secret_stays_off_the_stored_user_path() {
+        // With `--rest-secret` configured, a name that does not parse as
+        // `<expiry>:<label>` must still authenticate against the user table.
+        let auth = rest_auth();
+        let now = at(1_700_000_000);
+        let nonce = auth.issue_nonce(CLIENT, now);
+        let key = long_term_key(KeyAlgorithm::Md5, "user", "example.org", "pass");
+        let frame = long_term_request("user", &nonce, key, KeyAlgorithm::Md5);
+        let message = protocol::parse(&frame).unwrap();
+        assert!(auth.verify(&frame, &message, CLIENT, now).is_ok());
+    }
+
+    #[test]
+    fn rest_missing_nonce_is_still_a_bad_request() {
+        let auth = rest_auth();
+        let transaction_id = TransactionId([0x11; 12]);
+        let mut body = Vec::new();
+        protocol::push_attribute(&mut body, ATTR_USERNAME, b"1700000600:alice");
+        protocol::push_attribute(&mut body, ATTR_REALM, b"example.org");
+        let frame = protocol::encode_message(
+            protocol::message_type(0x0003, protocol::MessageClass::Request),
+            &transaction_id,
+            &body,
+        );
+        // MI present (so this is not the "no credentials at all" 401), NONCE
+        // absent: a malformed long-term request is a 400.
+        let frame = seal(
+            frame,
+            &Identity {
+                username: "1700000600:alice".to_string(),
+                keys: vec![(KeyAlgorithm::Md5, vec![0x11; 16])],
+            },
+        );
+        let message = protocol::parse(&frame).unwrap();
+        assert_eq!(
+            auth.verify(&frame, &message, CLIENT, at(1_700_000_000)),
+            Err(Rejection::BadRequest)
         );
     }
 

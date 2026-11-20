@@ -391,6 +391,30 @@ fn channel_data_framing_and_detection() {
     let tcp = channel_data_frame(0x4001, b"abc", ClientTransport::Tcp);
     assert_eq!(tcp.len(), 8);
     assert_eq!(&tcp[4..], b"abc\0");
+    // DTLS is a datagram transport: same framing as UDP, no stream padding.
+    let dtls = channel_data_frame(0x4001, b"abc", ClientTransport::Dtls);
+    assert_eq!(dtls, udp);
+}
+
+#[test]
+fn bandwidth_bucket_drops_after_the_one_second_budget() {
+    let start = Instant::now();
+    let mut unlimited = TokenBucket::new(0, start);
+    for _ in 0..1000 {
+        assert!(unlimited.try_take(start, 65_535));
+    }
+
+    // 1000 B/s: one second of tokens, starting full.
+    let mut bucket = TokenBucket::new(1000, start);
+    assert!(bucket.try_take(start, 600), "the bucket starts full");
+    assert!(!bucket.try_take(start, 600), "only 400 tokens left");
+    assert!(bucket.try_take(start, 400), "exactly draining is allowed");
+    assert!(!bucket.try_take(start, 1), "empty bucket drops the payload");
+    // Refills continuously: 500 ms later there are ~500 tokens again.
+    assert!(bucket.try_take(start + Duration::from_millis(500), 400));
+    // Never above one second's worth, no matter how long the idle period was.
+    assert!(bucket.try_take(start + Duration::from_secs(3600), 1000));
+    assert!(!bucket.try_take(start + Duration::from_secs(3600), 1));
 }
 
 #[test]

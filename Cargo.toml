@@ -1,6 +1,6 @@
 [package]
 name = "rstun"
-description = "Standalone STUN/TURN server (RFC 5389 Binding with optional short/long-term authentication; RFC 5780 NAT behaviour discovery with `--alt-listen`; RFC 8656 UDP relay with `--turn`)."
+description = "Standalone STUN/TURN server (RFC 5389 Binding with optional short/long-term authentication; RFC 5780 NAT behaviour discovery with `--alt-listen`; RFC 8656 relay with `--turn`: UDP/TCP, `turns:` (TLS) and DTLS behind the `tls`/`dtls` features; TURN REST credentials and per-allocation bandwidth quotas)."
 homepage = "https://github.com/exvlan/rstun"
 repository = "https://github.com/exvlan/rstun"
 version = "26.410.100"
@@ -16,12 +16,25 @@ readme = "README.md"
 keywords = ["stun", "rfc5389", "rfc5780", "nat", "networking"]
 categories = ["network-programming"]
 # 发布到 crates.io 时不带进包里：fuzz 目标是独立 workspace（nightly + libFuzzer），
-# test/ 是实验室夹具（Go module / webrtc 客户端），CI 描述与源码无关。
-exclude = ["fuzz/**", "test/**", ".github/**"]
+# test/ 是实验室夹具（Go module / webrtc 客户端），tests/ 是单测夹具（含一次性 RSA
+# 自签密钥对，见 tests/fixtures/README.md —— 会通过 `include_str!` 参与源码构建但
+# 不希望进入 crate 包），CI 描述与源码无关。
+exclude = ["fuzz/**", "test/**", "tests/**", ".github/**", ".opencode/**", ".trellis/**", "contrib/**", "script/**", "docs/**", ".cargo/**"]
 
 [[bin]]
 name = "rstun"
 path = "src/main.rs"
+
+# 两种发布构建（**默认 lean**）：
+#   lean  `cargo build`                     STUN + TURN(UDP/TCP) + REST + 带宽，9 个直接依赖、~3.5 MB
+#   full  `cargo build --features full`     再加 `turns:`(TLS) 与 DTLS，13 个直接依赖、~7.9 MB
+# `dtls` 依赖 `tls`：两者共用同一份证书材料解析（`SecureMaterial`），DTLS 单独存在没有意义。
+# 任何 feature 都不改变默认关闭路径的字节（`frozen` 项：3 配置 × 17 请求）。
+[features]
+default = []
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+dtls = ["tls", "dep:webrtc-dtls", "dep:webrtc-util"]
+full = ["tls", "dtls"]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
@@ -51,6 +64,27 @@ hmac = "0.12"
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
+
+# ---- TURN T2：`turns:`（TLS，RFC 8656 §5）与 DTLS 客户端传输（feature = tls / dtls）----
+# 全部 optional：默认构建（lean）不编译、不链接、不引入它们的传递依赖。
+# rustls 的 provider 固定为 ring（`default-features = false`）：webrtc-dtls 也用
+# ring，两个 provider 同时编进来时 `CryptoProvider::get_default()` 会 panic。
+tokio-rustls = { version = "0.26.5", optional = true, default-features = false, features = [
+  "logging",
+  "ring",
+  "tls12",
+] }
+rustls-pemfile = { version = "2.2", optional = true }
+# `rustls` 不支持 DTLS；`webrtc-dtls` 是纯 Rust 实现（内置 rcgen/ring 的传递依赖）。
+# `pem` 只用于把 PEM 证书/私钥读成 `Certificate`。
+webrtc-dtls = { version = "0.12", optional = true, features = ["pem"] }
+# `webrtc-dtls` 的监听/连接 API 以 `webrtc-util` 的 `Conn`/`Listener` trait 表达
+# （`listen()` 返回 `impl Listener`，`accept()` 返回 `Arc<dyn Conn>`），调用这些
+# 方法必须把 trait 带进作用域。它不是新增的传递依赖：webrtc-dtls 已依赖同一个
+# crate（同版本、同 feature），这里只是把它变成直接依赖以便 `use`。
+webrtc-util = { version = "0.11", optional = true, default-features = false, features = [
+  "conn",
+] }
 
 [dev-dependencies]
 # 参考实现 oracle（**只用于测试**，运行期依赖是上面 9 个）：

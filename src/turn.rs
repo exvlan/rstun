@@ -1,20 +1,28 @@
-//! TURN (RFC 8656) UDP relay — T1 scope.
+//! TURN (RFC 8656) relay state machine: allocations, permissions, channels,
+//! indications and the per-allocation bandwidth buckets.
 //!
-//! What this module implements and, more importantly, what it does **not**:
+//! What this module owns (the transports themselves live in `main.rs`):
 //!
-//! * `Allocate` / `Refresh` / `CreatePermission` / `ChannelBind` over UDP and TCP
-//!   client transports, always with **long-term credentials** (`--realm` +
-//!   `--auth-secret` + a user). There is no unauthenticated operation: the
-//!   startup path refuses to enable `--turn` without long-term credentials.
-//! * A UDP relay allocation (`REQUESTED-TRANSPORT = 17`). A TCP allocation
-//!   (RFC 6062, `REQUESTED-TRANSPORT = 6`) is answered `442`.
-//! * `Send` / `Data` indications and `ChannelData` (4-byte header, TCP padding).
+//! * `Allocate` / `Refresh` / `CreatePermission` / `ChannelBind` over **UDP,
+//!   TCP, TLS (`turns:`) and DTLS** client transports — see
+//!   [`ClientTransport`]. TLS and DTLS are compiled in only with the `tls` /
+//!   `dtls` features and never change the UDP/TCP code paths.
+//! * Authentication is **long-term credentials** (`--realm` + `--auth-secret` +
+//!   a stored user) or the TURN REST ephemeral credentials (`--rest-secret`,
+//!   coturn's `use-auth-secret`). There is no unauthenticated operation: the
+//!   startup path refuses to enable `--turn` without one of them.
+//! * A **UDP** relay allocation (`REQUESTED-TRANSPORT = 17`) regardless of the
+//!   client transport. A TCP allocation (RFC 6062, `REQUESTED-TRANSPORT = 6`)
+//!   is answered `442`.
+//! * `Send` / `Data` indications and `ChannelData` (4-byte header; padded only on
+//!   a stream transport).
+//! * `EVEN-PORT` (including the R=1 reservation token), because coturn's
+//!   `turnutils_uclient` sends it on every Allocate.
+//! * `--turn-bandwidth`: two token buckets per allocation (client→peer,
+//!   peer→client); over the cap the packet is dropped and counted, the
+//!   allocation survives.
 //!
-//! `EVEN-PORT` (including the R=1 reservation token) is implemented because
-//! coturn's `turnutils_uclient` sends it on every Allocate.
-//!
-//! Deliberately absent (T2 or later): TLS/DTLS, REST ephemeral credentials,
-//! bandwidth quotas, TCP allocations (RFC 6062), `DONT-FRAGMENT` and
+//! Deliberately absent: TCP allocations (RFC 6062), `DONT-FRAGMENT` and
 //! `REQUESTED-ADDRESS-FAMILY` (answered `420` because they are
 //! comprehension-required and unsupported).
 //!
@@ -43,7 +51,7 @@ use tokio::task::JoinHandle;
 
 use crate::auth::{self, Identity};
 use crate::protocol::{self, MessageClass, TransactionId};
-use crate::{Decision, ServerContext, Transport};
+use crate::{Decision, ServerContext};
 
 // ---------------------------------------------------------------------------
 // Wire constants (RFC 8656 §14)
@@ -121,6 +129,10 @@ pub const DEFAULT_MAX_ALLOCATIONS_PER_USER: usize = 8;
 pub const DEFAULT_MAX_ALLOCATIONS_PER_IP: usize = 16;
 pub const DEFAULT_PERMISSION_LIMIT: usize = 10;
 pub const DEFAULT_ALLOCATION_LIFETIME_SECONDS: u64 = 600;
+/// Default `--turn-bandwidth`: 1 MiB/s per direction per allocation. Large
+/// enough that control traffic and a few media streams are untouched, small
+/// enough that one allocation cannot flatten a shared uplink.
+pub const DEFAULT_BANDWIDTH: u64 = 1024 * 1024;
 pub const MAX_ALLOCATION_LIFETIME_SECONDS: u64 = 3600;
 /// Permission lifetime, fixed by RFC 8656 §8 (5 minutes).
 pub const PERMISSION_LIFETIME: Duration = Duration::from_secs(300);
@@ -142,6 +154,13 @@ pub struct Config {
     /// Default `LIFETIME` granted when a client requests none, and the cap
     /// applied to whatever it does request. `--allocation-lifetime`.
     pub lifetime: Duration,
+    /// Per-allocation bandwidth cap in bytes/second, applied **per direction**
+    /// (`--turn-bandwidth`). `0` = unlimited.
+    ///
+    /// Enforced with two token buckets (one for client→peer, one for
+    /// peer→client) whose capacity is one second of tokens. Over the cap the
+    /// offending packet is dropped and counted; the allocation lives on.
+    pub bandwidth: u64,
 }
 
 impl Default for Config {
@@ -152,6 +171,7 @@ impl Default for Config {
             max_allocations_per_ip: DEFAULT_MAX_ALLOCATIONS_PER_IP,
             permission_limit: DEFAULT_PERMISSION_LIMIT,
             lifetime: Duration::from_secs(DEFAULT_ALLOCATION_LIFETIME_SECONDS),
+            bandwidth: DEFAULT_BANDWIDTH,
         }
     }
 }
@@ -226,6 +246,13 @@ pub struct Counters {
     pub rejected_ports: AtomicU64,
     pub rejected_family: AtomicU64,
     pub rejected_loopback: AtomicU64,
+    /// Bytes dropped by the per-allocation bandwidth buckets (`--turn-bandwidth`).
+    pub bytes_dropped_in: AtomicU64,
+    pub bytes_dropped_out: AtomicU64,
+    /// TLS/DTLS handshakes that failed or timed out (`--turn-tls-listen` /
+    /// `--turn-dtls-listen`). Kept out of `/metrics` on purpose: the label
+    /// space stays exactly the T1 one plus `rstun_turn_bytes_dropped_total`.
+    pub handshake_failed: AtomicU64,
 }
 
 /// One consistent read of [`Counters`] plus the live allocation count.
@@ -240,6 +267,9 @@ pub struct Snapshot {
     pub rejected_ports: u64,
     pub rejected_family: u64,
     pub rejected_loopback: u64,
+    pub bytes_dropped_in: u64,
+    pub bytes_dropped_out: u64,
+    pub handshake_failed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -247,18 +277,28 @@ pub struct Snapshot {
 // ---------------------------------------------------------------------------
 
 /// Which transport the *client* speaks to us (the relay itself is always UDP).
+///
+/// `Tcp` is also what a `turns:` (TLS) connection records: design §6 keeps the
+/// 5-tuple identical to plain TCP — the listener port already distinguishes
+/// the two, and TLS and plaintext are never served on the same port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClientTransport {
     Udp,
     Tcp,
+    /// DTLS: one datagram = one STUN/TURN message or one `ChannelData` (§12),
+    /// exactly like UDP, but a distinct 5-tuple from a plaintext UDP client.
+    ///
+    /// Constructed only by the `dtls` feature (and by the framing unit test), so
+    /// a lean build would otherwise report it as dead code.
+    #[cfg_attr(not(any(feature = "dtls", test)), allow(dead_code))]
+    Dtls,
 }
 
 impl ClientTransport {
-    pub(crate) fn from_transport(transport: Transport) -> Self {
-        match transport {
-            Transport::Udp => Self::Udp,
-            Transport::Tcp => Self::Tcp,
-        }
+    /// Datagram framing: `ChannelData` is `header + payload` with no padding
+    /// (RFC 8656 §12.4); only a *stream* transport pads (§12.5).
+    fn is_datagram(self) -> bool {
+        matches!(self, Self::Udp | Self::Dtls)
     }
 }
 
@@ -278,16 +318,17 @@ enum ClientSink {
     /// The listening socket that received the request (source address must be
     /// the server's own, RFC 8656 §7.3).
     Udp(Arc<UdpSocket>),
-    /// A TCP connection's writer task (ChannelData / Data indication framed).
+    /// A connection's writer task: TCP, TLS and DTLS all hand back a bounded
+    /// queue (ChannelData / Data indication already framed for the transport).
     /// Bounded: `try_send` drops on overflow instead of growing memory.
-    Tcp(mpsc::Sender<Vec<u8>>),
+    Queue(mpsc::Sender<Vec<u8>>),
 }
 
 impl std::fmt::Debug for ClientSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Udp(_) => f.write_str("Udp"),
-            Self::Tcp(_) => f.write_str("Tcp"),
+            Self::Queue(_) => f.write_str("Queue"),
         }
     }
 }
@@ -305,6 +346,53 @@ struct AllocationState {
     expires_at: Instant,
     permissions: HashMap<IpAddr, Instant>,
     channels: HashMap<u16, ChannelBinding>,
+    /// `--turn-bandwidth` enforcement, one bucket per direction.
+    inbound: TokenBucket,
+    outbound: TokenBucket,
+}
+
+/// One direction's bandwidth bucket (bytes, refilled continuously).
+///
+/// Capacity is one second of tokens, so a burst of up to `--turn-bandwidth`
+/// bytes passes immediately and a sustained rate above it is what gets
+/// dropped. `rate == 0` disables the bucket entirely.
+#[derive(Debug)]
+struct TokenBucket {
+    rate: f64,
+    capacity: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(bandwidth: u64, now: Instant) -> Self {
+        let rate = bandwidth as f64;
+        Self {
+            rate,
+            capacity: rate,
+            tokens: rate,
+            last: now,
+        }
+    }
+
+    /// Take `bytes` tokens if the bucket has them; `false` means "drop it".
+    fn try_take(&mut self, now: Instant, bytes: usize) -> bool {
+        if self.rate <= 0.0 {
+            return true;
+        }
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+            self.last = now;
+        }
+        let wanted = bytes as f64;
+        if self.tokens >= wanted {
+            self.tokens -= wanted;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// One live allocation.
@@ -431,7 +519,18 @@ impl Turn {
             rejected_ports: counters.rejected_ports.load(Ordering::Relaxed),
             rejected_family: counters.rejected_family.load(Ordering::Relaxed),
             rejected_loopback: counters.rejected_loopback.load(Ordering::Relaxed),
+            bytes_dropped_in: counters.bytes_dropped_in.load(Ordering::Relaxed),
+            bytes_dropped_out: counters.bytes_dropped_out.load(Ordering::Relaxed),
+            handshake_failed: counters.handshake_failed.load(Ordering::Relaxed),
         }
+    }
+
+    /// Count one failed/timed-out TLS/DTLS handshake (exit log only).
+    #[cfg(feature = "tls")]
+    pub fn count_handshake_failure(&self) {
+        self.counters
+            .handshake_failed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // -- lookup ------------------------------------------------------------
@@ -467,10 +566,15 @@ impl Turn {
 
     /// Allocations belonging to one closed TCP connection: their writer task
     /// is gone, so keeping them would only leak relay sockets until the TTL.
-    pub fn release_connection(&self, client: SocketAddr, server: SocketAddr) {
+    pub fn release_connection(
+        &self,
+        client: SocketAddr,
+        server: SocketAddr,
+        transport: ClientTransport,
+    ) {
         let key = Key {
             client,
-            transport: ClientTransport::Tcp,
+            transport,
             server,
         };
         self.remove(&key);
@@ -630,16 +734,19 @@ impl Turn {
         datagram: &[u8],
         peer: SocketAddr,
         local: SocketAddr,
-        transport: Transport,
+        client_transport: ClientTransport,
         context: &ServerContext,
-        tcp_sink: Option<&mpsc::Sender<Vec<u8>>>,
+        // Writer queue for a connection-oriented transport (TCP/TLS) and for
+        // DTLS, whose relayed payload must go back through the same
+        // encryption context. `None` on the UDP path, which answers from the
+        // listening socket itself.
+        sink: Option<&mpsc::Sender<Vec<u8>>>,
     ) -> Option<Result<Decision, protocol::ParseError>> {
-        let client_transport = ClientTransport::from_transport(transport);
-
         // ChannelData is not STUN: first byte 0x40–0x7F (RFC 8656 §12.4).
-        // Over a datagram the frame is exactly header + payload; over TCP the
-        // caller has already de-framed it and calls `handle_channel_data`.
-        if client_transport == ClientTransport::Udp && is_channel_data(datagram) {
+        // Over a datagram (UDP/DTLS) the frame is exactly header + payload;
+        // over a stream the caller has already de-framed it and calls
+        // `handle_channel_data`.
+        if client_transport.is_datagram() && is_channel_data(datagram) {
             if datagram.len() < 4 {
                 // A truncated header is not a STUN frame either; ignore it
                 // rather than index past the datagram.
@@ -694,7 +801,7 @@ impl Turn {
             local,
             client_transport,
             context,
-            tcp_sink,
+            sink,
         )))
     }
 
@@ -708,7 +815,7 @@ impl Turn {
         local: SocketAddr,
         transport: ClientTransport,
         context: &ServerContext,
-        tcp_sink: Option<&mpsc::Sender<Vec<u8>>>,
+        sink: Option<&mpsc::Sender<Vec<u8>>>,
     ) -> Decision {
         let transaction_id = &message.transaction_id;
 
@@ -745,9 +852,9 @@ impl Turn {
         }
 
         match method {
-            ALLOCATE_METHOD => self.allocate(
-                message, peer, local, transport, context, tcp_sink, &identity,
-            ),
+            ALLOCATE_METHOD => {
+                self.allocate(message, peer, local, transport, context, sink, &identity)
+            }
             REFRESH_METHOD => self.refresh(message, peer, local, transport, &identity),
             CREATE_PERMISSION_METHOD => {
                 self.create_permission(message, peer, local, transport, context, &identity)
@@ -769,7 +876,7 @@ impl Turn {
         local: SocketAddr,
         transport: ClientTransport,
         context: &ServerContext,
-        tcp_sink: Option<&mpsc::Sender<Vec<u8>>>,
+        sink: Option<&mpsc::Sender<Vec<u8>>>,
         identity: &Identity,
     ) -> Decision {
         let transaction_id = &message.transaction_id;
@@ -1054,8 +1161,8 @@ impl Turn {
                     ));
                 }
             },
-            ClientTransport::Tcp => match tcp_sink {
-                Some(sink) => ClientSink::Tcp(sink.clone()),
+            ClientTransport::Tcp | ClientTransport::Dtls => match sink {
+                Some(sink) => ClientSink::Queue(sink.clone()),
                 None => {
                     self.release_port(relay_addr.port());
                     return Decision::Respond(signed_error(
@@ -1073,6 +1180,8 @@ impl Turn {
             expires_at: now + Duration::from_secs(u64::from(granted)),
             permissions: HashMap::new(),
             channels: HashMap::new(),
+            inbound: TokenBucket::new(self.config.bandwidth, now),
+            outbound: TokenBucket::new(self.config.bandwidth, now),
         }));
         let relay_task = spawn_relay_reader(
             relay.clone(),
@@ -1645,10 +1754,42 @@ impl Turn {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
+        self.relay_to_peer(&allocation, data, peer_address);
+    }
+
+    /// Client → peer relay of one payload, gated by the allocation's inbound
+    /// bandwidth bucket (`--turn-bandwidth`).
+    ///
+    /// Over the cap the payload is dropped and counted; the allocation stays
+    /// alive (a bandwidth spike must not tear down a call).
+    fn relay_to_peer(
+        &self,
+        allocation: &Allocation,
+        data: &[u8],
+        peer_address: SocketAddr,
+    ) -> bool {
+        let now = Instant::now();
+        let allowed = lock_write(&allocation.state)
+            .inbound
+            .try_take(now, data.len());
+        if !allowed {
+            self.counters
+                .bytes_dropped_in
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            tracing::debug!(
+                relay = %allocation.relay_addr,
+                bytes = data.len(),
+                "rstun: TURN inbound bandwidth cap, payload dropped"
+            );
+            return false;
+        }
         if allocation.relay.try_send_to(data, peer_address).is_ok() {
             self.counters
                 .bytes_in
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 
@@ -1694,11 +1835,7 @@ impl Turn {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if allocation.relay.try_send_to(data, peer_address).is_ok() {
-            self.counters
-                .bytes_in
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-        }
+        self.relay_to_peer(&allocation, data, peer_address);
     }
 
     fn quota_counts(&self, username: &str, ip: IpAddr) -> (usize, usize) {
@@ -1766,6 +1903,21 @@ fn spawn_relay_reader(
             if !permitted {
                 continue;
             }
+            // Peer → client bandwidth bucket. Over the cap: drop and count,
+            // keep the allocation (and the call) alive.
+            let allowed = lock_write(&state).outbound.try_take(now, length);
+            if !allowed {
+                counters
+                    .bytes_dropped_out
+                    .fetch_add(length as u64, Ordering::Relaxed);
+                tracing::debug!(
+                    %client,
+                    %source,
+                    bytes = length,
+                    "rstun: TURN outbound bandwidth cap, payload dropped"
+                );
+                continue;
+            }
             let payload = match channel {
                 Some(channel) => channel_data_frame(channel, &buffer[..length], transport),
                 None => data_indication(source, &buffer[..length]),
@@ -1774,7 +1926,7 @@ fn spawn_relay_reader(
                 ClientSink::Udp(socket) => socket.send_to(&payload, client).await.is_ok(),
                 // Bounded queue: a client that stops reading loses datagrams
                 // (relayed data is best-effort) but cannot grow memory.
-                ClientSink::Tcp(writer) => writer.try_send(payload).is_ok(),
+                ClientSink::Queue(writer) => writer.try_send(payload).is_ok(),
             };
             if sent {
                 counters
@@ -1801,9 +1953,12 @@ pub fn is_channel_data_prefix(byte: u8) -> bool {
 
 /// `ChannelData` framing: 4-byte header + payload; TCP pads to 4 bytes (§12.5).
 fn channel_data_frame(channel: u16, data: &[u8], transport: ClientTransport) -> Vec<u8> {
-    let padding = match transport {
-        ClientTransport::Udp => 0,
-        ClientTransport::Tcp => (4 - data.len() % 4) % 4,
+    // A datagram transport carries header + payload (RFC 8656 §12.4); only a
+    // stream transport pads to a 4-byte boundary (§12.5).
+    let padding = if transport.is_datagram() {
+        0
+    } else {
+        (4 - data.len() % 4) % 4
     };
     let mut frame = Vec::with_capacity(4 + data.len() + padding);
     frame.extend_from_slice(&channel.to_be_bytes());

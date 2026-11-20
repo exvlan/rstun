@@ -444,6 +444,26 @@ impl OpsState {
 
             header(
                 &mut out,
+                "rstun_turn_bytes_dropped_total",
+                "Payload bytes dropped by the per-allocation bandwidth cap \
+                 (--turn-bandwidth); direction matches rstun_turn_bytes_total.",
+                "counter",
+            );
+            sample(
+                &mut out,
+                "rstun_turn_bytes_dropped_total",
+                &[("direction", "in")],
+                counts.bytes_dropped_in,
+            );
+            sample(
+                &mut out,
+                "rstun_turn_bytes_dropped_total",
+                &[("direction", "out")],
+                counts.bytes_dropped_out,
+            );
+
+            header(
+                &mut out,
                 "rstun_turn_allocations_total",
                 "TURN allocation lifecycle events, by result.",
                 "counter",
@@ -1013,6 +1033,12 @@ const ENV_FLAGS: &[(&str, EnvKind)] = &[
     ("max_allocations_per_ip", EnvKind::Value),
     ("permission_limit", EnvKind::Value),
     ("allocation_lifetime", EnvKind::Value),
+    ("turn_tls_listen", EnvKind::List),
+    ("turn_dtls_listen", EnvKind::List),
+    ("tls_cert", EnvKind::Value),
+    ("tls_key", EnvKind::Value),
+    ("rest_secret", EnvKind::Value),
+    ("turn_bandwidth", EnvKind::Value),
 ];
 
 /// `RSTUN_<FLAG>`: uppercase, `-` → `_`.
@@ -1172,6 +1198,12 @@ fn overlay(args: &mut Args, from_env: &mut Args, matches: &ArgMatches) {
         max_allocations_per_ip,
         permission_limit,
         allocation_lifetime,
+        turn_tls_listen,
+        turn_dtls_listen,
+        tls_cert,
+        tls_key,
+        rest_secret,
+        turn_bandwidth,
     );
 }
 
