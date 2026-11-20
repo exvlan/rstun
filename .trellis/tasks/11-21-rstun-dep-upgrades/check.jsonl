@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/auth.md", "reason": "HMAC/key 派生契约（升级不得改变向量结果）"}
+{"file": ".trellis/spec/backend/turn.md", "reason": "DTLS/证书契约（webrtc-util 升级影响面）"}
