@@ -82,7 +82,7 @@ webrtc-dtls = { version = "0.12", optional = true, features = ["pem"] }
 # （`listen()` 返回 `impl Listener`，`accept()` 返回 `Arc<dyn Conn>`），调用这些
 # 方法必须把 trait 带进作用域。它不是新增的传递依赖：webrtc-dtls 已依赖同一个
 # crate（同版本、同 feature），这里只是把它变成直接依赖以便 `use`。
-webrtc-util = { version = "0.11", optional = true, default-features = false, features = [
+webrtc-util = { version = "0.17", optional = true, default-features = false, features = [
   "conn",
 ] }
 
