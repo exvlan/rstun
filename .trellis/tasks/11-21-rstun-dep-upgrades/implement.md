@@ -209,3 +209,30 @@ FROZEN_BASE=8a0fe2d bash script/lab/rstun-turn.sh --no-build
      `contrib/helm/Chart.yaml`（`appVersion`）、`contrib/helm/values.yaml`（`tag`）
    其余 `26.410.100` 出现点（协议/鉴权/限流文档里的「与 26.410.100 逐字节一致」、
    `docs/perf.md` 的被测版本、`script/**` 与源码注释）属历史基线与示例，保留不改。
+
+## 发版执行记录（26.410.101，主会话）
+
+| 项 | 结果 |
+| --- | --- |
+| 代码提交 | `9daa319`（依赖升级 + 版本号 + CHANGELOG + README 重测）|
+| crates.io | ✅ `rstun v26.410.101` 已发布；`cargo install rstun --version 26.410.101` → `rstun 26.410.101` |
+| Release 流水线 | ✅ run `44792798928` 11/11 作业成功 |
+| Release 资产 | ✅ **11**（lean+full 各 4 zip + 2 SBOM + `rstun.rb`）；tag `rstun-v26.410.101` |
+| 镜像 | `ghcr.io/exvlan/rstun:26.410.101`（amd64+arm64，full）|
+| **新 manifest digest** | `sha256:78c0d07581a74c650dedb518347aa92079ed0063825d72c40e6fb52e0835ae17` |
+| 上一版 digest（26.410.100）| `sha256:bafa4f17257b37d05e6d5615d9cbd4f46105ac610473607ca10329926657b663` |
+| Dependabot | #3/#4/#6/#7 关闭（由 `9daa319` 取代）；#5 关闭（blocked upstream），**0 个 open** |
+
+### 复核修正（冷复核发现，已改）
+
+1. CHANGELOG 原写「tokio 1.54.0 → 1.54.1、tokio-rustls 0.26.5 → 0.26.6」与实际不符——
+   `Cargo.lock` 里两者升级前后都是 1.54.1 / 0.26.6，本次只收紧约束文本；实际变化的 patch 只有
+   `clap 4.6.8 → 4.6.9`。已按事实改写。
+2. 同名多版本计数：30 → **28**（不是 29；减少的是 `md-5 0.10.6` 与 `md-5 0.11.0` 两行）。
+3. 发版清单补 `contrib/{k8s,docker,helm}` 四个钉死旧 tag 的可部署产物（`release.yml` 不会自动改）。
+
+### 发版后已同步的版本钉死点
+
+`README.md`（安装表「已发布」）、`docs/book/src/docker.md`（镜像示例）、
+`contrib/k8s/deployment.yaml`、`contrib/docker/compose.yaml`、
+`contrib/helm/Chart.yaml`（`appVersion`）、`contrib/helm/values.yaml`（`tag`）。

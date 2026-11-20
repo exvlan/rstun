@@ -32,6 +32,7 @@
 | 镜像 | `ghcr.io/exvlan/rstun:<version>`，稳定版附 `:latest`；双架构必须由 manifest 合并 | 单架构冒充双架构 |
 | 包可见性 | 新包默认 private：有凭证可拉、匿名 401 | 「我这边能 pull」误判 |
 | 动态链接 | linux 目标为 static-pie（musl）| 依赖宿主 glibc 版本 |
+| full 构建的 C 工具链 | Linux musl 目标必须装 `musl-tools` 且设 `CC_<triple>=musl-gcc`（full 的 `ring` 含 C 代码）| `cc-rs: failed to find <triple>-musl-gcc`，构建 exit 101 |
 
 ## 4. Validation & Error Matrix
 
@@ -43,6 +44,7 @@
 | 镜像缺 amd64 或 arm64 | 发布失败（manifest 不完整）|
 | Windows 冒烟/脚本 | 必须 `PYTHONIOENCODING=utf-8`，缺 `python3` 时用 `python` shim |
 | 精简 CI 作业 | 本仓无 `.cargo/config.toml` 的链接器强制项；若将来加入（如 mold），需在作业里自装 |
+| TLS 握手探针 | 必须「先落盘再 `grep`」；`pipefail` 下 `openssl s_client \| grep -q` 会因 grep 命中即退出让 openssl 收 SIGPIPE，握手成功也判失败 |
 
 ## 5. Good / Base / Bad
 

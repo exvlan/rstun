@@ -36,7 +36,7 @@ Release 的 `rstun-full-*` 或镜像）：
 
 | 渠道 | 命令 | 说明 |
 | --- | --- | --- |
-| Cargo | `cargo install rstun` | 已发布 `26.410.100`；从源码树用 `cargo install --path .` |
+| Cargo | `cargo install rstun` | 已发布 `26.410.101`；从源码树用 `cargo install --path .` |
 | Homebrew | `brew install exvlan/rstun/rstun` | tap 见 [`contrib/homebrew/rstun.rb`](contrib/homebrew/rstun.rb)；**lean** |
 | Debian / Ubuntu | `sudo dpkg -i rstun_<version>_amd64.deb` | [`contrib/deb/nfpm.yaml`](contrib/deb/nfpm.yaml)，含 systemd unit；**lean** |
 | Docker | `docker run -d -p 3478:3478/udp ghcr.io/exvlan/rstun:<version>` | **full** 构建，见 [Docker 页](docs/book/src/docker.md) |
