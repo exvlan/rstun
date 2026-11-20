@@ -1169,7 +1169,7 @@ name = "rstun"
 version = "26.410.100"
 dependencies = [
  "clap",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "md-5 0.10.6",
  "rustls-pemfile",
  "sha1 0.10.7",
