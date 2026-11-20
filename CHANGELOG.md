@@ -3,7 +3,28 @@
 版本线**独立于任何宿主项目**：`YY.QMM.Mmpp`（年.季度月.月日+序号），首发 `26.410.100`。
 `rstun-v*` 的 Release tag / 镜像 tag / 资产名都用这里给出的版本号。
 
-## Unreleased
+## 26.410.101
+
+补丁版：依赖升到各自最新 + 上一版积累的功能（T1 TURN、T2 `turns:`/DTLS/REST/带宽、
+运维面、鉴权、协议闭环、抗滥用）一并交付。
+
+### 依赖升级（无协议字节、无 CLI、无指标名变化）
+
+- RustCrypto 栈升到 `digest 0.11` 一代：`hmac 0.12 → 0.13`、`md-5 0.10 → 0.11`、
+  `sha1 0.10 → 0.11`、`sha2 0.10 → 0.11`。唯一代码改动是 `src/auth.rs` 里
+  `<Hmac<_> as Mac>::new_from_slice` → `<Hmac<_> as KeyInit>::new_from_slice`
+  （`digest 0.11` 把 `new_from_slice` 移到了 `KeyInit`）；算法、key 派生（`MD5`/`SHA256`
+  长期凭据、`USERHASH` 32 字节、nonce HMAC）与全部 RFC 向量（2202 / 4231 / 1321 /
+  5769 §2.4）**逐字节不变**。
+- `clap 4.6.8 → 4.6.9`（锁文件里实际变化的唯一 patch）。
+  `tokio` / `tokio-rustls` 只把 `Cargo.toml` 的约束文本收紧到 `1.54.1` / `0.26.6`
+  （`Cargo.lock` 解析版本未变，运行时行为相同）。CI 门禁与 lab 全绿。
+- **`webrtc-util` 保持 0.11**（Dependabot #5 不合并）：`webrtc-dtls` 最新版仍是 `0.12.0`，
+  它钉死 `util ^0.11`；把直接依赖升到 `0.17.3` 会让树里出现两份 `webrtc-util`，
+  `DTLSConn` 实现的是 0.11 的 `Conn`，`Arc<DTLSConn> → Arc<dyn Conn>` 转换编译失败
+  （E0277/E0308）。等上游 `webrtc-dtls` 跟进后再升。
+- 直接依赖数不变：`cargo tree -e normal --depth 1` = **9**（lean）/ **13**（full）。
+  默认关闭路径的字节冻结（`plain_response_bytes_are_frozen` 与 3 配置 × 17 请求对照）不变。
 
 ### TURN（RFC 8656 UDP 中继，`--turn`，T1）
 

@@ -336,20 +336,24 @@ nft add rule inet filter input tcp dport 3478 accept   # 仅 --tcp 时需要
 
 ## 依赖面
 
-两种构建，依赖面不同。**下面的数字都可以用标注的命令复现**（2026-11-20，Linux x86_64，
+两种构建，依赖面不同。**下面的数字都可以用标注的命令复现**（2026-11-21，Linux x86_64，
 Rust 1.95）：
 
 | 指标 | lean（默认） | full（`--features full`） | 命令 |
 | --- | --- | --- | --- |
 | 直接依赖 | **9** | **13** | `cargo tree -e normal --depth 1 [--all-features] \| tail -n +2 \| wc -l` |
-| 依赖树行数（含重复的 feature 合并） | 89 | 345 | `cargo tree -e normal [--all-features] \| wc -l` |
-| 唯一 crate 数 | 65 | 201 | `cargo tree -e normal [--all-features] --format '{p}' \| sed 's/^[│├└─ \t]*//' \| sort -u \| wc -l` |
-| release 二进制（未 strip） | **3.77 MB** | **7.93 MB** | `cargo build --release [--features full] && ls -l target/release/rstun` |
-| 镜像/发布用的二进制（LTO + strip） | **2.35 MB** | **4.80 MB** | 见 Dockerfile 的 `CARGO_PROFILE_RELEASE_{LTO,CODEGEN_UNITS,STRIP}` |
+| 依赖树行数（含重复的 feature 合并） | 89 | 359 | `cargo tree -e normal [--all-features] \| wc -l` |
+| 唯一 crate 数 | 66 | 212 | `cargo tree -e normal [--all-features] --format '{p}' \| sed 's/^[│├└─ \t]*//' \| sort -u \| wc -l` |
+| release 二进制（未 strip） | **3.77 MB** | **7.95 MB** | `cargo build --release [--features full] && ls -l target/release/rstun` |
+| 镜像/发布用的二进制（LTO + strip） | **2.34 MB** | **4.82 MB** | 见 Dockerfile 的 `CARGO_PROFILE_RELEASE_{LTO,CODEGEN_UNITS,STRIP}` |
 
-> `cargo metadata --format-version 1 | jq '.packages\|length'` 也能跑（本仓 87），但它数的是
+> `cargo metadata --format-version 1 | jq '.packages\|length'` 也能跑（本仓 77），但它数的是
 > **Cargo.lock 里的全部包**——含 dev-dependencies 与未启用的 optional 依赖，不区 feature，
 > 所以不适合回答「这份二进制带了多少依赖」。上表按 feature 分别计。
+>
+> full 比 lean 多出的 146 行里，有一大块是 **两代 `digest` 各一份**：本仓的鉴权栈在
+> `digest 0.11`，而 `webrtc-dtls 0.12`（上游最新版）仍钉 `digest 0.10`，两代都留在树里
+> （`webrtc-dtls` 跟进后自动消失，届时删掉这段说明）。
 
 ```
 lean：

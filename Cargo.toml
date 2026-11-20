@@ -3,7 +3,7 @@ name = "rstun"
 description = "Standalone STUN/TURN server (RFC 5389 Binding with optional short/long-term authentication; RFC 5780 NAT behaviour discovery with `--alt-listen`; RFC 8656 relay with `--turn`: UDP/TCP, `turns:` (TLS) and DTLS behind the `tls`/`dtls` features; TURN REST credentials and per-allocation bandwidth quotas)."
 homepage = "https://github.com/exvlan/rstun"
 repository = "https://github.com/exvlan/rstun"
-version = "26.410.100"
+version = "26.410.101"
 # 本 crate 是一个**独立项目**：没有 workspace、没有 path 依赖，
 # `docker build .` 与 `cargo install --path .` 都能直接工作，
 # 所以 edition / rust-version / 依赖版本都写实数。
@@ -37,10 +37,10 @@ dtls = ["tls", "dep:webrtc-dtls", "dep:webrtc-util"]
 full = ["tls", "dtls"]
 
 [dependencies]
-clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+clap = { version = "4.6.9", features = ["derive", "wrap_help"] }
 # `all` 为了 set_only_v6 / set_reuse_address / listen。
 socket2 = { version = "0.6.5", features = ["all"] }
-tokio = { version = "1.53", default-features = false, features = [
+tokio = { version = "1.54.1", default-features = false, features = [
   "io-util",
   "macros",
   "net",
@@ -58,18 +58,24 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "fmt",
 ] }
 # 鉴权（RFC 5389 §10 / RFC 8489 §9.2）**不手写密码学**：四个 RustCrypto 小 crate，
-# 纯 Rust、无 C 依赖，版本固定在 digest 0.10 这一代（彼此 ABI 兼容）。
+# 纯 Rust、无 C 依赖，版本固定在 digest 0.11 这一代（彼此 ABI 兼容）。
 # 运行期依赖因此从 5 个变成 9 个 —— README「依赖面」与 CHANGELOG 都明写了这一点。
-hmac = "0.12"
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
+#
+# `default-features = false`：md-5/sha1/sha2 0.11 一代的默认特性是 `alloc` + `oid`，
+# 本仓只用「喂字节 → 取摘要」，不用 OID 常量也不需要 crate 侧分配 —— 关掉它们能把
+# `const-oid` 挡在运行期依赖树之外，lean 的依赖树行数因此与 0.10 一代完全一致
+# （89 行，见 README）。hmac 0.13 本身没有默认特性，这一行只是与同代保持一致。
+# 算法与输出不受影响（RFC 2202/4231/1321/5769 向量照旧逐字节断言）。
+hmac = { version = "0.13", default-features = false }
+md-5 = { version = "0.11", default-features = false }
+sha1 = { version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 
 # ---- TURN T2：`turns:`（TLS，RFC 8656 §5）与 DTLS 客户端传输（feature = tls / dtls）----
 # 全部 optional：默认构建（lean）不编译、不链接、不引入它们的传递依赖。
 # rustls 的 provider 固定为 ring（`default-features = false`）：webrtc-dtls 也用
 # ring，两个 provider 同时编进来时 `CryptoProvider::get_default()` 会 panic。
-tokio-rustls = { version = "0.26.5", optional = true, default-features = false, features = [
+tokio-rustls = { version = "0.26.6", optional = true, default-features = false, features = [
   "logging",
   "ring",
   "tls12",

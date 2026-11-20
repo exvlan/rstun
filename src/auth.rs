@@ -33,7 +33,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md5::Md5;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -770,7 +770,7 @@ impl Auth {
         let expiry_bytes = expiry.to_be_bytes();
         let mut nonce = [0_u8; NONCE_LEN];
         nonce[..NONCE_EXPIRY_LEN].copy_from_slice(&expiry_bytes[8 - NONCE_EXPIRY_LEN..]);
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.secret)
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.secret)
             .expect("HMAC accepts a key of any length");
         mac.update(&expiry_bytes[8 - NONCE_EXPIRY_LEN..]);
         match client {
@@ -985,14 +985,14 @@ fn attribute(body: &[u8], attr_type: u16) -> Option<&[u8]> {
 
 fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac =
-        <Hmac<Sha1> as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
+        <Hmac<Sha1> as KeyInit>::new_from_slice(key).expect("HMAC accepts a key of any length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts a key of any length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

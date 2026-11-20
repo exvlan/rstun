@@ -2,10 +2,15 @@
 
 ## 1. 边界
 
-- 只做 **Dependabot 已提出的 5 个 crate** 升级与必要的最小代码适配；不借机重构鉴权/DTLS。
+- **全部依赖升到各自最新**（用户定稿）：`clap`、`tokio`、crypto 栈（`sha1/sha2/md-5/hmac`）、
+  `webrtc-util`，以及其间的 patch/minor；不借机重构鉴权/DTLS。
+- 升级完成后**发补丁版**（用户定稿）：版本号 `26.410.101`（`YY.QMM.Mmpp` 的 patch+1），
+  crates.io 重发 + Release 11 资产 + 双架构镜像，并告知生产新 digest。
 - 分两阶段，各自独立可回滚：
+  - **阶段 0**：semver 兼容的 patch/minor（`clap 4.6.9`、`tokio 1.54.1`、`tokio-rustls 0.26.6` 等）；
   - **阶段 1**：`sha1` / `sha2` / `md-5`（`digest 0.10 → 0.11`）→ 再 `hmac 0.12 → 0.13`；
-  - **阶段 2**：`webrtc-util 0.11 → 0.17`（DTLS 链，可能连带 `webrtc-dtls`）。
+  - **阶段 2**：`webrtc-util 0.11 → 0.17`（DTLS 链，可能连带 `webrtc-dtls`）；
+  - **阶段 3**：版本号 `26.410.101` + `CHANGELOG`，进入发布（由主会话执行 publish/release）。
 - 不改协议字节、不改 CLI、不改指标名。
 
 ## 2. 阶段 1：crypto 栈
