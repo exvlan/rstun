@@ -28,6 +28,20 @@
 | `k8s/deployment.yaml` | `hostNetwork` + UDP/TCP 3478 + `readinessProbe → /healthz` + 只读根文件系统 | `kubectl apply --dry-run=client -f contrib/k8s/` |
 | `k8s/service.yaml` | `LoadBalancer` + `externalTrafficPolicy: Local` | 同上 |
 | `helm/` | 最小 chart（`listen` / `rfc5780` / `health` / `abuse` / `drainTimeoutSeconds` 在 values 里），**无第三方 chart 依赖** | `helm lint contrib/helm` + `helm template contrib/helm` |
+| `deb/nfpm.yaml` | `.deb` 打包配置（binary → `/usr/local/bin`、unit → `/lib/systemd/system`、文档 → `/usr/share/doc/rstun`），由 `script/ci/build-deb.sh` 渲染后调用 | `bash script/ci/build-deb.sh`（内含 `dpkg -c` + `systemd-analyze verify`） |
+| `deb/rstun.service` | **装完就能起来**的默认 unit（通配 3478 + `--tcp`），与上面的运维样例不同 | `systemd-analyze verify` |
+| `homebrew/rstun.rb` | Homebrew formula **模板**（发布时由 `script/ci/gen-brew.sh` 填版本 + sha256，推到 `exvlan/homebrew-rstun` tap） | `ruby -c` |
+
+## 包管理器（只发 lean）
+
+```bash
+bash script/ci/build-deb.sh                  # dist/deb/rstun_<version>_<arch>.deb（含 systemd unit）
+bash script/ci/gen-brew.sh --assets <dir>    # dist/homebrew/rstun.rb（发布时用真实 Release 资产）
+```
+
+包管理器里只出 **lean** 构建：`turns:`(TLS)/DTLS 走 Release 的 `rstun-full-*` 与
+`ghcr.io/exvlan/rstun` 镜像，避免同一个版本出现两个包。两边的版本串都必须等于
+`Cargo.toml` 的 `version`（脚本会硬校验）。
 
 ## systemd
 

@@ -1,0 +1,42 @@
+# Dependabot：只开 PR，**不自动合并**（合并是人的决定，见 CONTRIBUTING 的门禁）。
+#
+# 节奏：cargo 每周一次（依赖面小、升级风险真实）；GitHub Actions 每月一次
+# （action 全部锁 commit SHA，升级就是换 SHA，频率低但必须有人看 diff）。
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+
+  # fuzz 是独立 workspace（nightly + libFuzzer），依赖不跟随主树 —— 单独盯。
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps/fuzz)"
+    labels:
+      - dependencies
+      - fuzz
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - dependencies
+      - ci

@@ -1,0 +1,87 @@
+name: Bug 报告
+description: 协议行为不对、启动失败、崩溃、打包/部署问题
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **安全漏洞请不要用这个模板**：见 [SECURITY.md](https://github.com/exvlan/rstun/blob/main/SECURITY.md)
+        （私密 advisory 或邮件），不要开公开 issue。
+
+        报告前请先跑一次 `rstun --version` 与最小复现命令；缺版本/构建形态的问题通常无法定位。
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本（必填）
+      description: "`rstun --version` 的完整输出（发行版带 `+<sha6>`）：`rstun 26.410.100+abc123`"
+      placeholder: "rstun 26.410.100+abc123"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: features
+    attributes:
+      label: 构建形态（必填）
+      description: lean 是默认（STUN + TURN UDP/TCP + REST + 带宽）；full 另加 `turns:`(TLS) 与 DTLS
+      options:
+        - lean（`cargo build` / brew / .deb / `rstun-<platform>-*.zip`）
+        - full（`--features full` / 镜像 / `rstun-full-<platform>-*.zip`）
+        - 不确定（请说明从哪里装的）
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: 平台（必填）
+      description: "OS + 架构 + 部署形态：如 `Debian 13 / x86_64 / 裸机 systemd`、`macOS 15 arm64 / Rosetta`、`Windows 11 x86_64`、`K8s pod (glibc)`"
+      placeholder: "Debian 13 / x86_64 / 裸机 systemd"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: 启动命令与关键参数（必填）
+      description: 脱敏后的完整命令行（含 `--listen` / `--tcp` / `--turn` / `--realm` / 限速参数）。**不要贴真实凭据与公网 IP**。
+      render: shell
+      placeholder: |
+        rstun server --listen 0.0.0.0:3478 --tcp --rate-limit 200 --health-listen 127.0.0.1:9100
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 最小复现（必填）
+      description: 让别人能在本机重放的步骤或脚本（发包命令、`rstun-smoke.sh`、curl `/metrics` 等）。
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望 vs 实际
+      description: 协议问题请写清期望的状态码/属性/字节数，以及实测到的值（抓包或探针输出）。
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志与统计
+      description: 启动日志（`RUST_LOG=debug` 更好）、退出时的 `received/answered/dropped` 行、`/metrics` 相关片段。
+      render: text
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 自查
+      options:
+        - label: 我已确认这不是 [SECURITY.md](https://github.com/exvlan/rstun/blob/main/SECURITY.md) 里列出的「已知不算漏洞的行为」
+          required: true
+        - label: 我已确认用的是最新 Release（或说明了为什么不能升级）
+          required: true
