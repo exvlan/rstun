@@ -1,0 +1,249 @@
+name: QA scheduled
+
+# 每周一次的质量任务（不是 PR 门禁）：fuzz、互操作矩阵、基准冒烟。
+#
+# 为什么单独一个 workflow：
+#   * `ci.yml` 每次 push/PR 都要跑，加 10 分钟 fuzz 会把反馈时间拖到不可接受；
+#   * 这三项的价值在「长期趋势 + 依赖漂移」，而不是单次提交的正确性；
+#   * 全都**不设硬阈值**（公共 runner 噪声比阈值大）：基准只存数值，覆盖率在
+#     `ci.yml` 里非阻塞上传；fuzz 崩溃才开 issue（那是真缺陷，不是噪声）。
+#
+# 设计见 `.trellis/tasks/11-19-rstun-qa/design.md` §5，产物说明见 `docs/perf.md`。
+#
+# 手动跑：Actions → QA scheduled → Run workflow。
+#   fuzz_seconds  默认 600（10 分钟）
+#   run_interop   默认 true（42 项互操作矩阵，容器里装 coturn + go）
+#   run_bench     默认 true（release 构建 + 压测冒烟，只存 JSON）
+#
+# 额度：public 仓免费；每周一次的矩阵刻意只有一份（不按平台铺开，避免浪费）。
+
+on:
+  schedule:
+    # 每周一 04:00 UTC（北京时间 12:00）。只跑一份，不铺矩阵。
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "fuzz 时长（秒）"
+        required: false
+        default: "600"
+      run_interop:
+        description: "跑互操作矩阵（rstun-interop.sh all）"
+        required: false
+        type: boolean
+        default: true
+      run_bench:
+        description: "跑基准冒烟（只存数值，不设阈值）"
+        required: false
+        type: boolean
+        default: true
+
+# fuzz 崩溃要开 issue（issues: write）；其余只读。
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: qa-scheduled
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fuzz:
+    name: fuzz (parse, ${{ inputs.fuzz_seconds || '600' }}s)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      FUZZ_SECONDS: ${{ inputs.fuzz_seconds || '600' }}
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # fuzz 目标在独立 workspace（`fuzz/`，nightly + libFuzzer）。
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: nightly
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: qa-fuzz-${{ runner.os }}-${{ runner.arch }}
+          workspaces: "fuzz -> target"
+
+      - name: Install cargo-fuzz
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-fuzz >/dev/null 2>&1; then
+            cargo +nightly install cargo-fuzz --locked
+          fi
+
+      # 崩溃/挂死都算失败：libFuzzer 自己会以非 0 退出，但 OOM/timeout 的
+      # 关键词有时只出现在日志里（`rstun-interop.sh` 的 fuzz 项同样这么判）。
+      - name: Run fuzzer
+        id: fuzz
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/fuzz-out"
+          status=0
+          (cd fuzz && cargo +nightly fuzz run parse -- \
+            -max_total_time="$FUZZ_SECONDS" \
+            -rss_limit_mb=2048 \
+            -artifact_prefix="$GITHUB_WORKSPACE/fuzz-out/") \
+            >fuzz.log 2>&1 || status=$?
+          tail -40 fuzz.log || true
+          if grep -qE "panicked|ERROR: libFuzzer|deadly signal|timeout after" fuzz.log; then
+            status=1
+          fi
+          echo "exit=$status"
+          exit "$status"
+
+      # 崩溃即开 issue（有未闭环的 `fuzz` label issue 就追加评论，免得每周刷一条）。
+      # 没有崩溃时这一步不执行；issue 打不开也不会盖掉 fuzz 本身的红灯（两个信号）。
+      - name: Open issue on crash
+        if: steps.fuzz.outcome == 'failure'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # 固定 label 去重（`--search` 的标题匹配依赖搜索索引，容易漏；label 是精确的）。
+          gh label create fuzz --color FBCA04 --description "定时 fuzz 崩溃" 2>/dev/null || true
+          existing="$(gh issue list --label fuzz --state open --json number --jq '.[0].number // empty')"
+          body="$(printf '定时 fuzz 失败（%s）。\n\n运行：%s\n\n```\n%s\n```\n' \
+            "$(date -u +%F)" "$RUN_URL" "$(tail -80 fuzz.log)")"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "[fuzz] parse crashed ($(date -u +%F))" --label fuzz --body "$body"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: fuzz-${{ github.run_id }}
+          path: |
+            fuzz.log
+            fuzz-out/
+            fuzz/corpus/
+          if-no-files-found: warn
+          retention-days: 14
+
+  interop:
+    name: "interop matrix (container: coturn + go)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container: buildpack-deps:trixie
+    if: ${{ inputs.run_interop || github.event_name == 'schedule' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # `rstun-interop.sh all` 的对手：coturn（turnserver + turnutils_*）、go（pion）、
+      # python3（探针，只用标准库）。容器里缺一样，脚本会记 SKIP 而不是失败 ——
+      # 所以下面**显式断言「没有 SKIP」**，否则这个 job 会在缺依赖时假绿。
+      - name: Install interop dependencies
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            coturn golang-go python3 iproute2 ca-certificates curl
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: qa-interop-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Interop matrix (all)
+        run: |
+          set -uo pipefail
+          status=0
+          bash script/lab/rstun-interop.sh all >interop.log 2>&1 || status=$?
+          tail -60 interop.log || true
+          # 只白名单 IPv6：容器/runner 不保证 `::1`（容器内 IPv6 未验证，本 job 也不
+          # 声明已验证）。**其它任何 SKIP 都算失败** —— 容器里 coturn/go/python3
+          # 应当齐全，缺了就是环境没装好，不能假绿。
+          unexpected="$(grep '^  SKIP ' interop.log \
+            | grep -vE '^  SKIP (probe/ipv6|webrtc-stun/ipv6)( |$)' || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo "::error::interop 出现了白名单之外的 SKIP（依赖没装齐）："
+            printf '%s\n' "$unexpected"
+            status=1
+          fi
+          exit "$status"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: interop-${{ github.run_id }}
+          path: interop.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  bench:
+    name: bench smoke (numbers only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # 设计已定：CI 不设性能阈值（公共 runner 噪声大），数值只存 artifact 供趋势对比。
+    # 因此整个作业允许失败但保留产物 —— 真回归看数值，不看这一步的红绿。
+    continue-on-error: true
+    if: ${{ inputs.run_bench || github.event_name == 'schedule' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: qa-bench-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build release binary (lean)
+        run: cargo build --release
+
+      - name: Load smoke (udp / rate-limit / tcp)
+        run: |
+          set -uo pipefail
+          mkdir -p bench
+          rc=0
+          bash script/lab/rstun-load.sh --mode udp --duration 10 --rate 5000 --no-build \
+            --json --out bench/udp-5000.json >bench/udp-5000.stdout.json 2>bench/udp-5000.stderr.log || rc=1
+          bash script/lab/rstun-load.sh --mode udp --duration 10 --rate 2000 --rate-limit 1000 --no-build \
+            --json --out bench/udp-2000-limited.json >bench/udp-limited.stdout.json 2>bench/udp-limited.stderr.log || rc=1
+          bash script/lab/rstun-load.sh --mode tcp --duration 5 --rate 200 --concurrency 32 --no-build \
+            --json --out bench/tcp-200.json >bench/tcp-200.stdout.json 2>bench/tcp-200.stderr.log || rc=1
+          {
+            echo "## bench smoke"
+            for file in bench/*.stdout.json; do
+              echo "### $file"
+              echo '```json'
+              cat "$file"
+              echo '```'
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: bench-${{ github.run_id }}
+          path: bench/
+          if-no-files-found: warn
+          retention-days: 30

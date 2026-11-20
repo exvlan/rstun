@@ -101,6 +101,61 @@ jobs:
           fi
           cargo audit
 
+  # 覆盖率：只在 Linux 跑一份（行/区域覆盖与平台无关），**非阻塞**。
+  #
+  # 设计取舍（`.trellis/tasks/11-19-rstun-qa/design.md` §5）：先观察一版，
+  # 不设 `--fail-under-lines` 门禁 —— 阈值定早了只会把「测试代码也算进去」的
+  # 噪声变成假红。artifact 里放 lcov + 文本摘要，发布前人工看趋势。
+  #
+  # `--ignore-filename-regex` 排除纯测试夹具（`src/tests_interop.rs`、`tests/`、
+  # `fuzz/`）。注意 `main.rs` 内部的 `#[cfg(test)] mod tests` **仍计入**：
+  # llvm-cov 只能按文件排除，按模块排除要改源码结构（本任务不改服务代码）。
+  coverage:
+    name: coverage (llvm-cov, non-blocking)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # `llvm-tools-preview` 提供 llvm-profdata / llvm-cov（cargo-llvm-cov 依赖它）。
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          components: llvm-tools-preview
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: coverage-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-llvm-cov
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+            cargo install cargo-llvm-cov --locked
+          fi
+
+      # 一次带插桩的测试运行，产出 lcov（artifact）+ 文本摘要（step summary）。
+      - name: Coverage (all features)
+        run: |
+          set -euo pipefail
+          IGNORE='(src/tests_interop\.rs|tests/|fuzz/)'
+          cargo llvm-cov --all-features --ignore-filename-regex "$IGNORE" \
+            --lcov --output-path lcov.info
+          # `report` 不复用上一条的过滤条件：正则必须再传一次，否则摘要会把
+          # 测试夹具（tests_interop.rs 等）算进去，与 lcov.info 口径不一致。
+          cargo llvm-cov report --summary-only --ignore-filename-regex "$IGNORE" \
+            >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: coverage-${{ github.run_id }}
+          path: lcov.info
+          if-no-files-found: warn
+          retention-days: 30
+
   smoke:
     name: smoke udp+tcp (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
