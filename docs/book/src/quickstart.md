@@ -4,7 +4,7 @@
 
 | 渠道 | 命令 | 构建 |
 | --- | --- | --- |
-| Cargo（crates.io，发布后） | `cargo install rstun` | lean |
+| Cargo（crates.io） | `cargo install rstun` | lean |
 | Cargo（源码树） | `cargo install --path .`（`--features full` 加 `turns:`/DTLS） | lean / full |
 | Homebrew | `brew install exvlan/rstun/rstun` | lean |
 | Debian / Ubuntu | `sudo dpkg -i rstun_<version>_amd64.deb` | lean |

@@ -272,6 +272,8 @@
 
 ## 26.410.100
 
+- 首次发布到 crates.io：`cargo install rstun`（lean）/ `cargo install rstun --features full`
+
 首个独立发布（仓库 `github.com/exvlan/rstun`，整仓 MPL-2.0）。
 
 ### 协议合规（T0）

@@ -23,8 +23,8 @@
 ## M1 · crates.io 首发（**最后**）
 
 - 前置：`CARGO_REGISTRY_TOKEN`（或发布机 `cargo login`）；名称已验证可用（见 `research/name-availability.md`）。
-- **当前阻塞**（2026-11-21）：token 有效、dry-run 通过，但 crates.io 返回 `400 A verified email address is required`
-  需账号持有人先在 <https://crates.io/settings/profile> 完成邮箱验证；详见 `research/M1-crates-io-blocked.md`。
+- **已完成**（2026-11-21）：`rstun v26.410.100` 已发布，干净环境 `cargo install rstun` 验证通过；
+  详见 `research/M1-crates-io-published.md`。
 - 步骤：`cargo package --list` 复核 → `cargo publish --dry-run` → `cargo publish` → 干净环境 `cargo install rstun`。
 - 发布后：README 加 crates.io 徽章；`Cargo.toml` 的 `repository` 保持。
 - **回滚**：`cargo yank --version <ver>`（crates.io 不支持删除）。

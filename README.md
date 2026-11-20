@@ -5,8 +5,7 @@
 [![docs](https://github.com/exvlan/rstun/actions/workflows/docs.yml/badge.svg)](https://exvlan.github.io/rstun/)
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
 [![Image](https://img.shields.io/badge/ghcr.io-exvlan%2Frstun-2496ED?logo=docker&logoColor=white)](https://github.com/exvlan/rstun/pkgs/container/rstun)
-<!-- crates.io 徽章在首次 `cargo publish` 之后再加（现在加是死链）：
-     [![crates.io](https://img.shields.io/crates/v/rstun.svg)](https://crates.io/crates/rstun) -->
+[![crates.io](https://img.shields.io/crates/v/rstun.svg)](https://crates.io/crates/rstun)
 
 文档站：<https://exvlan.github.io/rstun/>（源码 `docs/book/`，`mdbook build docs/book` 本地构建）
 
@@ -37,7 +36,7 @@ Release 的 `rstun-full-*` 或镜像）：
 
 | 渠道 | 命令 | 说明 |
 | --- | --- | --- |
-| Cargo | `cargo install rstun` | crates.io **发布后**可用；从源码树用 `cargo install --path .` |
+| Cargo | `cargo install rstun` | 已发布 `26.410.100`；从源码树用 `cargo install --path .` |
 | Homebrew | `brew install exvlan/rstun/rstun` | tap 见 [`contrib/homebrew/rstun.rb`](contrib/homebrew/rstun.rb)；**lean** |
 | Debian / Ubuntu | `sudo dpkg -i rstun_<version>_amd64.deb` | [`contrib/deb/nfpm.yaml`](contrib/deb/nfpm.yaml)，含 systemd unit；**lean** |
 | Docker | `docker run -d -p 3478:3478/udp ghcr.io/exvlan/rstun:<version>` | **full** 构建，见 [Docker 页](docs/book/src/docker.md) |
@@ -90,8 +89,8 @@ with the `tls` feature (cargo build --features tls,dtls)
 ```bash
 cargo install --path .                    # lean，从源码树
 cargo install --path . --features full    # 完整版
-cargo install rstun                       # crates.io 发布之后（lean）
-cargo install rstun --features full       # crates.io 之后（完整版）
+cargo install rstun                       # crates.io（lean）
+cargo install rstun --features full       # crates.io（完整版）
 ```
 
 容器：多阶段构建、非 root（uid 10001）、**full** 构建（`Dockerfile` 里 `--features full`）、
