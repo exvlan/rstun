@@ -62,7 +62,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # 运行期依赖因此从 5 个变成 9 个 —— README「依赖面」与 CHANGELOG 都明写了这一点。
 hmac = "0.12"
 md-5 = "0.10"
-sha1 = "0.10"
+sha1 = "0.11"
 sha2 = "0.10"
 
 # ---- TURN T2：`turns:`（TLS，RFC 8656 §5）与 DTLS 客户端传输（feature = tls / dtls）----
