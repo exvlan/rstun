@@ -1,0 +1,324 @@
+name: Verify platforms
+
+# 平台实跑验证（不是 PR 门禁）：补上 `ci.yml` 矩阵覆盖不到的两个缺口。
+#
+# 为什么需要它：`ci.yml` 的 test/smoke 矩阵是 `ubuntu-24.04` / `macos-latest` / `windows-latest`，
+# 即 x86_64 linux + native arm64/x64 的 macOS/Windows —— 两个缺口：
+#   * **linux aarch64 没有日常回归**：只有发版时 `release.yml` 在 `ubuntu-24.04-arm` 上构建并
+#     冒烟一次；两次发布之间（数月）arm64 的协议行为无人验证；
+#   * **macOS x86_64 产物从未被执行**：arm64 runner 只编译（`release.yml` 的 `smoke: none`）。
+# 「编过」不等于「能在这台机器上跑」：musl 静态链接、Rosetta 转译、socket 语义都可能只在
+# 真实执行时暴露。本 workflow 用**真机 + 真 socket**各验一次，日志进 artifact 供复核。
+#
+# 两个作业（都用 native runner，不靠 QEMU 模拟）：
+#   linux-aarch64  `ubuntu-24.04-arm` 上构建 `aarch64-unknown-linux-musl` → `--version`
+#                  + UDP/TCP Binding 冒烟 + 一次 TURN(UDP) 中继（有 `turnutils_uclient` 才跑）
+#   macos-x86_64   `macos-latest`（arm64）上构建 `x86_64-apple-darwin` → 用 Rosetta 实跑
+#                  `--version` + 冒烟；Rosetta 不可用则 **SKIP + `::warning::`**（不伪装通过）
+#
+# 排期与 `qa-scheduled.yml`（每周一 04:00 UTC）错开到周四：两个长作业不要同时抢公共 runner 额度。
+# 手动跑：Actions → Verify platforms → Run workflow。
+#
+# 刻意**不装 mold / musl-tools**：本仓没有 `.cargo/config.toml` 强制别的链接器；
+# musl 的 crt/libc 随 rust-std 自带（`lib/rustlib/<target>/lib/self-contained/`，含 `libc.a`），
+# `release.yml` 在同一个 runner 上同样不装。
+#
+# 证据口径见 `.trellis/tasks/11-19-rstun-maintenance/implement.md` M2 段：
+# 每个 `--version` / 冒烟输出落到 `evidence/` 并随 artifact 保存 30 天，
+# 复核时要能直接从日志里读到「平台 + 架构 + 版本串 + 0x0101」；
+# SKIP（Rosetta 缺失 / 无 `turnutils_uclient`）也必须留下原因，不得静默算绿。
+
+on:
+  schedule:
+    # 每周四 06:00 UTC（北京时间 14:00）。周一 04:00 是 qa-scheduled，刻意错开。
+    - cron: "0 6 * * 4"
+  workflow_dispatch:
+
+# 只读：本 workflow 只验证，不发版、不开 issue、不推镜像。
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-platforms
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # 冒烟脚本用中文输出；两个平台都统一 UTF-8（Windows 上必需，这里保持同口径）。
+  PYTHONIOENCODING: utf-8
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------- linux aarch64
+  linux-aarch64:
+    name: linux-aarch64 (native arm64 runner)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      TARGET: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # 与 `release.yml` 同参数：toolchain 固定 1.95（`rust-toolchain.toml`），
+      # target 由 action 装（musl 目标的 crt/libc 随 rust-std 自带，不需要 musl-tools）。
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          target: aarch64-unknown-linux-musl
+          cache: false
+          rustflags: ""
+
+      # key 带 `arm64`（`runner.arch`）：与 x86_64 目标的缓存不能混用。
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: verify-arm64-${{ runner.os }}-${{ runner.arch }}-${{ env.TARGET }}
+
+      - name: Prepare evidence dir
+        run: mkdir -p evidence
+
+      - name: Build rstun (release, musl)
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET"
+          BIN="target/${TARGET}/release/rstun"
+          ls -l "$BIN"
+          # 断言产物真的是 aarch64 且是静态链接：runner 架构对了不代表性目标没跑偏
+          # （`--target` 写错/漏传时 cargo 会静默产出 host 架构的二进制）。
+          file "$BIN" | tee evidence/platform.txt
+          file "$BIN" | grep -q "aarch64" \
+            || { echo "::error::产物不是 aarch64（见 evidence/platform.txt）"; exit 1; }
+          if file "$BIN" | grep -qi "dynamically linked"; then
+            echo "::error::musl 产物却是 dynamically linked —— 会依赖宿主 glibc"
+            exit 1
+          fi
+          { uname -a; uname -m; } | tee -a evidence/platform.txt
+
+      # 版本串只有一个真源：`Cargo.toml` 的 `version`（未注入 `RSTUN_BUILD_VERSION` 时回落它）。
+      # 既断言非空，也断言与 Cargo.toml 一致 —— 否则「跑起来了」可能跑的是别的东西。
+      - name: Self-check (--version)
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/rstun"
+          manifest_version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          out="$("$BIN" --version)"
+          [[ -n "$out" ]] || { echo "::error::--version 输出为空"; exit 1; }
+          printf '%s\n' "$out" | tee evidence/version.txt
+          # `26.410` 是当前版本线（`YY.QMM`）的字面量断言：换版本线时**同步改这一行**。
+          printf '%s\n' "$out" | grep -qF "26.410" \
+            || { echo "::error::--version 不含 26.410（版本线不符）"; exit 1; }
+          printf '%s\n' "$out" | grep -qF "${manifest_version}" \
+            || { echo "::error::--version 与 Cargo.toml(${manifest_version}) 不一致"; exit 1; }
+
+      # 编译通过 ≠ 协议正确：真发 20 字节 Binding Request，断言 0x0101 + XOR-MAPPED-ADDRESS。
+      - name: Binding smoke (UDP + TCP)
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/rstun"
+          PORT=34780
+          "$BIN" server --listen "127.0.0.1:${PORT}" --tcp >evidence/server.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+          bash script/ci/rstun-smoke.sh "127.0.0.1:${PORT}" --tcp --retries 10 2>&1 \
+            | tee evidence/smoke-tcp.log
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          trap - EXIT
+
+      # coturn 只借 `turnutils_uclient`（客户端）；装不上不算失败（下面会记 SKIP + 原因）。
+      # runner 上不需要 `turnserver` 服务，装完先关掉，避免占 3478/5349 干扰后续端口。
+      - name: Install coturn client (optional)
+        id: coturn
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if command -v turnutils_uclient >/dev/null 2>&1; then
+            echo "turnutils_uclient 已存在"
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends coturn
+          sudo systemctl stop coturn 2>/dev/null || true
+          command -v turnutils_uclient
+
+      # TURN 的 UDP 中继：这是 `--turn` 唯一「端到端真的转发了字节」的证据。
+      # 缺 `turnutils_uclient` 时**记 SKIP 并告警**（明确写下「未验证」），绝不静默算绿。
+      - name: TURN UDP relay (optional)
+        env:
+          # 只有诊断用：安装步骤 `continue-on-error`，这一步用「命令在不在」决定 SKIP/执行。
+          COTURN_OUTCOME: ${{ steps.coturn.outcome }}
+        run: |
+          set -uo pipefail
+          BIN="target/${TARGET}/release/rstun"
+          if ! command -v turnutils_uclient >/dev/null 2>&1; then
+            echo "::warning::turnutils_uclient 不可用（coturn 安装步骤 outcome=${COTURN_OUTCOME}）→ TURN UDP 中继 SKIP（该项未验证，不算通过）"
+            printf 'SKIP: turnutils_uclient 不可用（coturn 安装步骤 outcome=%s）→ 未验证中继\n' \
+              "${COTURN_OUTCOME:-unknown}" >evidence/turn-relay.log
+            exit 0
+          fi
+
+          BASE=34790
+          HEALTH=$((BASE + 1))
+          "$BIN" server --listen "127.0.0.1:${BASE}" \
+            --turn --realm example.org --auth-secret ci-secret \
+            --auth-user turnuser --auth-pass turnpass \
+            --relay-ports 49700-49799 \
+            --health-listen "127.0.0.1:${HEALTH}" >evidence/turn-server.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+
+          ready=false
+          for _ in $(seq 1 100); do
+            if curl -fsS "http://127.0.0.1:${HEALTH}/healthz" >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 0.1
+          done
+          if [[ "$ready" != true ]]; then
+            echo "::error::TURN 实例 10s 内未就绪（见 evidence/turn-server.log）"
+            cat evidence/turn-server.log || true
+            exit 1
+          fi
+
+          status=0
+          turnutils_uclient -u turnuser -w turnpass -p "$BASE" -n 5 -m 2 -y 127.0.0.1 \
+            >evidence/turn-relay.log 2>&1 || status=$?
+          tail -8 evidence/turn-relay.log || true
+          if [[ "$status" -ne 0 ]] || ! grep -aq "lost packets 0" evidence/turn-relay.log; then
+            echo "::error::TURN UDP 中继失败（uclient exit=${status}，期望 0 丢包）"
+            exit 1
+          fi
+          # 中继计数非 0 才说明字节真的过了 relay（uclient 成功但没转发是另一类缺陷）。
+          curl -fsS "http://127.0.0.1:${HEALTH}/metrics" 2>/dev/null \
+            | grep -E '^rstun_turn_bytes_total' | tee -a evidence/turn-relay.log || true
+
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          trap - EXIT
+
+      - name: Step summary
+        if: always()
+        run: |
+          {
+            echo "### linux-aarch64（native arm64）"
+            echo '```'
+            cat evidence/platform.txt evidence/version.txt evidence/smoke-tcp.log 2>/dev/null || true
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: verify-linux-aarch64-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------- macOS x86_64
+  macos-x86_64:
+    name: macos-x86_64 (Rosetta on arm64 runner)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      TARGET: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # `macos-latest` 是 arm64 runner：交叉编 x86_64 需要 Xcode SDK 里的 x86_64 slice（自带）。
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          target: x86_64-apple-darwin
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: verify-macos-x86_64-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Prepare evidence dir
+        run: mkdir -p evidence
+
+      - name: Build rstun (release, x86_64)
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET"
+          BIN="target/${TARGET}/release/rstun"
+          ls -l "$BIN"
+          file "$BIN" | tee evidence/platform.txt
+          # 交叉编译容易「编出 arm64 却以为在验 x86_64」：先断言产物架构。
+          file "$BIN" | grep -q "x86_64" \
+            || { echo "::error::产物不是 x86_64（见 evidence/platform.txt）"; exit 1; }
+          { sw_vers; uname -m; } | tee -a evidence/platform.txt
+
+      # Rosetta 是否可用是**环境事实**，不是被测对象：不可用就 SKIP + 告警，
+      # 让「未实跑」这件事在日志和 artifact 里都留痕（不能因为跑不起来就当作通过）。
+      - name: Probe Rosetta 2
+        id: rosetta
+        run: |
+          set -uo pipefail
+          if arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            echo "available=true" >>"$GITHUB_OUTPUT"
+            echo "Rosetta 2 可用（arm64 runner 上可实跑 x86_64 产物）"
+          else
+            echo "available=false" >>"$GITHUB_OUTPUT"
+            echo "::warning::Rosetta 2 不可用 → macOS x86_64 本次只做编译验证，实跑 SKIP（未验证，不算通过）"
+            printf 'SKIP: Rosetta 2 不可用（`arch -x86_64 /usr/bin/true` 失败）→ --version / 冒烟未执行\n' \
+              >evidence/version.txt
+          fi
+
+      - name: Self-check (--version, Rosetta)
+        if: steps.rosetta.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/rstun"
+          manifest_version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          out="$(arch -x86_64 "$BIN" --version)"
+          [[ -n "$out" ]] || { echo "::error::--version 输出为空"; exit 1; }
+          printf '%s\n' "$out" | tee evidence/version.txt
+          # 与上面的 linux 断言同口径：换版本线时同步改 `26.410`。
+          printf '%s\n' "$out" | grep -qF "26.410" \
+            || { echo "::error::--version 不含 26.410（版本线不符）"; exit 1; }
+          printf '%s\n' "$out" | grep -qF "${manifest_version}" \
+            || { echo "::error::--version 与 Cargo.toml(${manifest_version}) 不一致"; exit 1; }
+
+      # Rosetta 下真跑一遍协议：转译层的 socket 语义（UDP 回程、TCP 分段）与 native 不同，
+      # 这一条正是「只编译不执行」永远覆盖不到的东西。
+      - name: Binding smoke (UDP + TCP, Rosetta)
+        if: steps.rosetta.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/rstun"
+          PORT=34780
+          arch -x86_64 "$BIN" server --listen "127.0.0.1:${PORT}" --tcp >evidence/server.log 2>&1 &
+          pid=$!
+          # `arch` 是包装进程（spawn + wait），kill 它不保证带走子进程：两条都做。
+          trap 'kill "$pid" 2>/dev/null || true; pkill -f "release/rstun server" 2>/dev/null || true' EXIT
+          bash script/ci/rstun-smoke.sh "127.0.0.1:${PORT}" --tcp --retries 10 2>&1 \
+            | tee evidence/smoke-tcp.log
+          kill "$pid" 2>/dev/null || true
+          pkill -f "release/rstun server" 2>/dev/null || true
+          trap - EXIT
+
+      - name: Step summary
+        if: always()
+        env:
+          ROSETTA: ${{ steps.rosetta.outputs.available || 'unknown' }}
+        run: |
+          {
+            echo "### macos-x86_64（Rosetta: ${ROSETTA}）"
+            echo '```'
+            cat evidence/platform.txt evidence/version.txt evidence/smoke-tcp.log 2>/dev/null || true
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: verify-macos-x86_64-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30

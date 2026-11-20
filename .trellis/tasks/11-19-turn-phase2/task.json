@@ -1,8 +1,8 @@
 {
-  "id": "rstun-turn",
-  "name": "rstun-turn",
-  "title": "TURN 中继（Allocate/Refresh/Permission/Channel + TLS）",
-  "description": "实现 RFC 8656 TURN 服务器：UDP 中继分配、权限与通道、TURN over TLS/DTLS、配额与防开放中继（rstun-complete 的子任务）",
+  "id": "turn-phase2",
+  "name": "turn-phase2",
+  "title": "TURN 二期（TCP allocation / DONT-FRAGMENT / 地址族选择）",
+  "description": "承接 TURN 二期：RFC 6062 TCP allocation、DONT-FRAGMENT、REQUESTED-ADDRESS-FAMILY、多实例状态与证书热加载",
   "status": "planning",
   "dev_type": null,
   "scope": null,
