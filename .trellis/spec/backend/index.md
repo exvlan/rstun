@@ -23,6 +23,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [协议错误路径](./protocol-errors.md) | FINGERPRINT 的 Length/CRC 语义、300 优先级与放大面、500 映射、错误码矩阵 | Done |
 | [鉴权契约](./auth.md) | 短期/长期 key 派生、USERHASH 32B、nonce 无状态、400 vs 401、响应签名与顺序 | Done |
 | [运维面契约](./ops.md) | health/metrics 端点契约、整条连接总时限、并发上限、env 优先级、drain 语义 | Done |
+| [质量门禁契约](./quality-gates.md) | 基准口径（p99 不可按 ±10% 复现）、混沌整数界 ≥3σ、缺计数硬失败、覆盖率排除、定时任务权限 | Done |
 | [TURN 契约](./turn.md) | 5 元组/tid 幂等、441、Refresh 默认寿命、permission 容量 508、防回环（含通配与已知盲区）、有界 TCP 队列 | Done |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 
