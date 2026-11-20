@@ -1,0 +1,53 @@
+# .deb 打包配置（nfpm）
+#
+# 由 `script/ci/build-deb.sh` 调用，**不是** `nfpm pkg` 的直接入口（需要先注入变量）。
+#   RSTUN_VERSION  版本串（必须等于 Cargo.toml 的 version；不允许带 `v`）
+#   NFPM_ARCH      amd64 / arm64（与 Release 资产的 x86_64 / aarch64 对应）
+#   RSTUN_BIN      要打进包里的二进制路径（lean 构建；static-pie musl 最省事）
+#
+# nfpm 只在 CI/脚本里用，**不进 Cargo.toml**（版本固定在 build-deb.sh 里）。
+name: rstun
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${RSTUN_VERSION}
+section: net
+priority: optional
+maintainer: exvlan <exvlan@users.noreply.github.com>
+vendor: exvlan
+homepage: https://github.com/exvlan/rstun
+license: MPL-2.0
+description: |
+  Standalone STUN/TURN server: RFC 5389 Binding (optional RFC 5780 NAT behaviour
+  discovery) and optional RFC 8656 relay (--turn, UDP/TCP client transports).
+  This package is the "lean" build: STUN + TURN(UDP/TCP) + TURN REST credentials +
+  per-allocation bandwidth. The `turns:` (TLS) and DTLS transports are in the
+  `rstun-full-*` release assets and in the container image.
+depends: []
+contents:
+  - src: ${RSTUN_BIN}
+    dst: /usr/local/bin/rstun
+    file_info:
+      owner: root
+      group: root
+      mode: 0755
+  - src: contrib/deb/rstun.service
+    dst: /lib/systemd/system/rstun.service
+    file_info:
+      owner: root
+      group: root
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/rstun/LICENSE
+    file_info:
+      owner: root
+      group: root
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/rstun/README.md
+    file_info:
+      owner: root
+      group: root
+      mode: 0644
+scripts:
+  postinstall: contrib/deb/postinstall.sh
+  preremove: contrib/deb/preremove.sh

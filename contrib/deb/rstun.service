@@ -1,0 +1,54 @@
+# /lib/systemd/system/rstun.service —— .deb 安装的默认单元
+#
+# 与 `contrib/systemd/rstun.service` 的区别：那份是**运维样例**（RFC 5780 双地址 + 回环
+# `--health-listen`），这份是**装完就能起来**的默认形态：单地址通配监听 + TCP。
+#
+# 改监听地址有两条路：
+#   1. 编辑 `ExecStart`（flag 优先于环境变量）；
+#   2. 不写 `--listen`，在 `/etc/rstun/rstun.env` 里写 `RSTUN_LISTEN=...`（环境变量优先于内置默认值）。
+# 注意：**写了 `--listen` 就以它为准**，环境变量里的同名项不会生效。
+#
+# 启用 RFC 5780 需要两个具体公网 IP（不能用 0.0.0.0），按 `contrib/systemd/rstun.service`
+# 的注释改成 `--listen <ip1> --alt-listen <ip2> --alt-port <port>`。
+
+[Unit]
+Description=rstun (STUN/TURN server)
+Documentation=https://github.com/exvlan/rstun
+Documentation=https://exvlan.github.io/rstun/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rstun
+Group=rstun
+EnvironmentFile=-/etc/rstun/rstun.env
+
+# 默认：UDP + TCP 的 RFC 5389 Binding，0.0.0.0:3478（内置默认值）。
+ExecStart=/usr/local/bin/rstun server --tcp
+
+Restart=on-failure
+RestartSec=2
+
+# 优雅退出：SIGTERM → drain（--drain-timeout 默认 5s）→ 打印统计 → 退出 0。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+LimitNOFILE=65536
+
+# 3478 是 >1024 的端口，普通用户就能绑，**不需要** CAP_NET_BIND_SERVICE。
+
+[Install]
+WantedBy=multi-user.target
