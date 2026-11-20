@@ -137,3 +137,28 @@ pc.createOffer().then((o) => pc.setLocalDescription(o));
 | 启动就退出，提示 `tls` feature | 用了 lean 二进制 | `cargo build --features full` 或用镜像 |
 | DTLS 监听起不来，提示 ECDSA | 证书是 RSA | 换 ECDSA P-256/Ed25519，或去掉 `--turn-dtls-listen` |
 | 只有 host/srflx candidate | 忘了 `iceTransportPolicy: "relay"` | 加上重试；或看 SDP 里的 `typ` |
+
+## 尝试记录（2026-11-20，自动化尝试）
+
+**环境**：OpenCode 主机上跑 full 构建（`--features full`）+ 自签 ECDSA 证书 + REST 凭据，
+`turn:127.0.0.1:3478` 与 `turns:127.0.0.1:5349` 均监听正常（`/healthz` 200，本机 `turnutils_uclient` 中继通过）。
+用 in-app 浏览器打开本地 demo 页，`iceTransportPolicy:"relay"`。
+
+**结果：环境阻断，未取得浏览器侧证据。**
+
+| 观察 | 值 |
+| --- | --- |
+| demo 页加载 | 成功（经 OpenCode 的 HTTP 代理）|
+| 页面内 `Image` 探测 `http://127.0.0.1:9001/healthz` | **unreachable** |
+| `turn:` 中继候选 | **0 个**，`onicecandidateerror` 无 |
+| `turns:` 中继候选 | 0 个，`onicecandidateerror code=701 Failed to establish connection` |
+| 服务端 `/metrics` | `rstun_requests_total{transport="udp"} = 0`（浏览器从未到达）|
+
+**结论**：in-app 浏览器只把 **页面加载** 代理到 OpenCode 主机；WebRTC 的 UDP/TCP 流量走浏览器自身网络，
+因此绑在 OpenCode 主机 `127.0.0.1` 的 TURN 监听不可达。要完成本节验收，必须满足其一：
+
+1. 在**与 TURN 服务同一主机/网络**的浏览器里打开本页（例如直接在服务机上装浏览器）；或
+2. 把 TURN 绑到**浏览器可达的地址**（同 LAN 的私网 IP 或公网 IP），并把证书换成该地址可信任的证书
+   （自签需手动信任，或用受信 CA 签发的 `turns:` 证书）。
+
+该项仍为**人工待办**，不得据此报告「浏览器验收通过」。
