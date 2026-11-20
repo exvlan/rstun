@@ -1,0 +1,20 @@
+[book]
+title = "rstun"
+description = "独立 STUN/TURN 服务器：RFC 5389 Binding、可选 RFC 5780 NAT 行为发现、可选 RFC 8656 中继"
+authors = ["exvlan"]
+language = "zh-CN"
+src = "src"
+
+# 构建产物（`mdbook build docs/book`）不提交、不参与 CI 比较。
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/exvlan/rstun"
+edit-url-template = "https://github.com/exvlan/rstun/edit/main/docs/book/src/{path}"
+site-url = "/rstun/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[output.html.search]
+limit-results = 20
