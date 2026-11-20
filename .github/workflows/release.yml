@@ -112,7 +112,7 @@ jobs:
 
       # 本仓只依赖 Rust：musl 目标自带静态 crt，不需要 mold / protoc / pkg-config。
       # `rustflags: ""` 只清空 RUSTFLAGS 环境变量（本项目没有自定义 rustflags）。
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           toolchain: 1.95
           target: ${{ matrix.target }}
@@ -367,7 +367,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           toolchain: 1.95
           cache: false
