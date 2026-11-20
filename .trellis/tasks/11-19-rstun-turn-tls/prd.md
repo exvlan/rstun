@@ -13,8 +13,10 @@
 ### R1 TLS / DTLS
 
 - `--turn-tls-listen <addr>`：TLS 监听（证书/私钥从 CLI 或文件读取）；仅 TLS 特性启用时编译。
-- **DTLS 不做**（决策，2026-11-19）：`rustls` 不支持 DTLS，引入 `webrtc-dtls`/OpenSSL 会显著改变依赖与安全面；
-  浏览器经 `turns:`（TCP+TLS）已可用。需求出现时单独立项。
+- **DTLS 纳入范围**（用户决策，2026-11-20）：`rustls` 不支持 DTLS，改用纯 Rust 的 `webrtc-dtls`。
+  `--turn-dtls-listen <addr>` + 证书/私钥（与 TLS 共用或独立配置）；DTLS 1.2；每个 datagram 承载 STUN/TURN
+  或 `ChannelData`（与 UDP 同构）。验收需覆盖握手 + 中继。
+  **代价**：依赖面显著扩大（`webrtc-dtls` 及其 crypto 传递依赖），README 的「依赖清单/体积」必须同步。
 - 证书热加载不做；重启生效。
 - TLS 握手失败 / 证书不匹配必须记录可诊断日志（不含私钥内容）。
 
@@ -27,14 +29,22 @@
 
 ### R3 配额完善
 
-- 每 allocation 的**带宽配额**（入/出，令牌桶；超限丢弃并计数）。
-- 端口范围与分配上限的**运行时调优**参数（不改代码即可调整）。
-- 每 peer 的中继连接数上限。
+- 每 allocation 的**带宽配额**（入/出，令牌桶；超限丢弃并计数）—— `--turn-bandwidth`。
+- 端口范围与分配上限的**运行时调优**参数（不改代码即可调整）—— `--relay-ports` /
+  `--max-allocations-per-user` / `--max-allocations-per-ip` / `--permission-limit` /
+  `--allocation-lifetime` 都是启动参数，配好即生效，不需要改代码。
+- 每 peer 的中继连接数上限 —— **由 `--permission-limit` 承担**（RFC 8656 §9：一条 permission
+  就是一个可中继的 peer IP；`ChannelBind` 的隐式 permission 共用同一上限，超限 `508`）。
+  本实现没有第二个「每 peer 连接数」计数器：`Send`/`ChannelData` 只在 permission 覆盖该 peer
+  时转发，所以 permission 上限就是可同时中继的 peer 数上限。见 design §5 的映射说明。
 
 ### R4 验收工具链
 
 - `script/lab/rstun-turn.sh`：一键起 TURN（含 TLS 证书自签）+ `turnutils_uclient` 中继测试 + 清理。
 - 浏览器验收步骤文档化（本地 WebRTC demo + `turns:` + trickle ICE；至少验证「一方在对称 NAT 后」）。
+  → 已落到 [`docs/browser-acceptance.md`](../../../docs/browser-acceptance.md)（自签证书信任 /
+  `iceServers` + `iceTransportPolicy: "relay"` / trickle ICE 观察点 / 对称 NAT 拓扑 / 常见失败）。
+  **本仓库没有自动化浏览器验收，该项是人工待执行**（协议层由 `rstun-turn.sh --tls` 自动覆盖）。
 
 ### R5 文档
 
