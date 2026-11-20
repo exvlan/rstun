@@ -4,8 +4,10 @@ name: Release
 #   · 只传一个 `version`（**不带 `v`**，如 `26.410.100`），必须与 `Cargo.toml` 的
 #     `version` 一致 —— 不一致直接失败，避免「tag 说 A、二进制说 B」；
 #   · 一次 dispatch 交付两样：
-#       Release `rstun-v<version>` + 四端 `rstun-<platform>-<version>.zip`
-#       镜像 `ghcr.io/<owner>/rstun:<version>`（linux/amd64 + linux/arm64 双架构）
+#       Release `rstun-v<version>` + **八**个资产：四个平台 × 两种构建
+#         lean  `rstun-<platform>-<version>.zip`       STUN + TURN(UDP/TCP) + REST + 带宽
+#         full  `rstun-full-<platform>-<version>.zip`  再加 `turns:`(TLS) 与 DTLS
+#       镜像 `ghcr.io/<owner>/rstun:<version>`（linux/amd64 + linux/arm64 双架构，**full** 构建）
 #   · 幂等：Release 已存在则 `gh release upload --clobber` 只覆盖资产；
 #     镜像 tag 重复推即覆盖，manifest 用 `--amend` 重建。
 #
@@ -19,7 +21,7 @@ on:
         description: >-
           版本串（**不带 `v`**，如 26.410.100）。必须与 Cargo.toml 的 version 一致；
           同时用于 ghcr 镜像 tag、Release 名 `rstun-v<version>` 与资产名
-          `rstun-<platform>-<version>.zip`
+          `rstun-<platform>-<version>.zip`（lean）/ `rstun-full-<platform>-<version>.zip`（full）
         type: string
         required: true
 
@@ -121,7 +123,8 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Build rstun
+      # ---- lean 构建（默认发布形态）----
+      - name: Build rstun (lean)
         run: |
           set -euo pipefail
           cargo build --release --target "$TARGET"
@@ -129,7 +132,7 @@ jobs:
           if [[ "$TARGET" == *windows* ]]; then BIN="${BIN}.exe"; fi
           ls -l "$BIN"
 
-      - name: Self-check (--version)
+      - name: Self-check lean (--version)
         if: matrix.smoke != 'none'
         run: |
           set -euo pipefail
@@ -154,27 +157,113 @@ jobs:
           kill "$pid" 2>/dev/null || true
           wait "$pid" 2>/dev/null || true
 
-      - name: Stage artifact
+      # lean 二进制先落盘：下一步的 full 构建会覆盖 `target/.../release/rstun`。
+      - name: Stage lean artifact
         run: |
           set -euo pipefail
-          mkdir -p artifacts
+          mkdir -p artifacts/lean
           BIN="target/${TARGET}/release/rstun"
           if [[ "$TARGET" == *windows* ]]; then BIN="${BIN}.exe"; fi
-          cp "$BIN" artifacts/
-          ls -l artifacts
+          cp "$BIN" artifacts/lean/
+          ls -l artifacts/lean
 
-      # 资产名统一 **带 `rstun-` 前缀**（`rstun-<platform>-<version>.zip`），
-      # release 作业按 `pattern: rstun-*` 拉取后直接改名。
-      - name: Upload artifact
+      # ---- full 构建（`turns:` + DTLS）----
+      # 同一 target 目录再编一次：依赖已就位，只多编 rustls/webrtc-dtls 那一支。
+      - name: "Build rstun (full: tls+dtls)"
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET" --features full
+          BIN="target/${TARGET}/release/rstun"
+          if [[ "$TARGET" == *windows* ]]; then BIN="${BIN}.exe"; fi
+          ls -l "$BIN"
+
+      # 两种构建的 `--version` 必须同串（版本只来自 Cargo.toml / RSTUN_BUILD_VERSION），
+      # 区别只在 feature；用 lean 的检查逻辑再验一次 full，防止注入链路只在一边生效。
+      - name: Self-check full (--version)
+        if: matrix.smoke != 'none'
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/rstun"
+          if [[ "$TARGET" == *windows* ]]; then BIN="${BIN}.exe"; fi
+          out="$("$BIN" --version)"
+          echo "$out"
+          printf '%s\n' "$out" | grep -qF "${RSTUN_BUILD_VERSION}" \
+            || { echo "::error::full --version 与 RSTUN_BUILD_VERSION 不一致（期望 ${RSTUN_BUILD_VERSION}）"; exit 1; }
+
+      # full 产物不能只验 `--version`：TLS 正是它多出来的东西。两件事各一个进程：
+      #   1) `turns:` 监听 + openssl 自签证书 → 真实 TLS 握手；
+      #   2) 同一份 full 二进制在「默认关闭 TURN」形态下仍只做 Binding
+      #      （`rstun-smoke.sh` 发的是无凭据请求，开 `--turn` 的实例会正确回 401，
+      #        所以这一步必须用一个不鉴权的实例）。
+      # 仅 Linux runner（有 openssl）。
+      - name: TLS smoke (full build)
+        if: matrix.smoke == 'linux'
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/rstun"
+          WORK="$(mktemp -d)"
+          openssl ecparam -name prime256v1 -genkey -noout -out "$WORK/sec1.pem"
+          openssl pkcs8 -topk8 -nocrypt -in "$WORK/sec1.pem" -out "$WORK/key.pem"
+          openssl req -new -x509 -key "$WORK/key.pem" -out "$WORK/cert.pem" -days 2 \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+          # 1) `turns:`：独立实现（openssl）完成 TLS 握手
+          "$BIN" server --listen "127.0.0.1:34790" \
+            --turn --realm example.org --auth-secret ci-secret \
+            --auth-user ci --auth-pass ci \
+            --turn-tls-listen "127.0.0.1:34791" \
+            --tls-cert "$WORK/cert.pem" --tls-key "$WORK/key.pem" >"$WORK/tls.log" 2>&1 &
+          tls_pid=$!
+          trap 'kill "$tls_pid" "$plain_pid" 2>/dev/null || true; wait 2>/dev/null || true' EXIT
+          plain_pid=""
+
+          # 2) 默认形态（不开 --turn）：Binding 仍按 5389 回答
+          "$BIN" server --listen "127.0.0.1:34792" >"$WORK/plain.log" 2>&1 &
+          plain_pid=$!
+          sleep 1
+
+          timeout 10 openssl s_client -connect "127.0.0.1:34791" -servername localhost -brief \
+            </dev/null | grep -q "CONNECTION ESTABLISHED"
+          echo "TLS handshake ok"
+          bash script/ci/rstun-smoke.sh "127.0.0.1:34792" --retries 10
+          echo "full build: plain Binding ok"
+
+          kill "$tls_pid" "$plain_pid" 2>/dev/null || true
+          wait "$tls_pid" "$plain_pid" 2>/dev/null || true
+
+      - name: Stage full artifact
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/full
+          BIN="target/${TARGET}/release/rstun"
+          if [[ "$TARGET" == *windows* ]]; then BIN="${BIN}.exe"; fi
+          cp "$BIN" artifacts/full/
+          ls -l artifacts/full
+
+      # 资产名统一 **带 `rstun-` 前缀**：lean `rstun-<platform>`、full `rstun-full-<platform>`。
+      # release 作业按 `pattern: rstun-*` 拉取后直接改名，所以这里多出的 `full-` 前缀
+      # 会自然变成 `rstun-full-<platform>-<version>.zip`。
+      - name: Upload lean artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: rstun-${{ matrix.name }}
-          path: ./artifacts
+          path: ./artifacts/lean
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload full artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rstun-full-${{ matrix.name }}
+          path: ./artifacts/full
           if-no-files-found: error
           retention-days: 14
 
   # 双架构镜像：两个 runner 各自 native build（不靠 QEMU 模拟），各推 `<version>-<arch>`，
   # 再由 `manifest` 作业合成 `<version>`。context = 仓库根。
+  #
+  # 镜像是 **full** 构建（Dockerfile 里 `--features full`）：容器是本服务最常见的部署形态，
+  # `turns:` / DTLS 不能要求用户自己重编镜像。代价是镜像里多 ~4 MB（rustls + webrtc-dtls）。
   image:
     name: Image (${{ matrix.arch }})
     needs: prepare
@@ -264,7 +353,7 @@ jobs:
             tag latest
           fi
 
-  # Release：`rstun-v<version>` + `rstun-<platform>-<version>.zip`（四端二进制）。
+  # Release：`rstun-v<version>` + 八份二进制（四端 × lean/full）。
   # 幂等：已存在则只覆盖资产，不改标题/说明（避免把人工补充的 release notes 冲掉）。
   release:
     name: Publish Release
@@ -306,11 +395,12 @@ jobs:
             ( cd "$d" && zip -r "../../zipped_assets/rstun-${name}-${VERSION}.zip" . )
             count=$((count + 1))
           done
-          if [ "$count" -eq 0 ]; then
-            echo "::error::没有找到任何 rstun-<platform> 产物 —— 拒绝发一个缺二进制的 Release"
+          # 4 个平台 × 2 种构建 = 8 个资产；少一个都说明 build 矩阵断了一条腿。
+          if [ "$count" -ne 8 ]; then
+            echo "::error::期望 8 个资产（4 平台 × lean/full），实际 ${count} 个 —— 拒绝发不完整的 Release"
             exit 1
           fi
-          echo "打包 ${count} 个平台"
+          echo "打包 ${count} 个资产（lean + full）"
           ls -l zipped_assets
 
       - name: Render release notes
@@ -322,13 +412,18 @@ jobs:
           {
             echo "独立 STUN 服务器 \`rstun\`（RFC 5389 Binding；RFC 5780 需 \`--alt-listen\`）。"
             echo ""
-            echo "| 平台 | 资产 |"
-            echo "| --- | --- |"
-            echo "| Linux x86_64 / aarch64（musl） | \`rstun-linux-<arch>-${VERSION}.zip\` |"
-            echo "| macOS x86_64 | \`rstun-macos-x86_64-${VERSION}.zip\` |"
-            echo "| Windows x86_64 | \`rstun-windows-x86_64-${VERSION}.zip\` |"
+            echo "| 平台 | lean（默认） | full（+ \`turns:\` + DTLS） |"
+            echo "| --- | --- | --- |"
+            echo "| Linux x86_64 | \`rstun-linux-x86_64-${VERSION}.zip\` | \`rstun-full-linux-x86_64-${VERSION}.zip\` |"
+            echo "| Linux aarch64 | \`rstun-linux-aarch64-${VERSION}.zip\` | \`rstun-full-linux-aarch64-${VERSION}.zip\` |"
+            echo "| macOS x86_64 | \`rstun-macos-x86_64-${VERSION}.zip\` | \`rstun-full-macos-x86_64-${VERSION}.zip\` |"
+            echo "| Windows x86_64 | \`rstun-windows-x86_64-${VERSION}.zip\` | \`rstun-full-windows-x86_64-${VERSION}.zip\` |"
             echo ""
-            echo "容器镜像：\`ghcr.io/${owner}/rstun:${VERSION}\`（linux/amd64 + linux/arm64；"
+            echo "\`lean\`：STUN + TURN(UDP/TCP) + REST 临时凭据 + 带宽配额（9 个直接依赖；release 未 strip 3.77 MB）。"
+            echo "\`full\`：再加 \`turns:\`(TLS) 与 DTLS 1.2（13 个直接依赖；release 未 strip 7.93 MB）。"
+            echo "不带这两个 flag 时两者行为完全一致；\`--turn-tls-listen\` 在 lean 上会明确拒绝启动。"
+            echo ""
+            echo "容器镜像：\`ghcr.io/${owner}/rstun:${VERSION}\`（linux/amd64 + linux/arm64，**full** 构建；"
             echo "版本不含 \`-\` 时另有 \`latest\`）。"
             echo ""
             echo "跑起来：\`rstun server --listen 0.0.0.0:3478\`（UDP；加 \`--tcp\` 同时答 TCP）。"

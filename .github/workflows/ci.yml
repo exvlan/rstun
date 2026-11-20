@@ -5,6 +5,12 @@ name: CI
 #   smoke      native 二进制起服务，真发 20 字节 Binding Request（UDP + TCP）
 #   smoke-ipv6 单独验 `--listen-v6`（v6-only 绑定，可与 v4 同端口共存）
 #
+# 构建有两种 feature 组合，test 作业两种都跑：
+#   lean  `--no-default-features`  默认发布形态（STUN + TURN UDP/TCP + REST + 带宽）
+#   full  `--all-features`         再加 `turns:`(TLS) 与 DTLS
+# 编过 ≠ 行为对：lean 下 TLS/DTLS 标志必须给出 feature 错误、full 下必须能起监听，
+# 两种单测各自覆盖自己那一半。
+#
 # 为什么 fmt/clippy 只在 Linux 上跑：格式化与 lint 的结果与平台无关，
 # 三平台各跑一遍只是三倍等待。单测与冒烟才需要真机（socket 语义因平台而异）。
 #
@@ -60,17 +66,39 @@ jobs:
 
       # 单测里 bind 不到 127.0.0.2 / IPv6 的用例会自行跳过，
       # 环境差异不会把「平台不支持某个地址」变成红灯。
-      - name: Unit tests
-        run: cargo test --no-fail-fast
+      #
+      # `--no-default-features` 就是默认（`default = []`），写出来是声明意图：
+      # 这一条锁住「lean 构建必须绿」，第二条锁住 full（TLS/DTLS 代码路径）。
+      - name: Unit tests (lean)
+        run: cargo test --no-fail-fast --no-default-features
+
+      - name: "Unit tests (full: tls+dtls)"
+        run: cargo test --no-fail-fast --all-features
 
       - name: Format check
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
       # `--all-targets` 覆盖 lib/bin/测试；`-D warnings` 让 clippy 的任何提示都失败。
-      - name: Clippy
+      # 两种 feature 组合各跑一次：lean 的 dead-code 与 full 的依赖告警都要能看见。
+      - name: Clippy (lean)
         if: runner.os == 'Linux'
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: "Clippy (full: tls+dtls)"
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # 供应链：`cargo audit` 读仓库根的 `.cargo/audit.toml`（唯一豁免是
+      # RUSTSEC-2026-0387，理由见该文件）。锁定 action 的 commit SHA（= v2.0.0），
+      # 不跟 tag 漂移。`ignore` 显式传一次：action 用它自己的 `--ignore` 调
+      # cargo audit，与 audit.toml **保持同步**（改一处必须改两处）。
+      - name: Security audit (cargo audit)
+        if: runner.os == 'Linux'
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2026-0387
 
   smoke:
     name: smoke udp+tcp (${{ matrix.os }})
