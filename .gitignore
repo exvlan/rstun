@@ -12,3 +12,4 @@ docs/book/book
 
 # 打包产物（script/ci/build-deb.sh、gen-brew.sh、gen-sbom.sh 的输出）
 dist/
+.env.secret
