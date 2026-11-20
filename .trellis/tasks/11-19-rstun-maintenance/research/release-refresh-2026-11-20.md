@@ -28,3 +28,10 @@
 - `rstun.rb` 的三个 sha256 与重发后的 zip 一致（workflow 自动重生成）。
 - full/lean 行为区分：full 下 `--turn-tls-listen` 进入证书解析；lean 下报 `need a build with the tls feature`。
 - 版本串：两者均 `26.410.100+46c1ad`（同一提交）。
+
+## 生产切换确认（2026-11-21，对端回报）
+
+- 生产（Exvlan 侧）已切到**新 digest** `sha256:bafa4f17…`，仅重建 `exvlan` Pod，`std-x` 未动。
+- 证据：`rstun --version` → `26.410.100+46c1ad`；启动日志 `features="tls,dtls"`（镜像为 full 构建）、10 listeners、RFC 5780 正常；healthcheck 通过。
+- 部署仓变更：`44805ba9` 只改镜像 digest，无参数变更。
+- 结论：Release 重发与镜像重建已在生产验证；旧的 `9d7382c6…` 不再是生产在用版本。
