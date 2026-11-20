@@ -89,16 +89,17 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # 供应链：`cargo audit` 读仓库根的 `.cargo/audit.toml`（唯一豁免是
-      # RUSTSEC-2026-0387，理由见该文件）。锁定 action 的 commit SHA（= v2.0.0），
-      # 不跟 tag 漂移。`ignore` 显式传一次：action 用它自己的 `--ignore` 调
-      # cargo audit，与 audit.toml **保持同步**（改一处必须改两处）。
+      # 供应链：命令行 `cargo audit`（不用 rustsec/audit-check —— 它要创建 check run，
+      # 需要 `checks: write`，在只读 token 下会 `Resource not accessible by integration`）。
+      # 豁免清单只有一处真源：仓库根的 `.cargo/audit.toml`（RUSTSEC-2026-0387）。
       - name: Security audit (cargo audit)
         if: runner.os == 'Linux'
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2026-0387
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+          cargo audit
 
   smoke:
     name: smoke udp+tcp (${{ matrix.os }})
