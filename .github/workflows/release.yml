@@ -353,11 +353,52 @@ jobs:
             tag latest
           fi
 
-  # Release：`rstun-v<version>` + 八份二进制（四端 × lean/full）。
+  # SBOM：lean / full 各一份 CycloneDX（`cargo metadata` 生成，不需要额外工具链）。
+  # 与平台无关，只跑一次；`gen-sbom.sh` 会断言**直接依赖数**（lean 9 / full 13）——
+  # 依赖面一变就红，避免 SBOM 与「依赖面」文档各说各话。
+  sbom:
+    name: SBOM (${{ matrix.features }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [lean, full]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: sbom-${{ runner.os }}-${{ runner.arch }}
+
+      # `--locked` + 依赖闭包 BFS：读不到新依赖也不会「猜」进 SBOM。
+      - name: Generate CycloneDX (${{ matrix.features }})
+        run: |
+          set -euo pipefail
+          bash script/ci/gen-sbom.sh \
+            --features "${{ matrix.features }}" \
+            --out "dist/sbom/rstun-${{ needs.prepare.outputs.version }}-${{ matrix.features }}.cdx.json"
+
+      # 名字**不带** `rstun-` 前缀：release 作业按 `pattern: rstun-*` 拉二进制，
+      # 混进来会被当成一个「平台目录」并破坏 8 个 zip 的断言。
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sbom-${{ matrix.features }}
+          path: dist/sbom/*.cdx.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # Release：`rstun-v<version>` + 八份二进制（四端 × lean/full）+ 两份 SBOM + Homebrew formula 模板。
   # 幂等：已存在则只覆盖资产，不改标题/说明（避免把人工补充的 release notes 冲掉）。
   release:
     name: Publish Release
-    needs: [prepare, build]
+    needs: [prepare, build, sbom]
     runs-on: ubuntu-24.04
     permissions:
       contents: write # 建/更新 Release 并上传资产
@@ -373,6 +414,14 @@ jobs:
         with:
           path: release_assets
           pattern: rstun-*
+
+      # SBOM 走单独的 artifact 名（`sbom-lean` / `sbom-full`），`merge-multiple` 摊平目录。
+      - name: Download SBOMs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: sbom_assets
+          pattern: sbom-*
+          merge-multiple: true
 
       - name: Package assets
         env:
@@ -403,6 +452,23 @@ jobs:
           echo "打包 ${count} 个资产（lean + full）"
           ls -l zipped_assets
 
+      # SBOM 与 Homebrew formula 是「顺手产物」：缺了说明 sbom 作业或 zipped_assets 有问题，
+      # 但**不**影响 8 个 zip 的断言（那份断言只数 zip）。
+      - name: Collect SBOMs and Homebrew formula
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sboms=(sbom_assets/*.cdx.json)
+          if [ "${#sboms[@]}" -ne 2 ]; then
+            echo "::error::期望 2 份 SBOM（lean + full），实际 ${#sboms[@]} 份"
+            exit 1
+          fi
+          ls -l "${sboms[@]}"
+          bash script/ci/gen-brew.sh --assets zipped_assets --version "$VERSION" --out dist/homebrew
+          ls -l dist/homebrew
+
       - name: Render release notes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -426,6 +492,12 @@ jobs:
             echo "容器镜像：\`ghcr.io/${owner}/rstun:${VERSION}\`（linux/amd64 + linux/arm64，**full** 构建；"
             echo "版本不含 \`-\` 时另有 \`latest\`）。"
             echo ""
+            echo "SBOM（CycloneDX 1.5，\`cargo metadata\` 生成）："
+            echo "\`rstun-${VERSION}-lean.cdx.json\` / \`rstun-${VERSION}-full.cdx.json\`。"
+            echo "Homebrew：\`rstun.rb\`（本资产里的 formula，lean 构建；tap \`exvlan/homebrew-rstun\` 同步是人工步骤）。"
+            echo "**发布产物未做签名**（cosign/sigstore 后置）：请用 SBOM + 自行计算的 sha256 校验，"
+            echo "或在信任前从 tag 自行构建。"
+            echo ""
             echo "跑起来：\`rstun server --listen 0.0.0.0:3478\`（UDP；加 \`--tcp\` 同时答 TCP）。"
           } > release_notes.md
           cat release_notes.md
@@ -438,7 +510,16 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(zipped_assets/*.zip)
+          # 八份二进制 + 两份 SBOM + Homebrew formula。zip 数量在「Package assets」里已单独断言
+          # （8 个），这里只保证 SBOM/formula 也进来了 —— 它们缺失不该悄悄发出去。
+          assets=(zipped_assets/*.zip sbom_assets/*.cdx.json dist/homebrew/*.rb)
+          zips=(zipped_assets/*.zip)
+          if [ "${#zips[@]}" -ne 8 ] || [ "${#assets[@]}" -ne 11 ]; then
+            echo "::error::资产数不对：zip ${#zips[@]}（期望 8）+ 其它 $(( ${#assets[@]} - ${#zips[@]} ))（期望 3）"
+            printf '  %s\n' "${assets[@]}"
+            exit 1
+          fi
+          ls -l "${assets[@]}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在 → 只覆盖资产（--clobber，幂等；不动标题与说明）"
             gh release upload "$TAG" "${assets[@]}" --clobber

@@ -5,6 +5,10 @@ name: CI
 #   smoke      native 二进制起服务，真发 20 字节 Binding Request（UDP + TCP）
 #   smoke-ipv6 单独验 `--listen-v6`（v6-only 绑定，可与 v4 同端口共存）
 #
+# 另有两条与平台无关的必需作业：
+#   deny       供应链（cargo-deny：licenses / bans / sources；advisories 由 cargo audit 覆盖）
+#   docs       文档漂移（`script/ci/check-docs.sh` 比对 help 片段/参数名/指标名/链接）+ mdbook 构建
+#
 # 构建有两种 feature 组合，test 作业两种都跑：
 #   lean  `--no-default-features`  默认发布形态（STUN + TURN UDP/TCP + REST + 带宽）
 #   full  `--all-features`         再加 `turns:`(TLS) 与 DTLS
@@ -100,6 +104,83 @@ jobs:
             cargo install cargo-audit --locked
           fi
           cargo audit
+
+  # 供应链门禁（licenses / bans / sources）。**必需作业**：不是 `continue-on-error`。
+  #
+  # 为什么不用 `EmbarkStudios/cargo-deny-action`：那要多锁一个 action SHA（每次升级都要查 tag
+  # 指向），而 cargo-deny 本身就有 prebuilt musl 二进制 —— 固定版本 + 校验 sha256 更可控，
+  # 也省掉一次 `cargo install cargo-deny`（编译要几分钟）。
+  #
+  # advisories 不在这里跑：`cargo audit` 已经覆盖（豁免清单在 `.cargo/audit.toml`），
+  # `deny.toml` 的 `[advisories].ignore` 是同一份清单的镜像。两处要同步改。
+  deny:
+    name: deny (licenses/bans/sources)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install cargo-deny (pinned prebuilt)
+        run: |
+          set -euo pipefail
+          version=0.22.0
+          sha256=98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786
+          tarball="/tmp/cargo-deny-${version}.tar.gz"
+          curl -sSL --retry 3 -o "$tarball" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/cargo-deny-${version}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${sha256}  ${tarball}" | sha256sum -c -
+          tar xzf "$tarball" -C /tmp
+          install -m 0755 "/tmp/cargo-deny-${version}-x86_64-unknown-linux-musl/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+          cargo deny --version
+
+      # licenses 要读每个依赖的许可证文件 → 先把 crate 源拉全（cargo-deny 自己也会拉，
+      # 但这步能把「网络失败」与「许可证不合规」两种红分开）。
+      - name: cargo fetch
+        run: cargo fetch --locked
+
+      - name: cargo deny (licenses, bans, sources)
+        run: cargo deny check licenses bans sources
+
+  # 文档门禁：`check-docs.sh` 拿真实二进制比对 help 片段/参数名/指标名/链接；mdBook 必须能构建。
+  # 必需作业（文档漂移就是缺陷：用户按文档配参数会直接失败）。
+  docs:
+    name: docs (check-docs + mdbook)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: 1.95
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: docs-${{ runner.os }}-${{ runner.arch }}
+
+      # check-docs 要起一个实例读 /metrics（TURN 指标族只有 `--turn` 时才出现）。
+      - name: Build binary (lean)
+        run: cargo build
+
+      - name: Install mdbook (pinned prebuilt)
+        run: |
+          set -euo pipefail
+          version=0.5.4
+          sha256=5222beabd3e37dc5be0d18ff99b79058469354db5c220153a1b92db5ba12be89
+          tarball="/tmp/mdbook-${version}.tar.gz"
+          curl -sSL --retry 3 -o "$tarball" \
+            "https://github.com/rust-lang/mdBook/releases/download/v${version}/mdbook-v${version}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${sha256}  ${tarball}" | sha256sum -c -
+          mkdir -p /tmp/mdbook
+          tar xzf "$tarball" -C /tmp/mdbook
+          install -m 0755 /tmp/mdbook/mdbook "$HOME/.cargo/bin/mdbook"
+          mdbook --version
+
+      - name: Check docs (help 片段 / 参数名 / 指标名 / 链接)
+        run: bash script/ci/check-docs.sh --no-build
+
+      - name: mdbook build
+        run: mdbook build docs/book
 
   # 覆盖率：只在 Linux 跑一份（行/区域覆盖与平台无关），**非阻塞**。
   #

@@ -1,8 +1,10 @@
 # `cargo audit` 配置（项目级；本地 `cargo audit` 自动读取）。
 #
-# CI：`.github/workflows/ci.yml` 的 Linux `test` 作业用 `rustsec/audit-check`
-# （已锁 commit SHA）跑同一条审计，并把下面的 ignore 列表**显式传一次** —— 那个
-# action 用自己的 `--ignore` 调 cargo audit。**改清单要两处同步**。
+# CI：`.github/workflows/ci.yml` 的 Linux `test` 作业直接跑 `cargo audit`（命令行版，
+# 不用 rustsec/audit-check —— 那个 action 要 `checks: write`，只读 token 下会失败）。
+# 命令行版**自动读本文件**，所以下面的 ignore 列表只有这一处真源；
+# `deny.toml` 的 `[advisories].ignore` 是同一份清单的镜像（供手工 `cargo deny check` 用），
+# 改一处要同步另一处。
 #
 # 原则：只豁免**有明确处置**的公告，其它漏洞继续让 `cargo audit` 失败。
 # unmaintained 类公告（`bincode` / `pin-utils` / `rustls-pemfile`）只是 warning，

@@ -6,3 +6,9 @@ fuzz/coverage
 # Python probe artifacts
 __pycache__/
 *.pyc
+
+# mdBook 构建产物（docs/book/src 是源，book/ 是产物）
+docs/book/book
+
+# 打包产物（script/ci/build-deb.sh、gen-brew.sh、gen-sbom.sh 的输出）
+dist/
