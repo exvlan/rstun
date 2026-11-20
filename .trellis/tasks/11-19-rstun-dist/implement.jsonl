@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/release-artifacts.md", "reason": "发布物契约：资产可执行位、tag↔资产↔digest、SBOM 与资产数量"}
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "check-docs/覆盖率/门禁口径（dist 的 CI 作业要与之一致）"}
+{"file": ".trellis/spec/backend/turn.md", "reason": "文档站 turn.md 的行为表必须与契约一致（含 feature gate）"}
+{"file": ".trellis/tasks/11-19-rstun-dist/design.md", "reason": "打包/文档/供应链的具体取舍与验证方式"}
