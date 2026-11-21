@@ -30,6 +30,8 @@
 | 下游 digest | 对外报 **manifest list digest**（amd64+arm64 index）| 下游按 digest 校验对不上 |
 | 版本串 | `version` 输入 == `Cargo.toml` 的 `version`；二进制 `--version` = `<version>+<sha6>` | 包与报的版本不一致 |
 | 镜像 | `ghcr.io/exvlan/rstun:<version>`，稳定版附 `:latest`；双架构必须由 manifest 合并 | 单架构冒充双架构 |
+| deb 资产 | `rstun_<version>_{amd64,arm64}.deb` 各一份（lean、musl static-pie，包内二进制与 lean zip 同源）；缺任一即失败 | 用户装到旧版/异构二进制 |
+| Homebrew tap | `exvlan/homebrew-rstun` 的 formula 与该 Release 的 `rstun.rb` 类体一致 | `brew install` 拉到不存在的 sha256 |
 | 包可见性 | 新包默认 private：有凭证可拉、匿名 401 | 「我这边能 pull」误判 |
 | 动态链接 | linux 目标为 static-pie（musl）| 依赖宿主 glibc 版本 |
 | full 构建的 C 工具链 | Linux musl 目标必须装 `musl-tools` 且设 `CC_<triple>=musl-gcc`（full 的 `ring` 含 C 代码）| `cc-rs: failed to find <triple>-musl-gcc`，构建 exit 101 |

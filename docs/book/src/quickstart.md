@@ -6,8 +6,8 @@
 | --- | --- | --- |
 | Cargo（crates.io） | `cargo install rstun` | lean |
 | Cargo（源码树） | `cargo install --path .`（`--features full` 加 `turns:`/DTLS） | lean / full |
-| Homebrew | `brew install exvlan/rstun/rstun` | lean |
-| Debian / Ubuntu | `sudo dpkg -i rstun_<version>_amd64.deb` | lean |
+| Homebrew | `brew install exvlan/rstun/rstun`（tap `exvlan/homebrew-rstun`）| lean |
+| Debian / Ubuntu | 从 Releases 下载 `rstun_<version>_{amd64,arm64}.deb` → `sudo dpkg -i …` | lean |
 | Docker | `docker run -d -p 3478:3478/udp ghcr.io/exvlan/rstun:<version>` | full |
 | Release 资产 | `rstun-<platform>-<version>.zip` / `rstun-full-<platform>-<version>.zip` | lean / full |
 

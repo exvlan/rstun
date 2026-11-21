@@ -15,6 +15,9 @@
 | --- | --- |
 | `check-docs.sh` | 扫描 `docs/book/src/**` + 仓库根 `*.md`；比对 ① `rstun --help` 片段（**逐 token**，避免 clap 折行假红）② `--flag` 名存在 ③ `rstun_*` 指标名存在 ④ 链接与跨章锚点 |
 | `build-deb.sh` | 版本必须等于 `Cargo.toml`；架构映射 **amd64→`x86_64-unknown-linux-musl`**、arm64→`aarch64-…`；musl 缺失时回退 glibc **并警告**（动态链接需 libc6 约束）|
+| `build-deb.sh --foreign-bin` | 跨架构打包时跳过「执行二进制做版本自检」（仅用于二进制来自可信发布物，如 Release 的 zip；调用方必须核对 sha256）|
+| deb 产物位置 | Release 资产 `rstun_<version>_{amd64,arm64}.deb`，由 `release.yml` 的 Linux 构建作业产出（lean、musl static-pie）；补历史版本时可从已发布 zip 打包，**不重跑流水线**（避免镜像 digest 变化）|
+| Homebrew tap | `exvlan/homebrew-rstun` 的 `Formula/rstun.rb` 必须与同版本 Release 的 `rstun.rb` 类体一致（sha256 对得上）；每版发版后人工同步（`gen-brew.sh` 产物覆盖）|
 | `gen-brew.sh <version> <sha256...>` | 只取 3 个 lean zip（`rstun-<platform>-<version>.zip`）；full 前缀 `rstun-full-` 不得误匹配 |
 | `gen-sbom.sh --features lean\|full --out <path>` | CycloneDX 1.5；组件含 `type/name/version/bom-ref/purl/licenses`；`dependencies` 为**全可达图**、无悬空 ref |
 | `deny.toml` | `licenses` 显式允许清单；`bans.wildcards=deny`；`multiple-versions=warn`；advisories 交由 `cargo audit`（`unmaintained=none`）|
@@ -30,7 +33,7 @@
 | deb 安装路径 | 二进制 `/usr/local/bin/rstun`（**有意选择**：不覆盖发行版包管理器；代价是 lintian E 级，已在 `contrib/README.md` 说明）|
 | deb 服务 | unit 在 `/lib/systemd/system/rstun.service`；postinst 幂等、不 `rm -rf`、无 systemd 时不起服务；preremove 只 `daemon-reload`（不 stop，升级由 systemd 处理）|
 | SBOM | 随 Release 上传（lean/full 各一份）；**不含 hashes/签名**（Release notes 已声明，cosign 后置）；`components` 含 build/proc-macro 闭包，**不是运行期 crate 数** |
-| 资产数量 | Release 断言 11 个（8 zip + 2 cdx + 1 rb），缺 SBOM 直接失败 |
+| 资产数量 | Release 断言 **13** 个（8 zip + 2 cdx + 1 rb + 2 deb），缺 SBOM/deb 直接失败 |
 | 供应链门禁 | `cargo audit` 与 `cargo deny` **都**是必需作业（`deny` 无 `continue-on-error`）；豁免清单两处同步：`.cargo/audit.toml` 与 `deny.toml`，只 ignore `RUSTSEC-2026-0387` |
 
 ## 4. Validation & Error Matrix
@@ -43,7 +46,7 @@
 | 版本与 `Cargo.toml` 不一致 | `build-deb.sh` / `gen-brew.sh` exit 1 |
 | musl 产物缺失 | 回退 glibc 并打 3 行警告；**发布前必须确认走 musl** |
 | SBOM 缺组件/悬空 ref | 生成脚本自检失败 |
-| Release 资产 ≠ 11 | release 作业 `::error::` |
+| Release 资产 ≠ 13（或 deb ≠ 2）| release 作业 `::error::` |
 
 ## 5. Good / Base / Bad
 

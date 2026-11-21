@@ -37,8 +37,8 @@ Release 的 `rstun-full-*` 或镜像）：
 | 渠道 | 命令 | 说明 |
 | --- | --- | --- |
 | Cargo | `cargo install rstun` | 已发布 `26.410.102`；从源码树用 `cargo install --path .` |
-| Homebrew | `brew install exvlan/rstun/rstun` | tap 见 [`contrib/homebrew/rstun.rb`](contrib/homebrew/rstun.rb)；**lean** |
-| Debian / Ubuntu | `sudo dpkg -i rstun_<version>_amd64.deb` | [`contrib/deb/nfpm.yaml`](contrib/deb/nfpm.yaml)，含 systemd unit；**lean** |
+| Homebrew | `brew install exvlan/rstun/rstun` | tap [`exvlan/homebrew-rstun`](https://github.com/exvlan/homebrew-rstun)；模板见 [`contrib/homebrew/rstun.rb`](contrib/homebrew/rstun.rb)；**lean** |
+| Debian / Ubuntu | `sudo dpkg -i rstun_<version>_amd64.deb` | 从 [Releases](https://github.com/exvlan/rstun/releases) 下载（`amd64` / `arm64`）；配置见 [`contrib/deb/nfpm.yaml`](contrib/deb/nfpm.yaml)，含 systemd unit；**lean** |
 | Docker | `docker run -d -p 3478:3478/udp ghcr.io/exvlan/rstun:<version>` | **full** 构建，见 [Docker 页](docs/book/src/docker.md) |
 | Release 二进制 | `rstun-<platform>-<version>.zip`（lean）/ `rstun-full-<platform>-<version>.zip` | [Releases](https://github.com/exvlan/rstun/releases) |
 
@@ -121,7 +121,7 @@ cargo install rstun --features full       # crates.io（完整版）
   `--version`；Linux 上 full 产物还多跑一次 TLS 冒烟（自签 ECDSA 证书起 `turns:` 监听 +
   `openssl s_client` 握手 + 另一实例的明文 Binding）。
 - `sbom` 作业（与平台无关，只跑一次）用 `script/ci/gen-sbom.sh` 生成 lean / full 两份 SBOM；
-  `release` 作业断言 **8 个 zip + 2 份 SBOM + 1 份 formula = 11 个资产**，少一个就拒绝发版
+  `release` 作业断言 **8 个 zip + 2 份 SBOM + 1 份 formula + 2 个 deb = 13 个资产**，少一个就拒绝发版
   （SBOM 的组件数还额外断言直接依赖 9 / 13）。
 
 ## 运维面（readiness / metrics / env / 优雅退出 / 部署清单）

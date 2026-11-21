@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/distribution.md", "reason": "分发渠道契约（brew/deb/docker/cargo 的四条路径）"}
+{"file": ".trellis/spec/backend/release-artifacts.md", "reason": "Release 资产口径（11 → 13）与发布流水线契约"}

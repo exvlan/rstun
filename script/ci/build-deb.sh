@@ -13,6 +13,8 @@
 #   bash script/ci/build-deb.sh --version 26.410.100 --arch arm64 \
 #        --bin target/aarch64-unknown-linux-musl/release/rstun
 #   bash script/ci/build-deb.sh --download-nfpm          # 缺 nfpm 时下载固定版本（校验 sha256）
+#   bash script/ci/build-deb.sh --foreign-bin            # 跨架构打包：跳过「执行二进制做版本自检」
+#                                                        # （仅用于二进制来自可信发布物，如 Release 的 zip）
 #
 # 依赖：nfpm（>= 2.40，固定 2.49.0 验证过）、dpkg-deb（校验用，缺失时退化到 `ar t`）。
 set -euo pipefail
@@ -26,6 +28,7 @@ BIN=""
 OUT="$ROOT/dist/deb"
 DOWNLOAD_NFPM=0
 VERIFY_TAG=0
+FOREIGN_BIN=0
 
 # nfpm 固定版本与校验值（只在 CI/脚本里用，**不进 Cargo.toml**）。
 NFPM_VERSION="2.49.0"
@@ -61,6 +64,7 @@ while [ $# -gt 0 ]; do
       OUT="${1:-}"
       ;;
     --download-nfpm) DOWNLOAD_NFPM=1 ;;
+    --foreign-bin) FOREIGN_BIN=1 ;;
     --verify-tag) VERIFY_TAG=1 ;;
     -h | --help)
       usage
@@ -137,11 +141,18 @@ case "$ARCH:$file_arch" in
 esac
 
 # 版本串自检：发行版二进制是 `<version>+<sha6>`，所以用「包含」而不是「相等」。
-bin_version="$("$BIN" --version)"
-case "$bin_version" in
-  *"$VERSION"*) ;;
-  *) die "--version 输出（${bin_version}）不含 ${VERSION}" ;;
-esac
+#
+# `--foreign-bin`：跨架构打包（例如在 x86_64 主机上给 Release 的 aarch64 zip 打 deb）时，
+# 本机无法执行目标架构二进制，跳过这一步。调用方必须自己确认二进制来源（sha256 与发布物一致）。
+if [ "$FOREIGN_BIN" -eq 1 ]; then
+  echo "build-deb: --foreign-bin → 跳过版本自检（二进制来自外部发布物，请自行核对来源）" >&2
+else
+  bin_version="$("$BIN" --version)"
+  case "$bin_version" in
+    *"$VERSION"*) ;;
+    *) die "--version 输出（${bin_version}）不含 ${VERSION}" ;;
+  esac
+fi
 
 # ---- nfpm ------------------------------------------------------------------
 find_nfpm() {

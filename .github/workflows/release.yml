@@ -277,6 +277,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+
   # 双架构镜像：两个 runner 各自 native build（不靠 QEMU 模拟），各推 `<version>-<arch>`，
   # 再由 `manifest` 作业合成 `<version>`。context = 仓库根。
   #
@@ -441,6 +442,27 @@ jobs:
           pattern: sbom-*
           merge-multiple: true
 
+      # Debian 包只发 **lean**（与 brew 一致的既有决定）。在这里（x86_64 runner）统一打两个架构：
+      # nfpm 只是打包器、与宿主架构无关，二进制直接取 build 作业 staged 的 lean 产物；
+      # arm64 包无法在本机执行版本自检，用 `--foreign-bin` 跳过（来源由 zip/asset 保证）。
+      - name: Build Debian packages (lean)
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p deb_assets
+          for pair in amd64:rstun-linux-x86_64 arm64:rstun-linux-aarch64; do
+            arch="${pair%%:*}"
+            dir="${pair##*:}"
+            bin="release_assets/${dir}/rstun"
+            [ -x "$bin" ] || { echo "::error::missing lean binary $bin"; exit 1; }
+            extra=()
+            [ "$arch" = arm64 ] && extra=(--foreign-bin)
+            bash script/ci/build-deb.sh --download-nfpm "${extra[@]}" \
+              --version "$VERSION" --arch "$arch" --bin "$bin" --out deb_assets
+          done
+          ls -l deb_assets
+
       - name: Package assets
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -512,7 +534,9 @@ jobs:
             echo ""
             echo "SBOM（CycloneDX 1.5，\`cargo metadata\` 生成）："
             echo "\`rstun-${VERSION}-lean.cdx.json\` / \`rstun-${VERSION}-full.cdx.json\`。"
-            echo "Homebrew：\`rstun.rb\`（本资产里的 formula，lean 构建；tap \`exvlan/homebrew-rstun\` 同步是人工步骤）。"
+            echo "Homebrew：\`brew install exvlan/rstun/rstun\`（tap；同一份 formula 也在本 Release 的 \`rstun.rb\` 里）。"
+            echo "Debian/Ubuntu：\`rstun_${VERSION}_amd64.deb\` / \`rstun_${VERSION}_arm64.deb\`"
+            echo "（lean，musl static-pie；\`sudo dpkg -i rstun_${VERSION}_amd64.deb\`）。"
             echo "**发布产物未做签名**（cosign/sigstore 后置）：请用 SBOM + 自行计算的 sha256 校验，"
             echo "或在信任前从 tag 自行构建。"
             echo ""
@@ -530,10 +554,12 @@ jobs:
           shopt -s nullglob
           # 八份二进制 + 两份 SBOM + Homebrew formula。zip 数量在「Package assets」里已单独断言
           # （8 个），这里只保证 SBOM/formula 也进来了 —— 它们缺失不该悄悄发出去。
-          assets=(zipped_assets/*.zip sbom_assets/*.cdx.json dist/homebrew/*.rb)
+          assets=(zipped_assets/*.zip sbom_assets/*.cdx.json dist/homebrew/*.rb deb_assets/*.deb)
           zips=(zipped_assets/*.zip)
-          if [ "${#zips[@]}" -ne 8 ] || [ "${#assets[@]}" -ne 11 ]; then
-            echo "::error::资产数不对：zip ${#zips[@]}（期望 8）+ 其它 $(( ${#assets[@]} - ${#zips[@]} ))（期望 3）"
+          debs=(deb_assets/*.deb)
+          # 8 zip（4 平台 × lean/full）+ 2 SBOM + 1 formula + 2 deb（amd64/arm64）= 13
+          if [ "${#zips[@]}" -ne 8 ] || [ "${#debs[@]}" -ne 2 ] || [ "${#assets[@]}" -ne 13 ]; then
+            echo "::error::资产数不对：zip ${#zips[@]}（期望 8）+ deb ${#debs[@]}（期望 2）+ 其它 $(( ${#assets[@]} - ${#zips[@]} - ${#debs[@]} ))（期望 3）"
             printf '  %s\n' "${assets[@]}"
             exit 1
           fi
