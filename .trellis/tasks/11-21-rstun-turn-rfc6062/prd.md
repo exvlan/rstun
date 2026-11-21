@@ -16,13 +16,16 @@ coturn 与 `turnutils_uclient -T` 支持该模式；部分企业网络（阻断 
 ## 范围（RFC 6062 关键语义，待 design 细化）
 
 1. **`Allocate` + `REQUESTED-TRANSPORT=6`**：成功返回 `200` + `XOR-RELAYED-ADDRESS`
-   （TCP 中继地址）+ **`CONNECTION-ID`**；不再 442。
+   （TCP 中继地址）+ `XOR-MAPPED-ADDRESS` + `LIFETIME`；**不含 `CONNECTION-ID`**
+   （调研已证：RFC 6062 §5.1 无此要求，coturn 亦不带；`CONNECTION-ID` 由 `Connect` 响应产生）。
 2. **`Connect`**（新方法）：客户端给 `XOR-PEER-ADDRESS`，服务器向 peer 建 TCP；
    成功回 `200`；失败按 RFC 给错误码（如 `447 Connection Timeout or Failure`、
    `403 Forbidden`、`446` 等——以 RFC 原文为准）。
 3. **`ConnectionBind`**（新方法）：客户端在**新连接**上用 `CONNECTION-ID` 绑定，
    之后该连接上的字节裸转发到 peer（不再是 STUN 帧）。
-4. **`ConnectionAttempt` indication**（若实现被动模式；design 决定是否纳入本期）。
+4. **`ConnectionAttempt` indication**（**被动模式：本期不做**；调研结论见
+   `research/rfc6062.md` §5.4 —— 需要「allocation → 控制连接」的反向通道，且 `uclient -P`
+   实测 50% 丢包、验收判据不稳。留作二期内的后续子项）。
 5. **生命周期**：`LIFETIME`/`Refresh` 对 TCP allocation 同样有效；连接半开、对端关闭、
    超时、配额超限都要有确定行为与计数。
 6. **权限模型**：与 UDP 的 `CreatePermission` 关系（RFC 6062 对 TCP 的授权要求）；
@@ -42,7 +45,8 @@ coturn 与 `turnutils_uclient -T` 支持该模式；部分企业网络（阻断 
 - 现有配额（`--max-allocations-per-user/-ip`、`--relay-ports`、`--max-inflight`）对 TCP 中继同样生效；
 - 默认关闭路径字节冻结不变（3 配置 × 17 请求）；
 - 平台：Linux/macOS/Windows 都能编译（无 unix-only 依赖）；
-- 现有 `442` 行为在**未启用**特征时保持不变（即默认构建不静默改变语义）。
+- 现有 `442` 行为在**未启用**特征时保持不变：开关形态为**新增 CLI 开关**
+  `--turn-tcp-relay`（默认关；只有显式打开才走 RFC 6062 路径）。
 
 ## 验收
 

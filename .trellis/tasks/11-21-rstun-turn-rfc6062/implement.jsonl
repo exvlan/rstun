@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/turn.md", "reason": "TURN 行为/错误码/验收契约"}
+{"file": ".trellis/spec/backend/protocol-errors.md", "reason": "446/447/400/437/403/508 口径"}
+{"file": ".trellis/spec/backend/ops.md", "reason": "指标固定标签集与 /metrics 约束"}
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "门禁与冻结对照"}
