@@ -455,7 +455,10 @@ jobs:
             arch="${pair%%:*}"
             dir="${pair##*:}"
             bin="release_assets/${dir}/rstun"
-            [ -x "$bin" ] || { echo "::error::missing lean binary $bin"; exit 1; }
+            [ -f "$bin" ] || { echo "::error::missing lean binary $bin"; exit 1; }
+            # `download-artifact` 不保留权限位（GitHub 已知行为）：落盘是 0644，
+            # 直接 `[ -x ]` 会误判成「缺文件」，打包前补回可执行位。
+            chmod +x "$bin"
             extra=()
             [ "$arch" = arm64 ] && extra=(--foreign-bin)
             bash script/ci/build-deb.sh --download-nfpm "${extra[@]}" \

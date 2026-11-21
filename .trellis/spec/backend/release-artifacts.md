@@ -26,6 +26,7 @@
 | 契约 | 规则 | 违反后的现象 |
 | --- | --- | --- |
 | 资产可执行位 | zip 内 `rstun` / `rstun.exe` 必须 `0755`（打包前 `chmod +x`）| 解压后 `./rstun` → `Permission denied` |
+| 作业间产物权限 | `download-artifact` **不保留权限位**（落盘 0644）：任何直接使用下载产物的步骤（zip、deb、冒烟）必须先 `chmod +x`，不要用 `[ -x ]` 当存在性检查 | `::error::missing lean binary …` / `Permission denied` |
 | tag ↔ 资产 ↔ 镜像 | 三者必须对应同一 commit；**不 force 移动已发布 tag**（消费者会拿到不同树）| `--version` 的 `+<sha6>` 与 tag 指向不符 |
 | 下游 digest | 对外报 **manifest list digest**（amd64+arm64 index）| 下游按 digest 校验对不上 |
 | 版本串 | `version` 输入 == `Cargo.toml` 的 `version`；二进制 `--version` = `<version>+<sha6>` | 包与报的版本不一致 |
