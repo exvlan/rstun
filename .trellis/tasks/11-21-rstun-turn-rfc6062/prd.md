@@ -50,7 +50,10 @@ coturn 与 `turnutils_uclient -T` 支持该模式；部分企业网络（阻断 
 
 ## 验收
 
-- [ ] `turnutils_uclient -T`（含 `-P` 被动模式，若实现）能完成 TCP allocation 与数据中继
+- [ ] 标准客户端流程（仓库探针 `rstun-turn-probe.py` 的 tcp-relay 模式）对 rstun 与 coturn **逐行一致**：
+      `Allocate(TCP)` → `Connect`（源地址 = relay 端口）→ `ConnectionBind` → 裸字节双向 → `LIFETIME=0` 关数据连接。
+      **注**：`turnutils_uclient -T` **隐含 `-y`（client-to-client）**，被连侧需要服务器发 `ConnectionAttempt`
+      （被动模式，本期不做）→ `-T` 留到被动模式子任务验收；本期不把它当验收条件。
 - [ ] 与 coturn 同一套命令对跑，差异逐项判定（我方/对手/RFC 理解）
 - [ ] `ConnectionBind` 的 5 元组与 `CONNECTION-ID` 校验收紧（错 ID/重放/并发绑定）
 - [ ] 半开、对端 RST、超时、`LIFETIME=0`、配额超限各有确定行为与单测

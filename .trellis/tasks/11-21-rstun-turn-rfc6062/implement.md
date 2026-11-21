@@ -51,7 +51,7 @@
 
 | # | 事项 | 验证 |
 | --- | --- | --- |
-| 5.1 | lab 新增 `tcprelay` 项：`uclient -T`（`exit=0` + `lost packets 0`）| `--only tcprelay` |
+| 5.1 | lab 新增 `tcprelay` 项：探针标准流程（Allocate→Connect→Bind→裸字节→LIFETIME=0），rstun 与 coturn 逐行一致（`uclient -T` 见 design §8.1，留被动模式子任务）| `--only tcprelay` |
 | 5.2 | lab cleanup 补 `ss -ltnH` 的 TCP 残留断言 | `--only cleanup` |
 | 5.3 | coturn 对跑（同命令）：结果一致 + 差异清单 | 日志 |
 | 5.4 | 文档：`turn.md` 行为表、`README` 不做清单、`CHANGELOG`、spec、`src/turn.rs` 头注释 | `check-docs.sh` |

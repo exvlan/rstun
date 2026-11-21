@@ -129,7 +129,9 @@ Connect 成功 ──► Pending(buffered bytes) ──ConnectionBind ok──�
 
 ## 8. 验收（与 PRD 对齐）
 
-1. `turnutils_uclient -T`：`exit=0`、`Total lost packets 0`（coturn 同命令同结果）；
+1. 标准流程探针（`rstun-turn-probe.py --mode tcp-relay`）对 rstun 与 coturn **逐行一致**；
+   `turnutils_uclient -T` 因隐含 `-y`（需要被连侧的 `ConnectionAttempt`）**不在本期验收**，
+   留到被动模式子任务（`11-22-rstun-turn-passive`）。
 2. 无 permission 的 `Connect` → `200`；重复 `Connect` → `446`；连关闭端口 → `447`；
 3. `ConnectionBind` 错 ID/二次 bind/超 30 s → `400` 且连接关闭；
 4. `LIFETIME=0` / 过期 → 数据连接全部关闭（`ss -ltnH` 无残留）；
@@ -137,6 +139,15 @@ Connect 成功 ──► Pending(buffered bytes) ──ConnectionBind ok──�
 6. 开关关闭时 `uclient -T` 仍 `442`（回归）；
 7. 默认路径冻结、interop/abuse/turn/audit/deny 全绿；
 8. 与 coturn 对跑：`-T` 结果一致，差异（`400` vs RST、控制连接是否关闭）显式记录。
+
+## 8.1 为什么不用 `turnutils_uclient -T` 验收（2026-11-21 复核确认）
+
+- `uclient` 的 `-T`（TCP relay transport）**Implies options `-t, -y, -c`**；
+- `-y` 是 client-to-client：`-T` 只做**一次** `Connect`（`i<j` 的循环），被连的一侧必须由服务器发
+  `ConnectionAttempt` 才能 `ConnectionBind`；
+- 实测（本仓，开关开）：`uclient -T` → `tot_recv_msgs=0`、进程挂到超时（`exit=124`）；
+  开关关 → `error 442`、exit=255（回归正确）；
+- 结论：`-T` 的通过前提是**被动模式**，与本期范围冲突。出站链路由探针 + 单测覆盖。
 
 ## 9. 未验证 / 待验证（研究声明）
 
