@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/turn.md", "reason": "TURN 行为契约（属性/错误码/验收项）"}
+{"file": ".trellis/spec/backend/protocol-errors.md", "reason": "420/440/400 错误码口径与 UNKNOWN-ATTRIBUTES"}
