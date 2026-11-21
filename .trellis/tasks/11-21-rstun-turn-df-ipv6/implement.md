@@ -80,3 +80,25 @@ cargo tree -e normal --depth 1 | wc -l
 | 门禁 | `cargo test` 245 / `--all-features` 246；lab 18 passed；frozen 与 `cad4fa2` 一致；audit/deny ok |
 | 复核 | 两轮，结论「可提交（无阻塞）」；4 处收尾（注释×2、锁范围收窄、500 分支补测）已落地 |
 | 未做 | 版本号未动（仍 `26.410.102`）；发版由主会话另行决定 |
+
+## 发版执行记录（26.410.103，主会话）
+
+| 项 | 结果 |
+| --- | --- |
+| 代码提交 | `e5f38bf`（DF + IPv6 relay）→ 版本提交 `5d3e602` |
+| crates.io | ✅ `rstun 26.410.103`；`cargo install` → `rstun 26.410.103` |
+| Release | ✅ run `44864072983` 12/12 作业；**13 资产**（8 zip + 2 SBOM + rb + **2 deb**，deb 由 CI 首次产出）|
+| 镜像 | `ghcr.io/exvlan/rstun:26.410.103`（amd64+arm64，full）|
+| **manifest digest** | `sha256:d7c4f3872a545ee7a8b0cd57a1234c83e0ae0d9df37b7b341f2fd6aafd643874` |
+| deb 抽检 | `rstun_26.410.103_amd64.deb` → `Version: 26.410.103`，解包执行 `26.410.103+bac375` |
+| Homebrew tap | 已同步 `exvlan/homebrew-rstun`（formula 类体与 Release `rstun.rb` 一致，3 个 sha256 逐条核对）|
+| 版本钉死点 | README / docker.md / contrib{k8s,compose,helm×2} → `.103` |
+
+### 首次发布失败与修复（CI 缺陷）
+
+第一次 dispatch（run `44863740893`）在 `Publish Release` 失败：
+`::error::missing lean binary release_assets/rstun-linux-x86_64/rstun`。
+
+根因：`download-artifact` **不保留权限位**（落盘 0644），deb 步骤用 `[ -x ]` 做存在性检查 → 误判缺文件。
+修复：`[ -f ]` + `chmod +x`（`bac3757`），并把该契约写进 `spec/release-artifacts.md`
+（作业间产物权限）。重跑即绿；tag 未被创建过，无半成品。
