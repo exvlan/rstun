@@ -3,6 +3,33 @@
 版本线**独立于任何宿主项目**：`YY.QMM.Mmpp`（年.季度月.月日+序号），首发 `26.410.100`。
 `rstun-v*` 的 Release tag / 镜像 tag / 资产名都用这里给出的版本号。
 
+## Unreleased
+
+### TURN：`REQUESTED-ADDRESS-FAMILY`（0x0017）不再回 420
+
+- **行为修正（RFC 8656 §7.2 步骤 7 / §18.6）**：`Allocate` 携带
+  `REQUESTED-ADDRESS-FAMILY` 时按请求的地址族校验 relay：族一致（IPv4 客户端请求
+  IPv4）→ 正常 `200`；请求的族本端提供不了（IPv4 客户端请求 `0x02`，或族值不是
+  `0x01`/`0x02`）→ **`440 Address Family not Supported`**；长度 ≠ 4 → `400`；
+  保留 24 位忽略。`RESERVATION-TOKEN` 与 `EVEN-PORT`/RAF 互斥 → **`400`**，且该判定
+  （§7.2 步骤 5）**先于**族比对（步骤 7）—— 异族 token 也是 `400`（与 coturn 一致）。
+- **`Refresh` 按 §8.2（MUST）**：`REQUESTED-ADDRESS-FAMILY` 与 allocation 的 relay 族
+  不匹配 → **`443 Peer Address Family Mismatch`**（allocation 存活，含 `LIFETIME=0`
+  的异族请求也不释放）；族匹配 → 正常续期；长度 ≠ 4 → `400`；不再回 `420`。
+- `DONT-FRAGMENT`（0x001A）**不变**：仍按未知 comprehension-required 属性回 `420`
+  —— RFC 8656 §7.2 步骤 4 明确允许「不设 DF 位的服务器」这样做，不是偏差。
+- `ADDITIONAL-ADDRESS-FAMILY`（0x8000，comprehension-optional）仍未实现（忽略），
+  因此 §7.2 步骤 6（RAF+AAF → `400`）不生效。
+- 影响面：只有**带** `REQUESTED-ADDRESS-FAMILY` 的请求字节改变（`turnutils_uclient`
+  的 `-e`/`-x`/`-X` 与 aioice 等客户端的显式族请求）；不带该属性的请求与
+  `26.410.101` 逐字节一致（`plain_response_bytes_are_frozen`、3 配置 × 17 请求
+  冻结对照均未变）。无新增依赖、无新增指标（`rejected_family` 复用）、无 CLI 变化。
+- 验收：解析器单测 + 两条 e2e（`Allocate` 7 组断言：匹配 / 440 / 400 / 非法族 /
+  保留位 / token 互斥（`0x01` 与 `0x02` 两种族）/ DF 仍 420；`Refresh` 5 组断言：
+  异族 443 / 非法族 443 / 异族 `LIFETIME=0` 仍 443 且不释放 / 长度错 400 / 匹配 200）；
+  lab 新增 `raf` 项（`uclient -X` 中继、`-x` → `error 440`、`-g` → `error 420`），
+  `dtls` 项补 `-S -X`（生产复现形状）。
+
 ## 26.410.101
 
 补丁版：依赖升到各自最新 + 上一版积累的功能（T1 TURN、T2 `turns:`/DTLS/REST/带宽、

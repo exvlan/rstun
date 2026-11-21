@@ -39,10 +39,19 @@ EVEN-PORT / RESERVATION-TOKEN 互斥 // ~1042
    - `Some(其他)` → `440`（语义是「该族不支持」）；
    - `Some(匹配)` / `None` → 照旧分配。
    - 440 复用 `ERROR_ADDRESS_FAMILY_NOT_SUPPORTED`，计入 `rejected_family` 计数。
+   - **顺序要求**（复核 B1）：`RESERVATION-TOKEN` 互斥（步骤 5）必须先于族比对（步骤 7），
+     否则「token + 异族 RAF」会错误地回 440 而不是 400。
+   - 注意：relay 族**跟随客户端**，所以 IPv6 客户端会得到 IPv6 relay；本实现不支持的
+     只是「与客户端族不同」的请求与双分配（AAF）——文档不得写成「IPv6 一律 440」。
 4. 互斥（§7.2 步骤 5）：`RESERVATION-TOKEN` 与 `EVEN-PORT` **或 RAF** 同时出现 → `400`。
    现有代码只查 `wants_even`，补 `raf.is_some()`。
-5. `Refresh`：属性已「已知」→ 不再 420；本实现**忽略其值**（分配已存在，族不可变）。
-   在代码注释里写明这是有意为之。
+5. `Refresh`（§8.2 MUST）：属性已「已知」→ 不再 420；解析后与**现有分配**的 relay 族比对：
+   - 匹配 → 正常续期（200）；
+   - 不匹配 → `443 ERROR_PEER_ADDRESS_FAMILY_MISMATCH`，计 `rejected_family`；
+   - 长度 ≠ 4 → `400`。
+   （原稿「接受并忽略 → 200」偏离 §8.2，已废弃。）
+6. `ADDITIONAL-ADDRESS-FAMILY (0x8000)` 继续忽略（comprehension-optional），
+   因此 §7.2 步骤 6（RAF + AAF → 400）不生效 —— 需在 spec 显式记账。
 
 ## 3. 兼容性与字节冻结
 
@@ -63,7 +72,10 @@ EVEN-PORT / RESERVATION-TOKEN 互斥 // ~1042
 | RAF family=0x03 | `440` |
 | RAF reserved 非零 | 仍然 `200`（必须忽略）|
 | RESERVATION-TOKEN + RAF | `400` |
-| Refresh 带 RAF | 非 `420`（`200` 或既有 437/438 口径）|
+| Refresh RAF 族匹配 | `200`，LIFETIME 正常续期 |
+| Refresh RAF 族不匹配 | `443`（§8.2 MUST）|
+| Refresh RAF 长度 3 | `400` |
+| `RESERVATION-TOKEN + RAF(异族)` | `400`（步骤 5 先于步骤 7，复核 B1）|
 | 未知属性 0x001A | 仍 `420` 且 UNKNOWN-ATTRIBUTES=[0x001A] |
 
 lab（`script/lab/rstun-turn.sh`）：新增 `raf` 项，用真实 `turnutils_uclient` 跑

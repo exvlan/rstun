@@ -18,6 +18,8 @@
 | `Allocate` 幂等 | **同一 transaction id** 的重传 → `200` + 原 `XOR-RELAYED-ADDRESS`/`LIFETIME`；**新 tid → `437`** |
 | `Allocate` 换用户 | 5 元组命中但 `allocation.username != identity.username` → **`441`**；不得读/改他人 allocation |
 | `Refresh` 生命周期 | 缺 `LIFETIME` → 服务端默认（600s，§8.2）；`LIFETIME=0` → 立即释放；未知 allocation → `437` |
+| `REQUESTED-ADDRESS-FAMILY` (0x0017) | 4 字节 `family | reserved`；**reserved 24 位必须忽略**；`Allocate`：族与 `relay_ip` 一致 → `200`；不一致或族值非 `0x01`/`0x02` → **`440`**（计 `rejected_family`）；长度 ≠ 4 → **`400`**；`Refresh`：族与该 allocation 的 relay 族**不匹配 → `443`**（§8.2 MUST，计 `rejected_family`）、匹配 → 正常续期、长度 ≠ 4 → `400`；`RESERVATION-TOKEN` 与 `EVEN-PORT` **或 RAF** 互斥 → **`400`**，且**步骤 5 先于步骤 7**（异族 token 也是 400，coturn 同）；`ADDITIONAL-ADDRESS-FAMILY` (0x8000) 未实现（comprehension-optional，忽略）⇒ §7.2 **步骤 6**（RAF+AAF → 400）**不生效**，记账于 `docs/book/src/turn.md` |
+| `DONT-FRAGMENT` (0x001A) | **保持**未知 comprehension-required → `420`（RFC 8656 §7.2 步骤 4 明文允许「不设 DF 位」）；不得改成 400、也不得静默忽略 |
 | 他人 allocation | `Refresh` / `CreatePermission` / `ChannelBind` 命中他人 allocation → **`441`**；他人 `LIFETIME=0` 不删除 |
 | permission 容量 | `--permission-limit`（默认 10）；一条请求里多个 `XOR-PEER-ADDRESS` **先全量校验再写入**，超限 → **`508`** 且零生效 |
 | channel 容量 | `ChannelBind` 的隐式 permission 占用同一上限，超限 → **`508`** |
@@ -36,7 +38,7 @@
 准入（限速/在途）→ 鉴权（401/438/400）→ 420（未知 comprehension-required）
 → 5 元组查表（无 → 437）
 → 用户名比对（不同 → 441）
-→ 方法特定校验（400/442/440/443/508）
+→ 方法特定校验（400/442/440/443/508；其中 RAF 族比对在 `egress_ip` **与 §7.2 步骤 5（`EVEN-PORT`/`RESERVATION-TOKEN` 互斥）之后** —— 异族 token 也是 400）
 → 写入 → 200（签名 + SOFTWARE）
 ```
 
@@ -71,11 +73,28 @@
 6. 新 tid 重复 `Allocate` → `437`；同 tid 重传 → 200 且 relay 不变。
 7. 长度撒谎的 UDP `ChannelData` → peer 收不到。
 8. 成功响应含 `SOFTWARE`（Allocate/Refresh/CreatePermission/ChannelBind）。
-9. 不配 `--turn`：3 组配置 × 17 请求与 HEAD 逐字节一致。
+9. 不配 `--turn`：3 组配置 × 17 请求与 `FROZEN_BASE`（默认 `cad4fa2`）逐字节一致。
+10. `REQUESTED-ADDRESS-FAMILY` 四态：族匹配（+ reserved 非零）→ `200`；IPv4 客户端请求
+    `0x02` → `440` 且 `active()==0`、`rejected_family` 增长；长度 3 → `400`；族值 `0x03`
+    → `440`；`RESERVATION-TOKEN` + RAF **两种族（0x01/0x02）都** → `400`（步骤 5 先于
+    步骤 7）；`Refresh`：RAF `0x02`（IPv4 分配）→ **`443`** 且 allocation 存活（含
+    `LIFETIME=0` 的异族请求也不得释放）、RAF `0x01` → `200` + 正常 LIFETIME、RAF 长度 3
+    → `400`；`0x001A` 仍 `420` 且 `UNKNOWN-ATTRIBUTES=[0x001A]`；lab `raf` 项用真 uclient
+    断言 `-X` 中继、`-x` → `error 440`、`-g` → `error 420`。
 
 外部对照：`script/lab/rstun-turn.sh` 的 `wrong-user` / `lifecycle` / `relay` / `coturn` 项用同一
 探针分别对 rstun 与本地 `turnserver` 跑，输出应逐行一致（唯一允许差异：coturn 在
 `LIFETIME=0` 后会把 allocation「复活」，rstun 按 RFC 回 437）。
+
+**字节冻结口径**
+
+- 默认关闭（无 `--turn`）由 lab `frozen` 项（3 配置 × 17 请求）对照 `FROZEN_BASE`。
+  **版本号变化会改 `SOFTWARE` 串**（每帧字节都变），或有意改默认路径字节时，**必须**同步
+  `script/lab/rstun-turn.sh` 中 `FROZEN_BASE` 的默认值（当前 `cad4fa2`，即 RAF 改动的基线）。
+- TURN 侧**不设**「不带 RAF 的请求」的字节对照：RAF 缺失走 `Ok(None)` 分支，不进入任何族
+  比较/拒绝路径；由 `requested_address_family_parsing` 的 `Ok(None)` 与
+  `requested_address_family_selects_the_relay_family` 中「无/匹配 RAF → 200」隐含保证。
+  将来若给 TURN 加字节冻结，应按 `--turn` + 固定 transaction id 增补一组。
 
 ## 5b. T2 契约（`turns:` / DTLS / REST / 带宽）
 

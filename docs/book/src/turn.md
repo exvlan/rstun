@@ -32,7 +32,7 @@ rstun server \
 | 端口与配额 | `--relay-ports` 耗尽 → `508`；每用户 `--max-allocations-per-user`（默认 8）/ 每 IP `--max-allocations-per-ip`（默认 16）超限 → `486`；每 allocation permission 超 `--permission-limit`（默认 10）→ **`508`**（RFC 8656 §10.2；一条请求带多个 peer 时**整条原子校验**，不做部分生效） |
 | 响应属性 | 成功响应带 `SOFTWARE`（RFC 8656 §14.10 SHOULD），401/438 挑战不带；`ChannelBind` 隐式创建的 permission 与 `CreatePermission` 共用同一个上限 |
 | 数据面 | `Send` 仅在 permission 覆盖 peer 时转发（否则静默丢弃）；relay 收到 peer 数据时，命中 channel → `ChannelData`，否则 → `Data` indication；`ChannelData` 不解析 STUN；**UDP 上声明长度大于实际报文的 `ChannelData` 静默丢弃**（不转发截断内容）；TCP 客户端写队列有界（64 帧，溢出丢 relayed 数据）|
-| 其它 transport | `REQUESTED-TRANSPORT=6`（TCP allocation / RFC 6062）→ `442`；`EVEN-PORT`（含 R=1 reservation token）支持；`DONT-FRAGMENT` 等未实现的可理解属性 → `420` |
+| 其它 transport | `REQUESTED-TRANSPORT=6`（TCP allocation / RFC 6062）→ `442`；`EVEN-PORT`（含 R=1 reservation token）支持；`REQUESTED-ADDRESS-FAMILY`（0x0017，§18.6）已解析：与 relay 地址族一致 → 正常分配（relay 族跟随客户端：IPv4 客户端 + IPv4、IPv6 客户端 + IPv6）；请求的族本端提供不了（如 IPv4 客户端请求 `0x02`）或族值非 `0x01`/`0x02` → **`440 Address Family not Supported`**；长度 ≠ 4 → `400`；**保留 24 位忽略**（非零不报错）；`Refresh` 上族不匹配 → **`443 Peer Address Family Mismatch`**（§8.2 MUST）、匹配 → 正常续期、长度 ≠ 4 → `400`；`RESERVATION-TOKEN` 与 `EVEN-PORT`/RAF 互斥 → **`400`**（§7.2 步骤 5 先于步骤 7，异族 token 也是 400）；`ADDITIONAL-ADDRESS-FAMILY`（0x8000，comprehension-optional）未实现 → 忽略（因此步骤 6 的「RAF+AAF → 400」不生效）；`DONT-FRAGMENT`（0x001A）仍按未知 comprehension-required → `420`（§7.2 步骤 4 明文允许服务器不设 DF 位）|
 | TLS（`--turn-tls-listen`）| **仅 full 构建**（`tls` feature；lean 给出该 flag 会拒绝启动并说明）。在 TCP 分帧之上套 TLS 1.2/1.3（`tokio-rustls`，ring provider）。`--tls-cert`/`--tls-key` 在**启动时**解析：路径不可读、证书/私钥不配对、给了监听却没给材料 → **启动失败**（绝不降级明文）。握手 5s 超时、失败计数（退出日志 `handshake_failed`），日志不含证书内容。TLS 与明文**不共用端口** |
 | DTLS（`--turn-dtls-listen`）| **仅 full 构建**（`dtls` feature，含 `tls`）。DTLS 1.2（`webrtc-dtls`，纯 Rust）。**一个 datagram = 一个 STUN/TURN 消息或一个 `ChannelData`**（与 UDP 同构，无 4 字节对齐）；5 元组的 client transport 记为 `Dtls`；握手在每客户端独立任务里做（5s 超时），不阻塞 accept。私钥必须是 **PKCS#8** 且算法为 **ECDSA P-256 / Ed25519**（`webrtc-dtls` 的限制，启动时明确报错）|
 | REST 临时凭据（`--rest-secret`）| coturn `use-auth-secret` 兼容：`username = <expiry-unix>:<label>`、`password = base64(HMAC-SHA1(secret, username))`（**标准 base64**，带 `=` 填充）。过期 → `401`（不是 438：nonce 仍有效，换凭据而不是换 nonce）；HMAC 不匹配 → `401`。**与长期凭据并存时 REST 优先**（用户名能解出时间戳即走 REST，不再查用户表）；`<expiry>:<label>` 的 label 可含 `:`（按**第一个** `:` 切分，coturn 同）|
@@ -79,8 +79,16 @@ rstun server \
   高 churn 下可能多拒绝一次 `486`，下一次扫描恢复。
 - **防回环已知盲区**：不枚举宿主接口，故「peer = 宿主自身公网 IP:端口」无法识别；
   需要该能力时应改用 coturn 或引入接口枚举（T2 评估，新增依赖需单独立项）。
-- 不支持：TCP allocation（RFC 6062）、ACME/OCSP、`DONT-FRAGMENT`、
-  `REQUESTED-ADDRESS-FAMILY`、证书热加载。
+- 不支持：TCP allocation（RFC 6062）、ACME/OCSP、`DONT-FRAGMENT`（0x001A：仍回
+  `420`，RFC 8656 §7.2 步骤 4 明确允许「不设 DF 位的服务器按未知可理解属性处理」）、证书热加载。
+- `REQUESTED-ADDRESS-FAMILY`（0x0017）支持到「relay 地址族的请求与校验」：
+  **relay 族跟随客户端**（IPv6 监听上 IPv6 客户端拿到 IPv6 relay），无法满足的只是
+  「与客户端族不同」的请求（`440`）与双分配 `ADDITIONAL-ADDRESS-FAMILY`（未实现，忽略）。
+  `Refresh` 上族不匹配 → **`443`**（RFC 8656 §8.2 MUST）。
+  lab **未覆盖** IPv6 relay（`raf` 项的 `-x` 只验证「IPv4 客户端请求 IPv6 → `440`」）；
+  「IPv6 监听 + IPv6 客户端 → IPv6 relay」属**无仓内回归**的路径，改动它需要单独的 IPv6 lab 项。
+- **`DONT-FRAGMENT` 的 420 是有意为之**（合规），不是偏差；`REQUESTED-ADDRESS-FAMILY` 的 420 曾是偏差，
+  26.410.101 之后的版本已改为 `200`/`440`/`443`/`400`。
 - **DTLS 已知限制**（来自 `webrtc-util` 的监听实现）：每个远端地址的会话在监听器生命周期内
   只创建一次；一个 5s 内没完成握手的客户端，其后续重试会被丢弃到已关闭的会话里，直到进程重启。
   这是「握手超时」的代价，写在这里免得被当成随机故障。
@@ -88,8 +96,9 @@ rstun server \
 验收：
 
 ```bash
-bash script/lab/rstun-turn.sh            # 17 项（lean 构建：tls/dtls 标 SKIP）
-                                         #   启动失败/中继/401+438/生命周期/441/通配回环/permission 508/486/端口 508/
+bash script/lab/rstun-turn.sh            # 18 项（lean 构建：tls/dtls 标 SKIP）
+                                         #   启动失败/中继/401+438/生命周期/441/RAF(-X 成功、
+                                         #   -x 440、-g 420)/通配回环/permission 508/486/端口 508/
                                          #   TLS/DTLS/REST/带宽/回收/字节冻结/coturn 对照
 bash script/lab/rstun-turn.sh --tls      # 只跑 TLS（自动 --features full 构建；s_client 握手 + uclient -S -t 中继）
 bash script/lab/rstun-turn.sh --dtls     # 只跑 DTLS（自动 --features full；s_client -dtls1_2 + uclient -S 中继）

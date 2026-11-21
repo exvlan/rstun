@@ -436,10 +436,52 @@ fn unknown_comprehension_required_attributes_are_reported() {
     protocol::push_attribute(&mut body, 0x001A, &[]); // DONT-FRAGMENT: unsupported
     assert_eq!(turn_unknown_attributes(&body), vec![0x001A]);
 
+    // REQUESTED-ADDRESS-FAMILY is understood now (answered 200/440/400), so a
+    // request carrying it is no longer a 420 (RFC 8656 §7.2 step 7).
+    let mut raf = Vec::new();
+    protocol::push_attribute(&mut raf, ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
+    protocol::push_attribute(&mut raf, ATTR_REQUESTED_ADDRESS_FAMILY, &[0x01, 0, 0, 0]);
+    assert!(turn_unknown_attributes(&raf).is_empty());
+
     let mut known = Vec::new();
     protocol::push_attribute(&mut known, ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
     protocol::push_attribute(&mut known, ATTR_LIFETIME, &300_u32.to_be_bytes());
     assert!(turn_unknown_attributes(&known).is_empty());
+}
+
+#[test]
+fn requested_address_family_parsing() {
+    assert_eq!(parse_requested_address_family(&[]), Ok(None));
+
+    let mut ipv4 = Vec::new();
+    protocol::push_attribute(&mut ipv4, ATTR_REQUESTED_ADDRESS_FAMILY, &[0x01, 0, 0, 0]);
+    assert_eq!(parse_requested_address_family(&ipv4), Ok(Some(0x01)));
+
+    // §18.6: the reserved 24 bits are ignored, never validated.
+    let mut reserved = Vec::new();
+    protocol::push_attribute(
+        &mut reserved,
+        ATTR_REQUESTED_ADDRESS_FAMILY,
+        &[0x02, 0xff, 0xff, 0xff],
+    );
+    assert_eq!(parse_requested_address_family(&reserved), Ok(Some(0x02)));
+
+    let mut short = Vec::new();
+    protocol::push_attribute(&mut short, ATTR_REQUESTED_ADDRESS_FAMILY, &[0x01, 0, 0]);
+    assert_eq!(parse_requested_address_family(&short), Err(()));
+}
+
+#[test]
+fn requested_address_family_matches_the_relay_family() {
+    let v4: IpAddr = "192.0.2.1".parse().unwrap();
+    let v6: IpAddr = "2001:db8::1".parse().unwrap();
+    assert!(family_matches(0x01, v4));
+    assert!(!family_matches(0x01, v6));
+    assert!(family_matches(0x02, v6));
+    assert!(!family_matches(0x02, v4));
+    // Values outside 0x01/0x02 never match: "family not supported".
+    assert!(!family_matches(0x00, v4));
+    assert!(!family_matches(0x03, v6));
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,6 +1057,209 @@ async fn allocate_rejects_tcp_transport_and_missing_requested_transport() {
         )
         .await;
     assert_eq!(error_code(&response), Some(420));
+}
+
+/// RFC 8656 §7.2 step 7 / §18.6: `REQUESTED-ADDRESS-FAMILY` chooses the relay
+/// address family. The relay follows the client, so "IPv4 client + IPv4" must
+/// allocate (this is the `turnutils_uclient -e/-X` case that used to get 420),
+/// and anything the relay cannot serve is `440`.
+#[tokio::test]
+async fn requested_address_family_selects_the_relay_family() {
+    let harness = start(Config::default()).await;
+    let mut client = Client::connect(harness.server).await;
+    client.challenge().await;
+
+    // Reserved bits set: §18.6 says ignore them, so this must still allocate.
+    let response = client
+        .request(
+            ALLOCATE_METHOD,
+            vec![
+                (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                (ATTR_LIFETIME, 300_u32.to_be_bytes().to_vec()),
+                (ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x01, 0xff, 0xff, 0xff]),
+            ],
+        )
+        .await;
+    assert_eq!(
+        error_code(&response),
+        None,
+        "IPv4 + IPv4 relay must allocate"
+    );
+    assert!(relayed_address(&response).is_ipv4());
+    assert_eq!(harness.turn.active(), 1);
+
+    // Refresh accepts the attribute too (§8.2): a matching family refreshes
+    // normally (a mismatch is 443 — covered by its own test).
+    let response = client
+        .request(
+            REFRESH_METHOD,
+            vec![
+                (ATTR_LIFETIME, 300_u32.to_be_bytes().to_vec()),
+                (ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x01, 0, 0, 0]),
+            ],
+        )
+        .await;
+    assert_eq!(error_code(&response), None);
+    assert_eq!(lifetime_of(&response), 600);
+    assert_eq!(harness.turn.active(), 1);
+
+    // A relay family the client cannot get: 440, and nothing is allocated.
+    let harness = start(Config::default()).await;
+    let mut client = Client::connect(harness.server).await;
+    client.challenge().await;
+    let response = client
+        .request(
+            ALLOCATE_METHOD,
+            vec![
+                (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                (ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x02, 0, 0, 0]),
+            ],
+        )
+        .await;
+    assert_eq!(error_code(&response), Some(440));
+    assert_eq!(harness.turn.active(), 0);
+    assert!(harness.turn.snapshot().rejected_family >= 1);
+
+    // A family value that is neither 0x01 nor 0x02: 440 as well.
+    let response = client
+        .request(
+            ALLOCATE_METHOD,
+            vec![
+                (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                (ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x03, 0, 0, 0]),
+            ],
+        )
+        .await;
+    assert_eq!(error_code(&response), Some(440));
+
+    // Malformed (3-byte) value → 400, not 440.
+    let response = client
+        .request(
+            ALLOCATE_METHOD,
+            vec![
+                (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                (ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x01, 0, 0]),
+            ],
+        )
+        .await;
+    assert_eq!(error_code(&response), Some(400));
+
+    // RESERVATION-TOKEN and REQUESTED-ADDRESS-FAMILY are mutually exclusive
+    // (§7.2 step 5), exactly like EVEN-PORT — and step 5 runs **before** the
+    // step-7 family comparison, so even a family this relay cannot serve is
+    // 400 (coturn's answer), never 440.
+    for family in [0x01, 0x02] {
+        let response = client
+            .request(
+                ALLOCATE_METHOD,
+                vec![
+                    (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                    (ATTR_RESERVATION_TOKEN, vec![0; 8]),
+                    (ATTR_REQUESTED_ADDRESS_FAMILY, vec![family, 0, 0, 0]),
+                ],
+            )
+            .await;
+        assert_eq!(
+            error_code(&response),
+            Some(400),
+            "RESERVATION-TOKEN + RAF={family:#04x} must be 400 (§7.2 step 5 before step 7)"
+        );
+    }
+
+    // DONT-FRAGMENT stays unsupported (RFC 8656 §7.2 step 4 allows the 420).
+    let response = client
+        .request(
+            ALLOCATE_METHOD,
+            vec![
+                (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                (0x001A, Vec::new()),
+            ],
+        )
+        .await;
+    assert_eq!(error_code(&response), Some(420));
+    let unknown = attributes_of(&response)
+        .into_iter()
+        .find(|(attr_type, _)| *attr_type == protocol::ATTR_UNKNOWN_ATTRIBUTES)
+        .expect("UNKNOWN-ATTRIBUTES")
+        .1;
+    assert_eq!(unknown, vec![0x00, 0x1A]);
+}
+
+/// RFC 8656 §8.2 (MUST): a Refresh whose `REQUESTED-ADDRESS-FAMILY` does not
+/// match the allocation's relay family is `443 Peer Address Family Mismatch` —
+/// the allocation survives, a mismatched `LIFETIME=0` cannot release it, and a
+/// matching value refreshes normally.
+#[tokio::test]
+async fn refresh_requested_address_family_mismatch_is_443() {
+    let harness = start(Config::default()).await;
+    let mut client = Client::connect(harness.server).await;
+    client.challenge().await;
+    let response = client.allocate().await;
+    assert_eq!(error_code(&response), None);
+    assert!(relayed_address(&response).is_ipv4());
+
+    // Mismatched family → 443 (§8.2), not 200 and not 420.
+    let response = client
+        .request(
+            REFRESH_METHOD,
+            vec![
+                (ATTR_LIFETIME, 300_u32.to_be_bytes().to_vec()),
+                (ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x02, 0, 0, 0]),
+            ],
+        )
+        .await;
+    assert_eq!(error_code(&response), Some(443));
+    assert_eq!(
+        harness.turn.active(),
+        1,
+        "443 must not release the allocation"
+    );
+    assert!(harness.turn.snapshot().rejected_family >= 1);
+
+    // A value that is neither 0x01 nor 0x02 cannot match either → 443.
+    let response = client
+        .request(
+            REFRESH_METHOD,
+            vec![(ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x03, 0, 0, 0])],
+        )
+        .await;
+    assert_eq!(error_code(&response), Some(443));
+
+    // A mismatched `LIFETIME=0` must not delete the allocation either.
+    let response = client
+        .request(
+            REFRESH_METHOD,
+            vec![
+                (ATTR_LIFETIME, 0_u32.to_be_bytes().to_vec()),
+                (ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x02, 0, 0, 0]),
+            ],
+        )
+        .await;
+    assert_eq!(error_code(&response), Some(443));
+    assert_eq!(harness.turn.active(), 1);
+
+    // Malformed (3-byte) value → 400.
+    let response = client
+        .request(
+            REFRESH_METHOD,
+            vec![(ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x01, 0, 0])],
+        )
+        .await;
+    assert_eq!(error_code(&response), Some(400));
+
+    // Matching family → 200 with the normal granted lifetime.
+    let response = client
+        .request(
+            REFRESH_METHOD,
+            vec![
+                (ATTR_LIFETIME, 300_u32.to_be_bytes().to_vec()),
+                (ATTR_REQUESTED_ADDRESS_FAMILY, vec![0x01, 0, 0, 0]),
+            ],
+        )
+        .await;
+    assert_eq!(error_code(&response), None);
+    assert_eq!(lifetime_of(&response), 600);
+    assert_eq!(harness.turn.active(), 1);
 }
 
 #[tokio::test]

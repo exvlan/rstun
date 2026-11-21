@@ -22,9 +22,16 @@
 //!   peer→client); over the cap the packet is dropped and counted, the
 //!   allocation survives.
 //!
-//! Deliberately absent: TCP allocations (RFC 6062), `DONT-FRAGMENT` and
-//! `REQUESTED-ADDRESS-FAMILY` (answered `420` because they are
-//! comprehension-required and unsupported).
+//! `REQUESTED-ADDRESS-FAMILY` (0x0017, §18.6) is parsed: a family the relay
+//! cannot serve is answered `440 Address Family not Supported` (§7.2 step 7)
+//! *after* the step-5 `RESERVATION-TOKEN` mutual exclusion (`400`), a malformed
+//! value `400`, and the reserved 24 bits are ignored. `Refresh` compares it with
+//! the allocation's relay family: a mismatch is `443 Peer Address Family
+//! Mismatch` (§8.2 MUST), a match refreshes normally.
+//!
+//! Deliberately absent: TCP allocations (RFC 6062) and `DONT-FRAGMENT`
+//! (0x001A). DF stays an unknown comprehension-required attribute (`420`),
+//! which §7.2 step 4 explicitly allows for a server that does not set the bit.
 //!
 //! ## Accounting model
 //!
@@ -80,6 +87,14 @@ pub const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
 pub const ATTR_DATA: u16 = 0x0013;
 /// `XOR-RELAYED-ADDRESS` (§14.5).
 pub const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
+/// `REQUESTED-ADDRESS-FAMILY` (§18.6): `Family (1 byte) | Reserved (3 bytes)`.
+///
+/// `0x01` = IPv4, `0x02` = IPv6. The reserved bits are ignored, as §18.6
+/// requires. Legal on `Allocate` and `Refresh`; `Allocate` answers `440` when
+/// the requested family is not the one the relay can offer (§7.2 step 7), and
+/// `Refresh` answers `443` when it does not match the existing allocation
+/// (§8.2).
+pub const ATTR_REQUESTED_ADDRESS_FAMILY: u16 = 0x0017;
 /// `REQUESTED-TRANSPORT` (§14.7): protocol (1 byte) + RFFU.
 pub const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 /// `EVEN-PORT` (§14.6): R bit + reserved. coturn's `turnutils_uclient` sends
@@ -1033,6 +1048,23 @@ impl Turn {
                 identity,
             ));
         }
+        // `REQUESTED-ADDRESS-FAMILY` (§18.6). Parsing only; the family
+        // comparison happens **after** the §7.2 step-5 mutual exclusion below,
+        // so `RESERVATION-TOKEN + RAF(<other family>)` is 400 (coturn's
+        // answer), not 440 — step 5 precedes step 7.
+        let requested_family = match parse_requested_address_family(body) {
+            Ok(family) => family,
+            Err(()) => {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    protocol::ERROR_BAD_REQUEST,
+                    "Bad Request",
+                    identity,
+                ));
+            }
+        };
+
         // `EVEN-PORT` (§14.6): an even relay port; with the R bit, the next
         // (odd) port is reserved and its token returned. coturn's
         // `turnutils_uclient` asks for R=1 on every Allocate, so this is the
@@ -1069,13 +1101,34 @@ impl Turn {
                 }
             },
         };
-        if reservation_token.is_some() && wants_even {
-            // Mutually exclusive (RFC 8656 §7.2).
+        if reservation_token.is_some() && (wants_even || requested_family.is_some()) {
+            // §7.2 step 5, checked **before** the step-7 family comparison:
+            // `RESERVATION-TOKEN` is mutually exclusive with `EVEN-PORT` and
+            // `REQUESTED-ADDRESS-FAMILY`, and the answer is 400 for any family.
             return Decision::Respond(signed_error(
                 transaction_id,
                 ALLOCATE_METHOD,
                 protocol::ERROR_BAD_REQUEST,
                 "Bad Request",
+                identity,
+            ));
+        }
+
+        // §7.2 step 7: the relay address family is already decided by
+        // `egress_ip` (it follows the client), so this only has to answer "yes"
+        // or `440` — never `420`, which is what `turnutils_uclient -x/-X/-e`
+        // used to hit.
+        if let Some(family) = requested_family
+            && !family_matches(family, relay_ip)
+        {
+            self.counters
+                .rejected_family
+                .fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                ERROR_ADDRESS_FAMILY_NOT_SUPPORTED,
+                "Address Family not Supported",
                 identity,
             ));
         }
@@ -1259,6 +1312,40 @@ impl Turn {
                 "Wrong Credentials",
                 identity,
             ));
+        }
+
+        // RFC 8656 §8.2 (MUST): a Refresh carrying `REQUESTED-ADDRESS-FAMILY`
+        // whose value does not match the allocation's relay family is a
+        // `443 Peer Address Family Mismatch` — not a 200, so a client never
+        // believes it switched families. Checked before LIFETIME handling so a
+        // mismatched `LIFETIME=0` cannot release the allocation either. A
+        // malformed value is 400; a matching one is accepted (the family cannot
+        // change, so the value itself has no further effect).
+        match parse_requested_address_family(message.body) {
+            Ok(None) => {}
+            Ok(Some(family)) => {
+                if !family_matches(family, allocation.relay_addr().ip()) {
+                    self.counters
+                        .rejected_family
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Decision::Respond(signed_error(
+                        transaction_id,
+                        REFRESH_METHOD,
+                        ERROR_PEER_ADDRESS_FAMILY_MISMATCH,
+                        "Peer Address Family Mismatch",
+                        identity,
+                    ));
+                }
+            }
+            Err(()) => {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    REFRESH_METHOD,
+                    protocol::ERROR_BAD_REQUEST,
+                    "Bad Request",
+                    identity,
+                ));
+            }
         }
 
         // RFC 8656 §8.2: an absent LIFETIME means "server default", not 400.
@@ -2064,6 +2151,33 @@ fn parse_lifetime(body: &[u8]) -> Result<Option<u32>, ()> {
     }
 }
 
+/// `REQUESTED-ADDRESS-FAMILY` (§18.6): `Family (1 byte) | Reserved (3 bytes)`.
+///
+/// `Ok(None)` = absent; `Ok(Some(family))` = present and well formed — the
+/// reserved bits are ignored, as §18.6 requires; `Err(())` = present with the
+/// wrong length.
+fn parse_requested_address_family(body: &[u8]) -> Result<Option<u8>, ()> {
+    match attribute(body, ATTR_REQUESTED_ADDRESS_FAMILY) {
+        None => Ok(None),
+        Some(value) if value.len() == 4 => Ok(Some(value[0])),
+        Some(_) => Err(()),
+    }
+}
+
+/// Does `family` (0x01 IPv4 / 0x02 IPv6) name the address family of `relay`?
+///
+/// Anything else (including `0x00` and `0x03`) is "not supported", which is
+/// what drives both the `Allocate` `440` (§7.2 step 7) and the `Refresh` `443`
+/// (§8.2). The relay family itself follows the client (§5), so an IPv6 client
+/// on an IPv6 listener matches `0x02`.
+fn family_matches(family: u8, relay: IpAddr) -> bool {
+    match family {
+        0x01 => relay.is_ipv4(),
+        0x02 => relay.is_ipv6(),
+        _ => false,
+    }
+}
+
 /// Unknown comprehension-required attributes *in the TURN dialect*.
 fn turn_unknown_attributes(body: &[u8]) -> Vec<u16> {
     let mut unknown: Vec<u16> = Vec::new();
@@ -2083,6 +2197,7 @@ fn turn_unknown_attributes(body: &[u8]) -> Vec<u16> {
                     | ATTR_REQUESTED_TRANSPORT
                     | ATTR_EVEN_PORT
                     | ATTR_RESERVATION_TOKEN
+                    | ATTR_REQUESTED_ADDRESS_FAMILY
             )
         {
             continue;

@@ -10,14 +10,20 @@
 #   bash script/lab/rstun-turn.sh --no-build       # 复用 target/debug/rstun（探测其 feature）
 #   bash script/lab/rstun-turn.sh --tls --dtls     # 只跑 TLS/DTLS 项（自动 --features full 构建）
 #   bash script/lab/rstun-turn.sh --only relay     # 只跑一项
-#     （startup|relay|auth|lifecycle|wrong-user|wildcard|permission-limit|quota|
+#     （startup|relay|auth|lifecycle|wrong-user|raf|wildcard|permission-limit|quota|
 #       ports|tls|dtls|rest|bandwidth|cleanup|frozen|coturn）
 #   bash script/lab/rstun-turn.sh --keep           # 保留日志（默认只清进程）
+#   FROZEN_BASE=<sha> bash script/lab/rstun-turn.sh --only frozen
+#                                                  # 字节冻结对照的基线提交（默认 cad4fa2）
 #
 # 构建：默认 lean（`cargo build`，无 tls/dtls feature）。`--tls` / `--dtls` /
 # `--only tls|dtls|coturn` 会自动用 `cargo build --features full` 构建；`--no-build`
 # 时探测现有二进制是否带 feature。lean 下 tls/dtls 项记 SKIP（不是失败），
 # coturn 项的 TLS/DTLS 对照行同样跳过。
+#
+# frozen 基线约定：`FROZEN_BASE` 是指「本次改动之前」的提交。版本号变更会改变
+# `SOFTWARE` 串（每一帧字节都变），或有意改默认路径字节时，**必须**同步
+# `FROZEN_BASE` 的默认值，否则 frozen 项会因版本串不同而红。
 #
 # 依赖：cargo/rustc（本仓）、python3（探针，只用标准库）、`turnutils_uclient`
 # （coturn 自带客户端）、`openssl`（TLS/DTLS 项自签证书 + 握手探针）。
@@ -60,10 +66,10 @@ FAILED=()
 SKIPPED=()
 PASSED=()
 
-ALL_ITEMS=(startup relay auth lifecycle wrong-user wildcard permission-limit quota ports tls dtls rest bandwidth cleanup frozen coturn)
+ALL_ITEMS=(startup relay auth lifecycle wrong-user raf wildcard permission-limit quota ports tls dtls rest bandwidth cleanup frozen coturn)
 
 usage() {
-  sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -96,7 +102,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [[ -n "$ONLY" ]]; then
   case "$ONLY" in
-    startup | relay | auth | lifecycle | wrong-user | wildcard | permission-limit | quota | ports | tls | dtls | rest | bandwidth | cleanup | frozen | coturn) : ;;
+    startup | relay | auth | lifecycle | wrong-user | raf | wildcard | permission-limit | quota | ports | tls | dtls | rest | bandwidth | cleanup | frozen | coturn) : ;;
     *) echo "--only 未知项: $ONLY（可用：${ALL_ITEMS[*]}）" >&2; exit 2 ;;
   esac
 fi
@@ -384,7 +390,50 @@ run_wrong_user() {
   stop_server "$name"
 }
 
-# ---------- 4c. wildcard listener: loopback peers are refused ----------
+# ---------- 4c. RAF: REQUESTED-ADDRESS-FAMILY (0x0017) is understood ----------
+
+# RFC 8656 §7.2 step 7: uclient's `-X` (IPv4 relay requested), `-x` (IPv6
+# requested) and `-e` carry REQUESTED-ADDRESS-FAMILY; `-g` carries
+# DONT-FRAGMENT. Plain UDP (no `-S`) on purpose: the attribute is handled before
+# any transport dispatch, so the lean build covers it (the DTLS item repeats
+# `-S -X` for the production shape that reported the 420).
+run_raf() {
+  local name=raf
+  start_turn "$name"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    stop_server "$name"
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+  # 1) Explicit IPv4 relay family → Allocate + relay (this used to be 420).
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 3 -m 2 -y -X 127.0.0.1 \
+    >"$LOG_DIR/$name-ipv4.log" 2>&1
+  # 2) IPv6 relay family from an IPv4 client → 440 (§7.2 step 7), not 420.
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 3 -m 2 -y -x 127.0.0.1 \
+    >"$LOG_DIR/$name-ipv6.log" 2>&1
+  # 3) DONT-FRAGMENT keeps the RFC-sanctioned 420 (§7.2 step 4).
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 3 -m 2 -y -g 127.0.0.1 \
+    >"$LOG_DIR/$name-df.log" 2>&1
+  local ipv4=ok ipv6=ok df=ok
+  uclient_ok "$LOG_DIR/$name-ipv4.log" || ipv4=failed
+  grep -qa "error 440" "$LOG_DIR/$name-ipv6.log" || ipv6=failed
+  grep -qa "error 420" "$LOG_DIR/$name-df.log" || df=failed
+  local family
+  family="$(metric 'rstun_turn_rejected_total{reason="family"}')"
+  if [[ $ipv4 == ok && $ipv6 == ok && $df == ok && -n "$family" && "$family" -gt 0 ]]; then
+    ok "$name" "uclient -X relays (RAF IPv4), -x → error 440, -g → error 420; rejected_family=$family"
+  else
+    fail "$name" "ipv4=$ipv4 ipv6=$ipv6 df=$df rejected_family=$family (see $LOG_DIR/$name-*.log)"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 4d. wildcard listener: loopback peers are refused ----------
 
 run_wildcard() {
   local name=wildcard
@@ -649,6 +698,11 @@ run_dtls() {
     >"$LOG_DIR/$name-uclient.log" 2>&1
   local relay=ok
   uclient_ok "$LOG_DIR/$name-uclient.log" || relay=failed
+  # 2b) The production shape from 2026-11-21: Allocate over DTLS with an
+  #     explicit REQUESTED-ADDRESS-FAMILY (`-X`) used to be answered 420.
+  turnutils_uclient -S -X -u "$USER_NAME" -w "$USER_PASS" -p "$DTLS_PORT" -n 3 -m 2 -y 127.0.0.1 \
+    >"$LOG_DIR/$name-raf.log" 2>&1
+  uclient_ok "$LOG_DIR/$name-raf.log" || relay=failed
   local bytes_in bytes_out
   bytes_in="$(metric 'rstun_turn_bytes_total{direction="in"}')"
   bytes_out="$(metric 'rstun_turn_bytes_total{direction="out"}')"
@@ -676,7 +730,7 @@ run_dtls() {
 
   if [[ $handshake == ok && $relay == ok && "$bad_ok" == ok &&
     -n "$bytes_in" && "$bytes_in" -gt 0 && -n "$bytes_out" && "$bytes_out" -gt 0 ]]; then
-    ok "$name" "s_client -dtls1_2 handshake ok, uclient -S relay in=$bytes_in out=$bytes_out, RSA key refused"
+    ok "$name" "s_client -dtls1_2 handshake ok, uclient -S and -S -X relay in=$bytes_in out=$bytes_out, RSA key refused"
   else
     fail "$name" "handshake=$handshake relay=$relay bad_config=$bad_ok bytes in=$bytes_in out=$bytes_out"
   fi
@@ -889,10 +943,15 @@ run_frozen() {
   local name=frozen
   local old_src="$WORK/old-src"
   local old_target="$WORK/old-target"
-  # Baseline for the byte-freeze check. HEAD is correct *before* this work is
-  # committed; after committing, pin the last pre-TURN commit here (or pass
-  # FROZEN_BASE=<sha>), otherwise the check compares the new tree with itself.
-  local base="${FROZEN_BASE:-75ed637}"
+  # Baseline for the byte-freeze check: the commit *before* this change. HEAD is
+  # correct before work is committed; after committing, pin the last pre-change
+  # commit here (or pass FROZEN_BASE=<sha>). A version bump changes the
+  # `SOFTWARE` string — and therefore every frame — so a release must move this
+  # pin as well.
+  # `cad4fa2` is the base of the `REQUESTED-ADDRESS-FAMILY` change (and the
+  # first commit whose `SOFTWARE` string is 26.410.101, so the pinned build no
+  # longer differs by version alone).
+  local base="${FROZEN_BASE:-cad4fa2}"
   if ! git -C "$ROOT" archive "$base" | tar -x -C "$old_src" 2>/dev/null; then
     mkdir -p "$old_src"
     if ! git -C "$ROOT" archive "$base" | tar -x -C "$old_src"; then
@@ -937,7 +996,7 @@ run_frozen() {
     fi
   done
   if [[ $mismatches -eq 0 ]]; then
-    ok "$name" "3 configurations × 17 requests byte-identical to HEAD"
+    ok "$name" "3 configurations × 17 requests byte-identical to ${base}"
   else
     fail "$name" "$mismatches configuration(s) differ (see $LOG_DIR/$name-diff-*.txt)"
   fi
@@ -1125,6 +1184,7 @@ run_item() {
     auth) run_auth ;;
     lifecycle) run_lifecycle ;;
     wrong-user) run_wrong_user ;;
+    raf) run_raf ;;
     wildcard) run_wildcard ;;
     permission-limit) run_permission_limit ;;
     quota) run_quota ;;

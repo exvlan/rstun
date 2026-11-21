@@ -21,7 +21,9 @@
    - 请求 IPv6（或本端无法提供该族）→ `440 Address Family not Supported`；
    - 长度 ≠ 4 → `400 Bad Request`；族值非 0x01/0x02 → `440`。
 2. `RESERVATION-TOKEN + REQUESTED-ADDRESS-FAMILY` → `400`（§7.2 步骤 5，与 `EVEN-PORT` 同款互斥）。
-3. `Refresh` 里出现 RAF 不再回 420（该属性对 Refresh 也有定义）；本实现接受并忽略（分配已存在）。
+3. `Refresh` 里出现 RAF 不再回 420，且按 RFC 8656 §8.2 **MUST** 处理：
+   与现有分配的 relay 地址族不匹配 → `443 Peer Address Family Mismatch`；匹配 → 正常续期；
+   长度 ≠ 4 → `400`。（原设计写「接受并忽略」是遗漏 §8.2，已按复核修正。）
 4. `DONT-FRAGMENT` 维持 `420`（合规，**不改**）。
 5. 行为表、文档、spec 与 lab 验收同步；默认路径（不带 RAF）响应字节不变。
 
