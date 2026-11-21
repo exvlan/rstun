@@ -513,7 +513,10 @@ def canonical_relay(probe: Probe) -> None:
 
     peer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     peer.bind(("127.0.0.1", 0))
-    peer.settimeout(0.5)
+    # 1s, not 0.5s: under a loaded host (full lab + coturn in parallel) the
+    # relay round trip occasionally exceeds half a second, which surfaced as
+    # `send-indication-bytes bytes=0` and a false diff against coturn.
+    peer.settimeout(1.0)
     peer_address = peer.getsockname()
 
     probe.create_permission(peer_address)

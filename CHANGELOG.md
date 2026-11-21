@@ -3,7 +3,7 @@
 版本线**独立于任何宿主项目**：`YY.QMM.Mmpp`（年.季度月.月日+序号），首发 `26.410.100`。
 `rstun-v*` 的 Release tag / 镜像 tag / 资产名都用这里给出的版本号。
 
-## Unreleased
+## 26.410.102
 
 ### TURN：`REQUESTED-ADDRESS-FAMILY`（0x0017）不再回 420
 
@@ -34,6 +34,16 @@
 
 补丁版：依赖升到各自最新 + 上一版积累的功能（T1 TURN、T2 `turns:`/DTLS/REST/带宽、
 运维面、鉴权、协议闭环、抗滥用）一并交付。
+
+### TURN：`REQUESTED-ADDRESS-FAMILY`（RFC 8656 §18.6）
+
+- `Allocate` 解析 `0x0017`：族与 relay 一致 → 正常分配；请求异族或族值非 `0x01`/`0x02`
+  → `440 Address Family not Supported`；长度 ≠ 4 → `400`；保留 24 位忽略。
+- `RESERVATION-TOKEN` 与 `EVEN-PORT`/RAF 互斥 → `400`（§7.2 步骤 5 先于步骤 7）。
+- `Refresh` 上族不匹配 → `443 Peer Address Family Mismatch`（§8.2 MUST），且不释放分配。
+- `DONT-FRAGMENT (0x001A)` **保持 `420`**：§7.2 步骤 4 明文允许（不是偏差）。
+- 影响：`turnutils_uclient` 的 `-e`/`-X`（隐含 RAF）从 `420` 变为可中继；`-x` 得 `440`。
+- 不带 RAF 的路径字节不变（`frozen` 3 配置 × 17 请求与上一版逐字节一致）。
 
 ### 依赖升级（无协议字节、无 CLI、无指标名变化）
 

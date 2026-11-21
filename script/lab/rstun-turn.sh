@@ -21,9 +21,10 @@
 # 时探测现有二进制是否带 feature。lean 下 tls/dtls 项记 SKIP（不是失败），
 # coturn 项的 TLS/DTLS 对照行同样跳过。
 #
-# frozen 基线约定：`FROZEN_BASE` 是指「本次改动之前」的提交。版本号变更会改变
-# `SOFTWARE` 串（每一帧字节都变），或有意改默认路径字节时，**必须**同步
-# `FROZEN_BASE` 的默认值，否则 frozen 项会因版本串不同而红。
+# frozen 基线约定：`FROZEN_BASE` 是指「本次改动之前」的提交。基线二进制会用
+# `RSTUN_BUILD_VERSION=<当前二进制的版本串>` 重新构建，因此**版本号 bump 不会让
+# frozen 假红**，基线不需要随发版挪动；只有当你想换对照点（例如上次改动本身要当
+# 新基线）时才改默认值。
 #
 # 依赖：cargo/rustc（本仓）、python3（探针，只用标准库）、`turnutils_uclient`
 # （coturn 自带客户端）、`openssl`（TLS/DTLS 项自签证书 + 握手探针）。
@@ -945,12 +946,13 @@ run_frozen() {
   local old_target="$WORK/old-target"
   # Baseline for the byte-freeze check: the commit *before* this change. HEAD is
   # correct before work is committed; after committing, pin the last pre-change
-  # commit here (or pass FROZEN_BASE=<sha>). A version bump changes the
-  # `SOFTWARE` string — and therefore every frame — so a release must move this
-  # pin as well.
-  # `cad4fa2` is the base of the `REQUESTED-ADDRESS-FAMILY` change (and the
-  # first commit whose `SOFTWARE` string is 26.410.101, so the pinned build no
-  # longer differs by version alone).
+  # commit here (or pass FROZEN_BASE=<sha>).
+  #
+  # The baseline is rebuilt with `RSTUN_BUILD_VERSION` set to whatever version
+  # string the *new* binary carries. `SOFTWARE` (and therefore every frame) embeds
+  # that string, so without the override every version bump would show up as a
+  # 17-frame diff and force a pointless re-pin. With it, `frozen` only reports
+  # real behaviour changes.
   local base="${FROZEN_BASE:-cad4fa2}"
   if ! git -C "$ROOT" archive "$base" | tar -x -C "$old_src" 2>/dev/null; then
     mkdir -p "$old_src"
@@ -959,7 +961,14 @@ run_frozen() {
       return
     fi
   fi
-  if ! cargo build --manifest-path "$old_src/Cargo.toml" --target-dir "$old_target" \
+  local pinned_version
+  pinned_version="$("$BIN" --version 2>/dev/null | awk '{print $2}')"
+  if [[ -z "$pinned_version" ]]; then
+    skip "$name" "cannot read the version string from $BIN"
+    return
+  fi
+  if ! RSTUN_BUILD_VERSION="$pinned_version" \
+    cargo build --manifest-path "$old_src/Cargo.toml" --target-dir "$old_target" \
     >"$LOG_DIR/$name-build.log" 2>&1; then
     skip "$name" "old binary did not build (see $LOG_DIR/$name-build.log)"
     return

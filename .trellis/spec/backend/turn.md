@@ -89,8 +89,9 @@
 **字节冻结口径**
 
 - 默认关闭（无 `--turn`）由 lab `frozen` 项（3 配置 × 17 请求）对照 `FROZEN_BASE`。
-  **版本号变化会改 `SOFTWARE` 串**（每帧字节都变），或有意改默认路径字节时，**必须**同步
-  `script/lab/rstun-turn.sh` 中 `FROZEN_BASE` 的默认值（当前 `cad4fa2`，即 RAF 改动的基线）。
+  基线二进制用 `RSTUN_BUILD_VERSION=<当前二进制的版本串>` 重建，因此**版本号 bump 不会让
+  frozen 假红**，基线不必随发版挪动；只有想换对照点时才改 `script/lab/rstun-turn.sh` 里的
+  默认值（当前 `cad4fa2`，即 RAF 改动的基线）。
 - TURN 侧**不设**「不带 RAF 的请求」的字节对照：RAF 缺失走 `Ok(None)` 分支，不进入任何族
   比较/拒绝路径；由 `requested_address_family_parsing` 的 `Ok(None)` 与
   `requested_address_family_selects_the_relay_family` 中「无/匹配 RAF → 200」隐含保证。
