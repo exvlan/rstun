@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "性能/回归口径（黑盒、非门禁）"}
+{"file": ".trellis/spec/backend/distribution.md", "reason": "体积与依赖面数字的权威口径"}

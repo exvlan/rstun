@@ -22,7 +22,8 @@
     "11-19-rstun-turn-udp",
     "11-19-rstun-turn-tls",
     "11-21-rstun-turn-raf",
-    "11-21-rstun-turn-df-ipv6"
+    "11-21-rstun-turn-df-ipv6",
+    "11-21-rstun-turn-rfc6062"
   ],
   "parent": "11-19-rstun-complete",
   "relatedFiles": [],
