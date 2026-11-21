@@ -373,7 +373,7 @@ jobs:
           fi
 
   # SBOM：lean / full 各一份 CycloneDX（`cargo metadata` 生成，不需要额外工具链）。
-  # 与平台无关，只跑一次；`gen-sbom.sh` 会断言**直接依赖数**（lean 9 / full 13）——
+  # 与平台无关，只跑一次；`gen-sbom.sh` 会断言**直接依赖数**（lean 10 / full 14）——
   # 依赖面一变就红，避免 SBOM 与「依赖面」文档各说各话。
   sbom:
     name: SBOM (${{ matrix.features }})
@@ -525,8 +525,8 @@ jobs:
             echo "| macOS x86_64 | \`rstun-macos-x86_64-${VERSION}.zip\` | \`rstun-full-macos-x86_64-${VERSION}.zip\` |"
             echo "| Windows x86_64 | \`rstun-windows-x86_64-${VERSION}.zip\` | \`rstun-full-windows-x86_64-${VERSION}.zip\` |"
             echo ""
-            echo "\`lean\`：STUN + TURN(UDP/TCP) + REST 临时凭据 + 带宽配额（9 个直接依赖；release 未 strip 3.77 MB）。"
-            echo "\`full\`：再加 \`turns:\`(TLS) 与 DTLS 1.2（13 个直接依赖；release 未 strip 7.93 MB）。"
+            echo "\`lean\`：STUN + TURN(UDP/TCP) + REST 临时凭据 + 带宽配额（10 个直接依赖，Windows 9；release 未 strip 3.77 MB）。"
+            echo "\`full\`：再加 \`turns:\`(TLS) 与 DTLS 1.2（14 个直接依赖，Windows 13；release 未 strip 7.95 MB）。"
             echo "不带这两个 flag 时两者行为完全一致；\`--turn-tls-listen\` 在 lean 上会明确拒绝启动。"
             echo ""
             echo "容器镜像：\`ghcr.io/${owner}/rstun:${VERSION}\`（linux/amd64 + linux/arm64，**full** 构建；"

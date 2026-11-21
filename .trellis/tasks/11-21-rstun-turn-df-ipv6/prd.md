@@ -21,8 +21,9 @@
 
 1. **Allocate**：带 `DONT-FRAGMENT` → 不再 420；为该 allocation 的 relay socket 置 DF；
    该属性 length ≠ 0 → `400`；置位失败（setsockopt 报错）→ `500 Server Error` 并计数。
-2. **Send indication**：带 DF → 仅该报文置 DF（发送后恢复原值）；length ≠ 0 → 忽略该属性并照常转发
-   （indication 无错误响应；RFC 未定义错误路径），但计一次畸形计数（若已有计数可用）。
+2. **Send indication**：带 DF → 仅该报文置 DF（发送后恢复原值）；置位**失败 → 丢弃该 indication**
+   （RFC 8656 §11.2：当作未知 comprehension-required 属性），并计 `rejected_df`。
+   length ≠ 0 的畸形 DF：按未知属性语义丢弃该 indication（indication 无错误响应）。
 3. **平台**：`cfg(unix)` 支持（Linux `IP_MTU_DISCOVER = IP_PMTUDISC_DO`、macOS `IP_DONTFRAG`）；
    **Windows 保持 420**（无 libc；RFC 允许），文档注明。
 4. **IPv6 relay 回归**：lab 新增一项——服务器监听 `[::1]`、客户端走 IPv6、peer 也走 IPv6，

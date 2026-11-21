@@ -19,7 +19,8 @@
 | `Allocate` 换用户 | 5 元组命中但 `allocation.username != identity.username` → **`441`**；不得读/改他人 allocation |
 | `Refresh` 生命周期 | 缺 `LIFETIME` → 服务端默认（600s，§8.2）；`LIFETIME=0` → 立即释放；未知 allocation → `437` |
 | `REQUESTED-ADDRESS-FAMILY` (0x0017) | 4 字节 `family | reserved`；**reserved 24 位必须忽略**；`Allocate`：族与 `relay_ip` 一致 → `200`；不一致或族值非 `0x01`/`0x02` → **`440`**（计 `rejected_family`）；长度 ≠ 4 → **`400`**；`Refresh`：族与该 allocation 的 relay 族**不匹配 → `443`**（§8.2 MUST，计 `rejected_family`）、匹配 → 正常续期、长度 ≠ 4 → `400`；`RESERVATION-TOKEN` 与 `EVEN-PORT` **或 RAF** 互斥 → **`400`**，且**步骤 5 先于步骤 7**（异族 token 也是 400，coturn 同）；`ADDITIONAL-ADDRESS-FAMILY` (0x8000) 未实现（comprehension-optional，忽略）⇒ §7.2 **步骤 6**（RAF+AAF → 400）**不生效**，记账于 `docs/book/src/turn.md` |
-| `DONT-FRAGMENT` (0x001A) | **保持**未知 comprehension-required → `420`（RFC 8656 §7.2 步骤 4 明文允许「不设 DF 位」）；不得改成 400、也不得静默忽略 |
+| `DONT-FRAGMENT` (0x001A) | **平台**：`DONT_FRAGMENT_SUPPORTED = cfg!(any(target_os="linux","macos","ios"))` —— 只有 `set_dont_fragment` 真实现的三个平台为真；Windows 与其它 unix（FreeBSD 等）为假 ⇒ `0x001A` 保持未知 comprehension-required → **`420`** + `UNKNOWN-ATTRIBUTES=[0x001A]`（§7.2 步骤 4 允许）；编译期断言禁止该常量为真而实现缺失。**支持平台的行为**（§18.9）：`Allocate` 带它 → relay socket 置 DF（Linux `IPPROTO_IP/IP_MTU_DISCOVER`=`IP_PMTUDISC_DO`，IPv6 socket 用 `IPV6_MTU_DISCOVER`；macOS/iOS `IP_DONTFRAG`/`IPV6_DONTFRAG`），**整个 allocation 生命周期有效**；长度 ≠ 0 → **`400`**；`setsockopt` 失败 → **`500 Server Error`** + 计 `rejected_df` + 端口归还池。`Send` indication 带它 → **仅该报文**置位，发送后恢复 `IP_PMTUDISC_WANT`（Linux）/`0`（macOS），切换在同一 allocation 的互斥锁内（并发**带 DF 的** `Send` 不得看到彼此的临时状态；不带 DF 的 `Send`/`ChannelData` 不取锁，见下方「已知限制」）；**置位失败 → 丢弃该 indication**（§11.2 原文：视为未知 comprehension-required 属性，「and thus the Send indication is discarded」）+ 计 `rejected_df`，**不得**降级为「不置位但照常转发」；属性长度 ≠ 0 → 同样丢弃 + 计 `rejected_df`（indication 无错误响应）。`ChannelData` 无属性位 ⇒ 沿用 allocation 级设置。`cfg(unix)` 之外不得引用 `libc`。**已知限制（并发窗口）**：`df_lock` 只被**带 DF 的 `Send`** 持有 —— 不带 DF 的 `Send` 与 `ChannelData` 不取锁（数据面零锁开销），因此同一 allocation 上「DF-Send 置位窗口」与普通发包并发时，普通报文可能被短暂带上 DF；后果仅限「该报文超过路径 MTU 时被丢」，不跨 allocation、不改变协议语义。取锁范围**不得**说成「所有外包发互斥」 |
+| 依赖 | `[target.'cfg(unix)'.dependencies] libc = "0.2"` 是 DF 的**唯一**新增直接依赖（不得引 `nix`/`rustix`）；直接依赖计数 unix 口径 **10（lean）/ 14（full）**，Windows 9/13；`script/ci/gen-sbom.sh` 的 `EXPECTED_DIRECT` 必须同步 |
 | 他人 allocation | `Refresh` / `CreatePermission` / `ChannelBind` 命中他人 allocation → **`441`**；他人 `LIFETIME=0` 不删除 |
 | permission 容量 | `--permission-limit`（默认 10）；一条请求里多个 `XOR-PEER-ADDRESS` **先全量校验再写入**，超限 → **`508`** 且零生效 |
 | channel 容量 | `ChannelBind` 的隐式 permission 占用同一上限，超限 → **`508`** |
@@ -30,7 +31,7 @@
 | 成功响应 | 均带 `SOFTWARE`（§14.10 SHOULD）并按请求算法签名；401/438 不带 SOFTWARE |
 | TCP 写队列 | **有界**（`TCP_SINK_CAPACITY = 64`）+ `try_send`；溢出丢 relayed 数据，不无界增长 |
 | TTL | permission 5 分钟、channel 10 分钟、allocation 600s（受 `--allocation-lifetime` 上限约束）；1s 扫描回收 |
-| 指标 | `rstun_turn_allocations`、`rstun_turn_bytes_total{direction}`、`rstun_turn_allocations_total{result}`、`rstun_turn_rejected_total{reason}`；仅 `--turn` 输出 |
+| 指标 | `rstun_turn_allocations`、`rstun_turn_bytes_total{direction}`、`rstun_turn_allocations_total{result}`、`rstun_turn_rejected_total{reason=quota\|ports\|family\|loopback\|df}`；仅 `--turn` 输出 |
 
 ## 3. 判定顺序（四个 request 方法）
 
@@ -79,8 +80,25 @@
     → `440`；`RESERVATION-TOKEN` + RAF **两种族（0x01/0x02）都** → `400`（步骤 5 先于
     步骤 7）；`Refresh`：RAF `0x02`（IPv4 分配）→ **`443`** 且 allocation 存活（含
     `LIFETIME=0` 的异族请求也不得释放）、RAF `0x01` → `200` + 正常 LIFETIME、RAF 长度 3
-    → `400`；`0x001A` 仍 `420` 且 `UNKNOWN-ATTRIBUTES=[0x001A]`；lab `raf` 项用真 uclient
-    断言 `-X` 中继、`-x` → `error 440`、`-g` → `error 420`。
+    → `400`；lab `raf` 项用真 uclient 断言 `-X` 中继、`-x` → `error 440`。
+11. `DONT-FRAGMENT`（0x001A）：
+    - 支持平台（Linux/macOS/iOS）：`Allocate` 带 DF → `200`、allocation 标记 DF，且
+      **`getsockopt` 回读 relay socket 为 `IP_PMTUDISC_DO`/`IP_DONTFRAG=1`**
+      （`allocate_with_dont_fragment_sets_the_relay_socket`）；DF 长度 ≠ 0 → `400` 且零分配；
+      `set_dont_fragment` 往返（set→DO、clear→WANT、IPv4 与 IPv6 各一遍：
+      `set_dont_fragment_round_trips`）；`Send` 带 DF（allocation 未开）→ 转发成功、回读恢复
+      `WANT`；**置位失败 → peer 收不到（丢弃）且 `rejected_df` 增长**；畸形 DF 的 `Send` →
+      同样丢弃且 `rejected_df` 增长（`send_indication_dont_fragment_is_per_datagram`，
+      失败分支用 `df_failure` 注入；两条断言都做过「改成转发 → 测试红」的反证）；
+    - 不支持平台（Windows / FreeBSD 等）：`turn_unknown_attributes([0x001A]) == [0x001A]`，
+      `Allocate` → `420` + `UNKNOWN-ATTRIBUTES=[0x001A]`；`DONT_FRAGMENT_SUPPORTED` 必须等于
+      `cfg!(any(linux, macos, ios))`（`dont_fragment_support_matches_the_platforms_that_can_set_the_bit`
+      与编译期 `const _: () = assert!(!DONT_FRAGMENT_SUPPORTED)`）；
+    - lab `df` 项：`uclient -g` 必须中继（旧行为 `error 420`）、中继字节 > 0、`rejected_df` 可读；
+      `tcpdump -i lo` 的 `flags [DF]` **只是记录性证据**（Linux 默认 `IP_PMTUDISC_WANT` 本来就置
+      DF），判别性证据是上面的 `getsockopt` 回读；
+    - lab `ipv6relay` 项：`--listen [::1]` + IPv6 客户端 → `XOR-RELAYED-ADDRESS` 是 IPv6、
+      `Send`/`Data`/`ChannelData` 双向字节 > 0；无 `::1` 时 SKIP（不算通过）。
 
 外部对照：`script/lab/rstun-turn.sh` 的 `wrong-user` / `lifecycle` / `relay` / `coturn` 项用同一
 探针分别对 rstun 与本地 `turnserver` 跑，输出应逐行一致（唯一允许差异：coturn 在

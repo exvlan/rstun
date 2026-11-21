@@ -64,3 +64,19 @@ cargo tree -e normal --depth 1 | wc -l
 
 - 阶段 1：revert 该 commit（`Cargo.toml`/`Cargo.lock`/`src/turn.rs`/tests/文档）。
 - 阶段 2：revert lab commit（探针 + 脚本）。
+
+## 执行记录（2026-11-21）
+
+| 项 | 结果 |
+| --- | --- |
+| 依赖 | `[target.'cfg(unix)'.dependencies] libc = "0.2"`；无新 crate（lock 里只是提升为直接依赖）|
+| 依赖面 | unix **10 / 14**，Windows target **9 / 13** |
+| DF 支持平台 | `cfg!(any(linux, macos, ios))`；Windows/FreeBSD → 属性未知 → `420`（§7.2 步骤 4）|
+| Allocate + DF | 置 DF（Linux `IP_MTU_DISCOVER=IP_PMTUDISC_DO`；IPv6 `IPV6_MTU_DISCOVER`；macOS `IP_DONTFRAG`）；长度≠0 → 400；置位失败 → 500 + `rejected_df` + 端口归还 |
+| Send + DF | 仅该报文置位、发送后恢复；**置位失败/畸形 → 丢弃**（§11.2，`rejected_df`）|
+| IPv6 relay | lab `ipv6relay`：`relay=::1:49700`，send→peer 15B、peer→client 14B |
+| 证据 | `getsockopt` 回读 WANT(1)→DO(2)；tcpdump 在 lo 上不判别，仅记录性 |
+| 单测 | 新增 6 个 DF 用例（含 `Allocate` 500 + 端口归还）；变异测试 5 条均能变红 |
+| 门禁 | `cargo test` 245 / `--all-features` 246；lab 18 passed；frozen 与 `cad4fa2` 一致；audit/deny ok |
+| 复核 | 两轮，结论「可提交（无阻塞）」；4 处收尾（注释×2、锁范围收窄、500 分支补测）已落地 |
+| 未做 | 版本号未动（仍 `26.410.102`）；发版由主会话另行决定 |

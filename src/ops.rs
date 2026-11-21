@@ -492,6 +492,7 @@ impl OpsState {
                 ("ports", counts.rejected_ports),
                 ("family", counts.rejected_family),
                 ("loopback", counts.rejected_loopback),
+                ("df", counts.rejected_df),
             ] {
                 sample(
                     &mut out,

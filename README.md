@@ -122,7 +122,7 @@ cargo install rstun --features full       # crates.io（完整版）
   `openssl s_client` 握手 + 另一实例的明文 Binding）。
 - `sbom` 作业（与平台无关，只跑一次）用 `script/ci/gen-sbom.sh` 生成 lean / full 两份 SBOM；
   `release` 作业断言 **8 个 zip + 2 份 SBOM + 1 份 formula + 2 个 deb = 13 个资产**，少一个就拒绝发版
-  （SBOM 的组件数还额外断言直接依赖 9 / 13）。
+  （SBOM 的组件数还额外断言直接依赖 10 / 14）。
 
 ## 运维面（readiness / metrics / env / 优雅退出 / 部署清单）
 
@@ -341,17 +341,21 @@ Rust 1.95）：
 
 | 指标 | lean（默认） | full（`--features full`） | 命令 |
 | --- | --- | --- | --- |
-| 直接依赖 | **9** | **13** | `cargo tree -e normal --depth 1 [--all-features] \| tail -n +2 \| wc -l` |
-| 依赖树行数（含重复的 feature 合并） | 89 | 359 | `cargo tree -e normal [--all-features] \| wc -l` |
+| 直接依赖 | **10** | **14** | `cargo tree -e normal --depth 1 [--all-features] \| tail -n +2 \| wc -l` |
+| 依赖树行数（含重复的 feature 合并） | 90 | 360 | `cargo tree -e normal [--all-features] \| wc -l` |
 | 唯一 crate 数 | 66 | 212 | `cargo tree -e normal [--all-features] --format '{p}' \| sed 's/^[│├└─ \t]*//' \| sort -u \| wc -l` |
 | release 二进制（未 strip） | **3.77 MB** | **7.95 MB** | `cargo build --release [--features full] && ls -l target/release/rstun` |
 | 镜像/发布用的二进制（LTO + strip） | **2.34 MB** | **4.82 MB** | 见 Dockerfile 的 `CARGO_PROFILE_RELEASE_{LTO,CODEGEN_UNITS,STRIP}` |
+
+> 直接依赖是 **unix 口径**：`libc` 在 `[target.'cfg(unix)'.dependencies]` 里（DF 位的
+> `setsockopt`），Windows 构建没有它，lean/full 分别是 9/13 个。`cargo tree --depth 1`
+> 按当前目标平台（本机 Linux）计数，所以表里是 10/14。
 
 > `cargo metadata --format-version 1 | jq '.packages\|length'` 也能跑（本仓 77），但它数的是
 > **Cargo.lock 里的全部包**——含 dev-dependencies 与未启用的 optional 依赖，不区 feature，
 > 所以不适合回答「这份二进制带了多少依赖」。上表按 feature 分别计。
 >
-> full 比 lean 多出的 146 行里，有一大块是 **两代 `digest` 各一份**：本仓的鉴权栈在
+> full 比 lean 多出的 270 行（360 − 90）里，有一大块是 **两代 `digest` 各一份**：本仓的鉴权栈在
 > `digest 0.11`，而 `webrtc-dtls 0.12`（上游最新版）仍钉 `digest 0.10`，两代都留在树里
 > （`webrtc-dtls` 跟进后自动消失，届时删掉这段说明）。
 
@@ -359,6 +363,7 @@ Rust 1.95）：
 lean：
 clap  socket2  tokio  tracing  tracing-subscriber
 hmac  sha1  sha2  md-5              ← 鉴权（RFC 5389 §10 / RFC 8489 §9.2）
+libc (仅 unix)                      ← DONT-FRAGMENT 的 setsockopt（Windows 上没有）
 
 full（= lean + 这 4 个）：
 tokio-rustls  rustls-pemfile        ← turns:（TLS 监听；rustls 的 ring provider）
@@ -383,6 +388,13 @@ full = ["tls", "dtls"]
   UDP/TCP TURN 一样能用。
 - `webrtc-util` 是 `webrtc-dtls` 已有的同版本依赖，只是从传递依赖提升为直接依赖
   （否则 `Conn`/`Listener` 的方法无法调用），**不新增任何 crate**。
+- `libc` **只在 unix 上是直接依赖**（`[target.'cfg(unix)'.dependencies]`）：`DONT-FRAGMENT`
+  （0x001A）要把 DF 位置到 relay socket 上，而 `socket2 0.6` 没有 MTU-discover / DF 的 API，
+  只能直接 `setsockopt`（Linux `IP_MTU_DISCOVER`、macOS `IP_DONTFRAG`）。它本来就是
+  tokio/socket2 的传递依赖，**不新增任何 crate**。DF 只在 **Linux / macOS / iOS** 上真的支持；
+  其它平台（Windows，以及选项名未经验证的 FreeBSD 等 unix）上 `0x001A` 保持未知
+  comprehension-required → `420`（RFC 8656 §7.2 步骤 4 允许），`Send` 带 DF 则按未知属性
+  语义丢弃该 indication（§11.2）。
 - `tokio-rustls` 显式关掉默认特性、只开 `ring`：`rustls` 同时编进两个 provider 时
   `CryptoProvider::get_default()` 会在运行期 panic，而 `webrtc-dtls` 固定用 ring。
 
@@ -417,7 +429,7 @@ OpenSSL/libssl-dev）。引入它们的原因：鉴权要 HMAC-SHA1、HMAC-SHA25
 - Dependabot（`.github/dependabot.yml`）：cargo **每周**、GitHub Actions **每月**，**只开 PR 不自动合并**。
 - Release 附 **CycloneDX 1.5 SBOM**：`rstun-<version>-lean.cdx.json` / `rstun-<version>-full.cdx.json`
   （`script/ci/gen-sbom.sh` 用 `cargo metadata` 生成，按 feature 分别算依赖闭包，并断言直接依赖数
-  9 / 13）；另附 Homebrew formula `rstun.rb`。**发布产物未签名**（cosign/sigstore 后置）。
+  10 / 14）；另附 Homebrew formula `rstun.rb`。**发布产物未签名**（cosign/sigstore 后置）。
 
 ## 测试
 

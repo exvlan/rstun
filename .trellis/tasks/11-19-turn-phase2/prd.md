@@ -12,10 +12,11 @@
 1. **TCP allocation（RFC 6062）**：`Allocate` 的 `REQUESTED-TRANSPORT=6` →
    为客户端建立到 peer 的 TCP 连接（`Connect` / `ConnectionBind` / `ConnectionAttempt` indication），
    当前回 442（Unsupported Transport Protocol）。
-2. **`DONT-FRAGMENT`**：目前作为未知 comprehension-required 回 **420**；应识别并按 §7.2 语义处理
-   （设置 DF 位；平台不支持时按 RFC 返回错误）。
-3. **`REQUESTED-ADDRESS-FAMILY`**：当前 420；应支持选择 relay 地址族（IPv4/IPv6），
-   与 `--listen`/`--listen-v6` 的 relay 绑定配合。
+2. ~~**`DONT-FRAGMENT`**~~：**已完成**（子任务 `11-21-rstun-turn-df-ipv6`，未发布）——
+   unix（Linux/macOS/iOS）真支持 DF；其它平台按 §7.2 步骤 4 保持 `420`。
+3. ~~**`REQUESTED-ADDRESS-FAMILY`**~~：**已完成**（子任务 `11-21-rstun-turn-raf`，随 `26.410.102` 发布）——
+   族匹配正常分配、异族 `440`、`Refresh` 不匹配 `443`；relay 族跟随客户端。
+   双分配 `ADDITIONAL-ADDRESS-FAMILY` 仍未实现（comprehension-optional，忽略）。
 4. **多实例共享 allocation 状态**：当前只共享 nonce secret；跨实例的 5 元组一致性无保证。
    （可选，取决于部署形态。）
 5. **`turns:` 的证书热加载**：当前重启生效（T2 记录）。

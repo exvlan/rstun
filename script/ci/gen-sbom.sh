@@ -106,7 +106,9 @@ for dep in nodes[root_id].get("deps", []):
         direct.append(packages[dep["pkg"]])
 direct.sort(key=lambda p: p["name"])
 
-EXPECTED_DIRECT = {"lean": 9, "full": 13}
+# libc 是 `[target.'cfg(unix)'.dependencies]`：`cargo metadata` 的 resolve 图与
+# 平台无关，所以 unix-only 的直接依赖也计入 —— linux/macOS/Windows 都是 10/14。
+EXPECTED_DIRECT = {"lean": 10, "full": 14}
 
 
 def purl(pkg):

@@ -10,8 +10,8 @@
 #   bash script/lab/rstun-turn.sh --no-build       # 复用 target/debug/rstun（探测其 feature）
 #   bash script/lab/rstun-turn.sh --tls --dtls     # 只跑 TLS/DTLS 项（自动 --features full 构建）
 #   bash script/lab/rstun-turn.sh --only relay     # 只跑一项
-#     （startup|relay|auth|lifecycle|wrong-user|raf|wildcard|permission-limit|quota|
-#       ports|tls|dtls|rest|bandwidth|cleanup|frozen|coturn）
+#     （startup|relay|auth|lifecycle|wrong-user|raf|df|ipv6relay|wildcard|
+#       permission-limit|quota|ports|tls|dtls|rest|bandwidth|cleanup|frozen|coturn）
 #   bash script/lab/rstun-turn.sh --keep           # 保留日志（默认只清进程）
 #   FROZEN_BASE=<sha> bash script/lab/rstun-turn.sh --only frozen
 #                                                  # 字节冻结对照的基线提交（默认 cad4fa2）
@@ -67,7 +67,7 @@ FAILED=()
 SKIPPED=()
 PASSED=()
 
-ALL_ITEMS=(startup relay auth lifecycle wrong-user raf wildcard permission-limit quota ports tls dtls rest bandwidth cleanup frozen coturn)
+ALL_ITEMS=(startup relay auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls rest bandwidth cleanup frozen coturn)
 
 usage() {
   sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
@@ -103,7 +103,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [[ -n "$ONLY" ]]; then
   case "$ONLY" in
-    startup | relay | auth | lifecycle | wrong-user | raf | wildcard | permission-limit | quota | ports | tls | dtls | rest | bandwidth | cleanup | frozen | coturn) : ;;
+    startup | relay | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | rest | bandwidth | cleanup | frozen | coturn) : ;;
     *) echo "--only 未知项: $ONLY（可用：${ALL_ITEMS[*]}）" >&2; exit 2 ;;
   esac
 fi
@@ -394,10 +394,10 @@ run_wrong_user() {
 # ---------- 4c. RAF: REQUESTED-ADDRESS-FAMILY (0x0017) is understood ----------
 
 # RFC 8656 §7.2 step 7: uclient's `-X` (IPv4 relay requested), `-x` (IPv6
-# requested) and `-e` carry REQUESTED-ADDRESS-FAMILY; `-g` carries
-# DONT-FRAGMENT. Plain UDP (no `-S`) on purpose: the attribute is handled before
-# any transport dispatch, so the lean build covers it (the DTLS item repeats
-# `-S -X` for the production shape that reported the 420).
+# requested) and `-e` carry REQUESTED-ADDRESS-FAMILY. Plain UDP (no `-S`) on
+# purpose: the attribute is handled before any transport dispatch, so the lean
+# build covers it (the DTLS item repeats `-S -X` for the production shape that
+# reported the 420). `-g` (DONT-FRAGMENT) moved to its own `df` item.
 run_raf() {
   local name=raf
   start_turn "$name"
@@ -417,19 +417,132 @@ run_raf() {
   # 2) IPv6 relay family from an IPv4 client → 440 (§7.2 step 7), not 420.
   turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 3 -m 2 -y -x 127.0.0.1 \
     >"$LOG_DIR/$name-ipv6.log" 2>&1
-  # 3) DONT-FRAGMENT keeps the RFC-sanctioned 420 (§7.2 step 4).
-  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 3 -m 2 -y -g 127.0.0.1 \
-    >"$LOG_DIR/$name-df.log" 2>&1
-  local ipv4=ok ipv6=ok df=ok
+  local ipv4=ok ipv6=ok
   uclient_ok "$LOG_DIR/$name-ipv4.log" || ipv4=failed
   grep -qa "error 440" "$LOG_DIR/$name-ipv6.log" || ipv6=failed
-  grep -qa "error 420" "$LOG_DIR/$name-df.log" || df=failed
   local family
   family="$(metric 'rstun_turn_rejected_total{reason="family"}')"
-  if [[ $ipv4 == ok && $ipv6 == ok && $df == ok && -n "$family" && "$family" -gt 0 ]]; then
-    ok "$name" "uclient -X relays (RAF IPv4), -x → error 440, -g → error 420; rejected_family=$family"
+  if [[ $ipv4 == ok && $ipv6 == ok && -n "$family" && "$family" -gt 0 ]]; then
+    ok "$name" "uclient -X relays (RAF IPv4), -x → error 440; rejected_family=$family"
   else
-    fail "$name" "ipv4=$ipv4 ipv6=$ipv6 df=$df rejected_family=$family (see $LOG_DIR/$name-*.log)"
+    fail "$name" "ipv4=$ipv4 ipv6=$ipv6 rejected_family=$family (see $LOG_DIR/$name-*.log)"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 4c-bis. df: DONT-FRAGMENT (0x001A) relays instead of 420 ----------
+
+# RFC 8656 §18.9 / §7.2 step 4 / §11.2: unix 上 `Allocate` 带 DONT-FRAGMENT
+# 会真的给 relay socket 置 DF（Linux `IP_MTU_DISCOVER=IP_PMTUDISC_DO`、macOS
+# `IP_DONTFRAG`），所以 `uclient -g` 从「`error 420`」变成可中继。
+#
+# 证据口径（重要）：`tcpdump -i lo` 里的 `flags [DF]` **不是判别性证据** ——
+# Linux 默认的 `IP_PMTUDISC_WANT` 对「不超过 MTU」的报文本来就置 DF，而 lo 的 MTU
+# 是 65536、uclient 报文远小于它。判别性证据是单测里的 `getsockopt` 回读：
+#   · `set_dont_fragment_round_trips`（DO/WANT↔DF on/off 往返）；
+#   · `allocate_with_dont_fragment_sets_the_relay_socket`（活 allocation 的 relay
+#     socket 真的处于 DO）。
+# 本项因此断言三件可判别的事：`-g` 能中继（旧行为是 420）、线上报文带 DF（记录性）、
+# 中继字节增长；tcpdump 不可用/无权限时退化为「uclient + 指标」并在输出里说明。
+run_df() {
+  local name=df
+  start_turn "$name" "--max-allocations-per-user" "32"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    stop_server "$name"
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+
+  # 1) `-g` = DONT-FRAGMENT in Allocate. Before this change the server answered
+  #    `error 420`; now the allocation is created and the relay carries bytes.
+  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 5 -m 2 -y -g 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient.log" 2>&1
+  local relayed=ok
+  uclient_ok "$LOG_DIR/$name-uclient.log" || relayed=failed
+  grep -qa "error 420" "$LOG_DIR/$name-uclient.log" && relayed=failed
+
+  # 2) Observational wire evidence: relay→peer datagrams carry DF.
+  local wire=skip wire_note="tcpdump unavailable"
+  if command -v tcpdump >/dev/null 2>&1; then
+    timeout 20 tcpdump -i lo -n -vv -c 3 'udp and portrange '"$RELAY_LO"'-'"$RELAY_HI" \
+      >"$LOG_DIR/$name-tcpdump.log" 2>&1 &
+    local capture_pid=$!
+    sleep 0.5
+    turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 10 -m 2 -y -g 127.0.0.1 \
+      >"$LOG_DIR/$name-uclient-capture.log" 2>&1 || true
+    wait "$capture_pid" 2>/dev/null
+    if grep -qa "flags \[DF\]" "$LOG_DIR/$name-tcpdump.log"; then
+      wire=ok
+      wire_note="tcpdump: flags [DF] on relay→peer (recorded, not discriminating on lo)"
+    elif grep -qa "permission denied\|Operation not permitted" "$LOG_DIR/$name-tcpdump.log"; then
+      wire_note="tcpdump needs CAP_NET_RAW; getsockopt readback is the evidence"
+    else
+      wire=failed
+      wire_note="no DF in $(grep -c . "$LOG_DIR/$name-tcpdump.log" 2>/dev/null || echo 0) tcpdump lines"
+    fi
+  fi
+
+  local bytes_in bytes_out refused
+  bytes_in="$(metric 'rstun_turn_bytes_total{direction="in"}')"
+  bytes_out="$(metric 'rstun_turn_bytes_total{direction="out"}')"
+  refused="$(metric 'rstun_turn_rejected_total{reason="df"}')"
+  if [[ $relayed == ok && "$wire" != failed &&
+    -n "$bytes_in" && "$bytes_in" -gt 0 && -n "$bytes_out" && "$bytes_out" -gt 0 ]]; then
+    ok "$name" "uclient -g relays (was error 420), bytes in=$bytes_in out=$bytes_out, rejected_df=${refused:-0}; $wire_note"
+  else
+    fail "$name" "relayed=$relayed wire=$wire bytes in=$bytes_in out=$bytes_out ($wire_note; see $LOG_DIR/$name-*.log)"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 4c-ter. ipv6relay: IPv6 listener + IPv6 client → IPv6 relay ----------
+
+# The path that had no regression at all: `--listen [::1]`, an IPv6 client and
+# an IPv6 peer. The relay follows the client, so the whole chain stays on ::1;
+# the probe asserts the XOR-RELAYED-ADDRESS family and drives Send/Data/
+# ChannelData both ways. Hosts without IPv6 loopback skip instead of failing.
+run_ipv6relay() {
+  local name=ipv6relay
+  if ! python3 - <<'PY' >/dev/null 2>&1
+import socket
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("::1", 0))
+s.close()
+PY
+  then
+    skip "$name" "no IPv6 loopback on this host"
+    return
+  fi
+  start_server "$name" --listen "[::1]:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --health-listen "127.0.0.1:$HEALTH_PORT"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy (see $LOG_DIR/$name.log)"
+    stop_server "$name"
+    return
+  fi
+  if python3 "$PROBE" relay --server "[::1]:$BASE" --family inet6 --show-relay \
+    >"$LOG_DIR/$name-probe.log" 2>&1; then
+    local relay_addr sent back family
+    relay_addr="$(sed -n 's/^info: relay=//p' "$LOG_DIR/$name-probe.log")"
+    family="$(sed -n 's/^ok: allocate-family relay-family=//p' "$LOG_DIR/$name-probe.log")"
+    sent="$(sed -n 's/^ok: send-indication-bytes bytes=//p' "$LOG_DIR/$name-probe.log")"
+    back="$(sed -n 's/^ok: peer-to-client-bytes kind=[^ ]* bytes=//p' "$LOG_DIR/$name-probe.log")"
+    if [[ "$family" == "inet6" && -n "$relay_addr" &&
+      "${sent:-0}" -gt 0 && "${back:-0}" -gt 0 ]]; then
+      ok "$name" "relay=$relay_addr (IPv6), send→peer ${sent}B, peer→client ${back}B"
+    else
+      fail "$name" "relay=${relay_addr:-?} family=${family:-?} send=${sent:-0} back=${back:-0}"
+    fi
+  else
+    fail "$name" "see $LOG_DIR/$name-probe.log"
   fi
   stop_server "$name"
 }
@@ -1129,7 +1242,7 @@ run_coturn() {
   log "  uclient:        coturn exit=$coturn_exit  rstun exit=$rstun_exit"
   log "  TLS  (uclient -S -t): coturn=$coturn_tls_result  rstun=$rstun_tls_result"
   log "  DTLS (uclient -S):    coturn=$coturn_dtls_result  rstun=$rstun_dtls_result"
-  log "  allocation:     $(grep -a '^ok: allocate' "$LOG_DIR/$name-coturn-lifecycle.log" | sed 's/^ok: //')  (both servers)"
+  log "  allocation:     $(grep -a '^ok: allocate ' "$LOG_DIR/$name-coturn-lifecycle.log" | sed 's/^ok: //')  (both servers)"
   log "  refresh:        $(grep -a '^ok: refresh-' "$LOG_DIR/$name-rstun-lifecycle.log" | sed 's/^ok: //' | tr '\n' ';')"
   local coturn_release rstun_release
   coturn_release="$(grep -a 'refresh-after-release' "$LOG_DIR/$name-coturn-lifecycle.log" | sed 's/.*code=//')"
@@ -1194,6 +1307,8 @@ run_item() {
     lifecycle) run_lifecycle ;;
     wrong-user) run_wrong_user ;;
     raf) run_raf ;;
+    df) run_df ;;
+    ipv6relay) run_ipv6relay ;;
     wildcard) run_wildcard ;;
     permission-limit) run_permission_limit ;;
     quota) run_quota ;;

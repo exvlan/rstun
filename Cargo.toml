@@ -26,8 +26,10 @@ name = "rstun"
 path = "src/main.rs"
 
 # 两种发布构建（**默认 lean**）：
-#   lean  `cargo build`                     STUN + TURN(UDP/TCP) + REST + 带宽，9 个直接依赖、~3.5 MB
-#   full  `cargo build --features full`     再加 `turns:`(TLS) 与 DTLS，13 个直接依赖、~7.9 MB
+#   lean  `cargo build`                     STUN + TURN(UDP/TCP) + REST + 带宽，10 个直接依赖、~3.5 MB
+#   full  `cargo build --features full`     再加 `turns:`(TLS) 与 DTLS，14 个直接依赖、~7.9 MB
+# 数字是 unix 口径：`libc` 只在 unix 上是直接依赖（DONT-FRAGMENT 的 setsockopt），
+# Windows 上没有它，lean/full 分别是 9/13。
 # `dtls` 依赖 `tls`：两者共用同一份证书材料解析（`SecureMaterial`），DTLS 单独存在没有意义。
 # 任何 feature 都不改变默认关闭路径的字节（`frozen` 项：3 配置 × 17 请求）。
 [features]
@@ -92,8 +94,16 @@ webrtc-util = { version = "0.11", optional = true, default-features = false, fea
   "conn",
 ] }
 
+# ---- DONT-FRAGMENT (0x001A)：relay socket 的 DF 位 ----
+# `socket2 0.6` 没有 MTU-discover / DF 的 API，置位只能直接 `setsockopt`，所以要
+# `libc`。**只在 unix 上**：Windows 不链接 libc，那里的 `DONT-FRAGMENT` 保持
+# 「未知 comprehension-required → 420」（RFC 8656 §7.2 步骤 4 明文允许）。
+# `libc` 本来就是传递依赖（tokio/socket2），这里只是提升为直接依赖，不新增 crate。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-# 参考实现 oracle（**只用于测试**，运行期依赖是上面 9 个）：
+# 参考实现 oracle（**只用于测试**，运行期依赖是上面的 10 个（unix）/ 9 个（Windows））：
 # `stun-types` 是 STUN/TURN 生态里活跃维护的那一份（turn-types / WebRTC 侧的基础库），
 # 用它交叉验证我们的编解码 —— 若它读不了我们的响应，第三方客户端也读不了。
 stun-types = "2.0.5"

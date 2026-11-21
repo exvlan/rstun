@@ -198,6 +198,21 @@ impl Client {
         transaction_id(self.sequence)
     }
 
+    /// The TURN 5-tuple this client occupies (the harness binds a concrete
+    /// loopback address, so the server half is exactly `self.server`).
+    ///
+    /// Only the DONT-FRAGMENT tests reach into the allocation table, and those
+    /// are platform-gated; without the same gate a Windows test build warns
+    /// about a dead helper.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+    fn key(&self) -> Key {
+        Key {
+            client: self.socket.local_addr().expect("local address"),
+            transport: ClientTransport::Udp,
+            server: self.server,
+        }
+    }
+
     fn alloc_attributes(&self) -> Vec<(u16, Vec<u8>)> {
         vec![
             (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
@@ -316,6 +331,16 @@ fn lifetime_of(response: &[u8]) -> u32 {
 
 /// Build a `Send` indication (unauthenticated by design, RFC 8656 §7.3).
 fn send_indication(transaction_id: &TransactionId, peer: SocketAddr, data: &[u8]) -> Vec<u8> {
+    send_indication_with(transaction_id, peer, data, &[])
+}
+
+/// Same, plus extra attributes (`DONT-FRAGMENT`, malformed variants, ...).
+fn send_indication_with(
+    transaction_id: &TransactionId,
+    peer: SocketAddr,
+    data: &[u8],
+    extra: &[(u16, Vec<u8>)],
+) -> Vec<u8> {
     let mut body = Vec::new();
     protocol::push_attribute(
         &mut body,
@@ -323,6 +348,9 @@ fn send_indication(transaction_id: &TransactionId, peer: SocketAddr, data: &[u8]
         &protocol::xor_mapped_address_value(peer, transaction_id),
     );
     protocol::push_attribute(&mut body, ATTR_DATA, data);
+    for (attr_type, value) in extra {
+        protocol::push_attribute(&mut body, *attr_type, value);
+    }
     protocol::encode_message(
         protocol::message_type(SEND_METHOD, MessageClass::Indication),
         transaction_id,
@@ -433,8 +461,19 @@ fn error_codes_have_expected_values() {
 fn unknown_comprehension_required_attributes_are_reported() {
     let mut body = Vec::new();
     protocol::push_attribute(&mut body, ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
-    protocol::push_attribute(&mut body, 0x001A, &[]); // DONT-FRAGMENT: unsupported
-    assert_eq!(turn_unknown_attributes(&body), vec![0x001A]);
+    protocol::push_attribute(&mut body, 0x7777, &[]); // genuinely unknown
+    assert_eq!(turn_unknown_attributes(&body), vec![0x7777]);
+
+    // DONT-FRAGMENT is understood where the DF bit can be set (§18.9); on a
+    // build without that path it must stay unknown → 420 (§7.2 step 4).
+    let mut df = Vec::new();
+    protocol::push_attribute(&mut df, ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
+    protocol::push_attribute(&mut df, ATTR_DONT_FRAGMENT, &[]);
+    if DONT_FRAGMENT_SUPPORTED {
+        assert!(turn_unknown_attributes(&df).is_empty());
+    } else {
+        assert_eq!(turn_unknown_attributes(&df), vec![ATTR_DONT_FRAGMENT]);
+    }
 
     // REQUESTED-ADDRESS-FAMILY is understood now (answered 200/440/400), so a
     // request carrying it is no longer a 420 (RFC 8656 §7.2 step 7).
@@ -447,6 +486,22 @@ fn unknown_comprehension_required_attributes_are_reported() {
     protocol::push_attribute(&mut known, ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
     protocol::push_attribute(&mut known, ATTR_LIFETIME, &300_u32.to_be_bytes());
     assert!(turn_unknown_attributes(&known).is_empty());
+}
+
+#[test]
+fn dont_fragment_parsing() {
+    // Absent → nothing requested.
+    assert_eq!(parse_dont_fragment(&[]), Ok(false));
+    // §18.9: no value part, so length 0 is the well-formed shape.
+    let mut present = Vec::new();
+    protocol::push_attribute(&mut present, ATTR_DONT_FRAGMENT, &[]);
+    assert_eq!(parse_dont_fragment(&present), Ok(true));
+    // Any value part is malformed: `Allocate` answers 400, and a `Send`
+    // indication carrying it is discarded and counted (§11.2 treats an
+    // unusable DONT-FRAGMENT as an unknown comprehension-required attribute).
+    let mut malformed = Vec::new();
+    protocol::push_attribute(&mut malformed, ATTR_DONT_FRAGMENT, &[1]);
+    assert_eq!(parse_dont_fragment(&malformed), Err(()));
 }
 
 #[test]
@@ -1046,17 +1101,23 @@ async fn allocate_rejects_tcp_transport_and_missing_requested_transport() {
         .await;
     assert_eq!(error_code(&response), Some(400));
 
-    // DONT-FRAGMENT is comprehension-required and unsupported → 420.
+    // DONT-FRAGMENT is comprehension-required. Where the DF bit can be set it
+    // is understood (§18.9), so the Allocate goes through; on a build without
+    // that path it stays unknown → 420 (§7.2 step 4).
     let response = client
         .request(
             ALLOCATE_METHOD,
             vec![
                 (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
-                (0x001A, Vec::new()),
+                (ATTR_DONT_FRAGMENT, Vec::new()),
             ],
         )
         .await;
-    assert_eq!(error_code(&response), Some(420));
+    if DONT_FRAGMENT_SUPPORTED {
+        assert_eq!(error_code(&response), None);
+    } else {
+        assert_eq!(error_code(&response), Some(420));
+    }
 }
 
 /// RFC 8656 §7.2 step 7 / §18.6: `REQUESTED-ADDRESS-FAMILY` chooses the relay
@@ -1166,23 +1227,33 @@ async fn requested_address_family_selects_the_relay_family() {
         );
     }
 
-    // DONT-FRAGMENT stays unsupported (RFC 8656 §7.2 step 4 allows the 420).
+    // DONT-FRAGMENT: on unix the DF bit can be set, so the Allocate is accepted
+    // (§18.9 capability probe); on a build without that path it stays an
+    // unknown comprehension-required attribute → 420 (§7.2 step 4).
     let response = client
         .request(
             ALLOCATE_METHOD,
             vec![
                 (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
-                (0x001A, Vec::new()),
+                (ATTR_DONT_FRAGMENT, Vec::new()),
             ],
         )
         .await;
-    assert_eq!(error_code(&response), Some(420));
-    let unknown = attributes_of(&response)
-        .into_iter()
-        .find(|(attr_type, _)| *attr_type == protocol::ATTR_UNKNOWN_ATTRIBUTES)
-        .expect("UNKNOWN-ATTRIBUTES")
-        .1;
-    assert_eq!(unknown, vec![0x00, 0x1A]);
+    if DONT_FRAGMENT_SUPPORTED {
+        // Every earlier request in this block was refused, so the 5-tuple is
+        // still free: the DF capability probe allocates (§18.9).
+        assert_eq!(error_code(&response), None);
+        assert!(relayed_address(&response).is_ipv4());
+        assert_eq!(harness.turn.active(), 1);
+    } else {
+        assert_eq!(error_code(&response), Some(420));
+        let unknown = attributes_of(&response)
+            .into_iter()
+            .find(|(attr_type, _)| *attr_type == protocol::ATTR_UNKNOWN_ATTRIBUTES)
+            .expect("UNKNOWN-ATTRIBUTES")
+            .1;
+        assert_eq!(unknown, vec![0x00, 0x1A]);
+    }
 }
 
 /// RFC 8656 §8.2 (MUST): a Refresh whose `REQUESTED-ADDRESS-FAMILY` does not
@@ -1260,6 +1331,364 @@ async fn refresh_requested_address_family_mismatch_is_443() {
     assert_eq!(error_code(&response), None);
     assert_eq!(lifetime_of(&response), 600);
     assert_eq!(harness.turn.active(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// DONT-FRAGMENT (0x001A): §18.9 / §7.2 step 4 / §11.2
+// ---------------------------------------------------------------------------
+
+/// Read the DF option back from a socket: `IP_MTU_DISCOVER` on Linux,
+/// `IP_DONTFRAG` on macOS. Only the platforms `set_dont_fragment` implements.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+fn dont_fragment_option(socket: &UdpSocket, ipv6: bool) -> libc::c_int {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    let (level, name) = if ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER)
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let (level, name) = if ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_DONTFRAG)
+    };
+
+    let mut value: libc::c_int = -1;
+    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+    // SAFETY: `value` is a live `c_int` and `length` its exact size; the kernel
+    // writes at most `length` bytes into it.
+    let rc = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            level,
+            name,
+            std::ptr::from_mut(&mut value).cast(),
+            &mut length,
+        )
+    };
+    assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+    value
+}
+
+/// The `(DF on, DF off)` values the platform reports for its option.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+fn dont_fragment_values() -> (libc::c_int, libc::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        (libc::IP_PMTUDISC_DO, libc::IP_PMTUDISC_WANT)
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        (1, 0)
+    }
+}
+
+/// `set_dont_fragment` really reaches the socket: the option reads back as the
+/// platform's "DF set" value and returns to the kernel default afterwards.
+/// This is also the fallback evidence for the lab's `df` item when `tcpdump`
+/// cannot run.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+#[tokio::test]
+async fn set_dont_fragment_round_trips() {
+    let (set, cleared) = dont_fragment_values();
+    let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_eq!(
+        dont_fragment_option(&v4, false),
+        cleared,
+        "the kernel default is PMTUDISC_WANT / off"
+    );
+    set_dont_fragment(&v4, true).expect("set DF on an IPv4 socket");
+    assert_eq!(dont_fragment_option(&v4, false), set);
+    set_dont_fragment(&v4, false).expect("clear DF on an IPv4 socket");
+    assert_eq!(dont_fragment_option(&v4, false), cleared);
+
+    // IPv6 uses the v6 spelling of the option; skip hosts without ::1.
+    if let Ok(v6) = UdpSocket::bind("[::1]:0").await {
+        set_dont_fragment(&v6, true).expect("set DF on an IPv6 socket");
+        assert_eq!(dont_fragment_option(&v6, true), set);
+        set_dont_fragment(&v6, false).expect("clear DF on an IPv6 socket");
+        assert_eq!(dont_fragment_option(&v6, true), cleared);
+    }
+}
+
+/// §7.2 step 4 / §18.9: `DONT-FRAGMENT` in `Allocate` is the capability probe
+/// **and** arms the DF bit on the relay socket for the allocation's lifetime.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+#[tokio::test]
+async fn allocate_with_dont_fragment_sets_the_relay_socket() {
+    let harness = start(Config::default()).await;
+    let mut client = Client::connect(harness.server).await;
+    client.challenge().await;
+    let response = client
+        .request(
+            ALLOCATE_METHOD,
+            vec![
+                (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                (ATTR_LIFETIME, 300_u32.to_be_bytes().to_vec()),
+                (ATTR_DONT_FRAGMENT, Vec::new()),
+            ],
+        )
+        .await;
+    assert_eq!(
+        error_code(&response),
+        None,
+        "DF is supported on this platform (no longer 420)"
+    );
+    let relay = relayed_address(&response);
+    let allocation = harness
+        .turn
+        .get(&client.key(), Instant::now())
+        .expect("allocation");
+    assert!(
+        allocation.dont_fragment,
+        "the allocation records the request"
+    );
+    let (set, _) = dont_fragment_values();
+    assert_eq!(
+        dont_fragment_option(&allocation.relay, relay.is_ipv6()),
+        set,
+        "the relay socket carries DF for its whole life"
+    );
+
+    // §18.9: the attribute has no value part, so a value is 400.
+    let mut fresh = Client::connect(harness.server).await;
+    fresh.challenge().await;
+    let response = fresh
+        .request(
+            ALLOCATE_METHOD,
+            vec![
+                (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                (ATTR_DONT_FRAGMENT, vec![1]),
+            ],
+        )
+        .await;
+    assert_eq!(error_code(&response), Some(400));
+    assert_eq!(harness.turn.active(), 1, "the 400 allocated nothing");
+}
+
+/// §7.2 step 4 / §18.9: an `Allocate` that asks for `DONT-FRAGMENT` but whose
+/// relay socket refuses the option is an internal failure — `500`, nothing
+/// allocated, the port back in the pool, and `rejected_df` counted. This is the
+/// only DF branch a healthy kernel never reaches, hence the injected failure.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+#[tokio::test]
+async fn allocate_dont_fragment_failure_is_500_and_returns_the_port() {
+    let harness = start(Config::default()).await;
+    let mut client = Client::connect(harness.server).await;
+    client.challenge().await;
+    let before = harness.turn.snapshot().rejected_df;
+
+    df_failure::set(true);
+    let response = client
+        .request(
+            ALLOCATE_METHOD,
+            vec![
+                (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                (ATTR_LIFETIME, 300_u32.to_be_bytes().to_vec()),
+                (ATTR_DONT_FRAGMENT, Vec::new()),
+            ],
+        )
+        .await;
+    // The response only arrives after the handler returned, so the flag can go
+    // back immediately.
+    df_failure::set(false);
+
+    assert_eq!(
+        error_code(&response),
+        Some(500),
+        "a relay socket that cannot set DF is an internal failure, not a 420"
+    );
+    assert_eq!(
+        harness.turn.active(),
+        0,
+        "the failed Allocate must not leave an allocation behind"
+    );
+    assert!(
+        harness.turn.snapshot().rejected_df > before,
+        "the Allocate DF failure must be counted (rejected_df)"
+    );
+    assert!(
+        lock_lock(&harness.turn.used_ports).is_empty(),
+        "the relay port must go back to the pool on the 500 path"
+    );
+
+    // The table and the port pool are still usable: the same 5-tuple (whose
+    // first Allocate failed) allocates normally now.
+    let response = client.allocate().await;
+    assert_eq!(error_code(&response), None);
+    assert_eq!(harness.turn.active(), 1);
+    assert!(
+        !lock_lock(&harness.turn.used_ports).is_empty(),
+        "the second Allocate must hold a relay port"
+    );
+}
+
+/// §11.2: `DONT-FRAGMENT` in a `Send` indication is per datagram — the bit is
+/// set, the payload goes out, and the socket returns to its allocation-level
+/// setting. A malformed value or a DF that cannot be applied discards the
+/// indication (§11.2: treat it as an unknown comprehension-required attribute)
+/// and counts it; neither is ever forwarded without the bit.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+#[tokio::test]
+async fn send_indication_dont_fragment_is_per_datagram() {
+    let harness = start(Config::default()).await;
+    let mut client = Client::connect(harness.server).await;
+    client.challenge().await;
+    let response = client.allocate().await;
+    assert_eq!(error_code(&response), None);
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    assert_eq!(
+        error_code(&client.create_permission(&[peer_addr]).await),
+        None
+    );
+
+    let allocation = harness
+        .turn
+        .get(&client.key(), Instant::now())
+        .expect("allocation");
+    assert!(
+        !allocation.dont_fragment,
+        "this allocation did not ask for DF"
+    );
+    let (_, cleared) = dont_fragment_values();
+    assert_eq!(dont_fragment_option(&allocation.relay, false), cleared);
+
+    // DF on this datagram only.
+    let transaction_id = client.next_id();
+    let indication = send_indication_with(
+        &transaction_id,
+        peer_addr,
+        b"df-once",
+        &[(ATTR_DONT_FRAGMENT, vec![])],
+    );
+    send(&client.socket, &indication, harness.server).await;
+    assert_eq!(
+        recv(&peer, 1000)
+            .await
+            .expect("peer receives the DF payload"),
+        b"df-once"
+    );
+    let mut restored = false;
+    for _ in 0..100 {
+        if dont_fragment_option(&allocation.relay, false) == cleared {
+            restored = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(restored, "the DF bit must not outlive the datagram");
+
+    // A malformed attribute (§18.9 defines no value part) makes the indication
+    // undeliverable: nothing reaches the peer, and it is counted.
+    let before = harness.turn.snapshot().rejected_df;
+    let transaction_id = client.next_id();
+    let indication = send_indication_with(
+        &transaction_id,
+        peer_addr,
+        b"df-malformed",
+        &[(ATTR_DONT_FRAGMENT, vec![1])],
+    );
+    send(&client.socket, &indication, harness.server).await;
+    assert!(
+        recv(&peer, 500).await.is_none(),
+        "a malformed DONT-FRAGMENT must drop the indication (§11.2: treat it as unknown)"
+    );
+    assert!(
+        harness.turn.snapshot().rejected_df > before,
+        "a malformed DONT-FRAGMENT must be counted"
+    );
+
+    // §11.2: if the DF bit cannot be applied the indication is discarded (not
+    // forwarded without the bit). A healthy socket never fails `setsockopt`, so
+    // the test injects the failure through `df_failure`.
+    let before = harness.turn.snapshot().rejected_df;
+    df_failure::set(true);
+    let transaction_id = client.next_id();
+    let indication = send_indication_with(
+        &transaction_id,
+        peer_addr,
+        b"df-cannot-apply",
+        &[(ATTR_DONT_FRAGMENT, vec![])],
+    );
+    send(&client.socket, &indication, harness.server).await;
+    let dropped = recv(&peer, 500).await;
+    // Wait until the (dropped) request has been counted, so the flag is only
+    // cleared once the server is done with it.
+    let mut counted = false;
+    for _ in 0..100 {
+        if harness.turn.snapshot().rejected_df > before {
+            counted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    df_failure::set(false);
+    assert!(
+        dropped.is_none(),
+        "§11.2: an indication whose DF bit cannot be set must be discarded"
+    );
+    assert!(
+        counted,
+        "a DF application failure must be counted (rejected_df)"
+    );
+    // The allocation is untouched: a normal DF Send still relays afterwards.
+    let transaction_id = client.next_id();
+    let indication = send_indication_with(
+        &transaction_id,
+        peer_addr,
+        b"df-after-failure",
+        &[(ATTR_DONT_FRAGMENT, vec![])],
+    );
+    send(&client.socket, &indication, harness.server).await;
+    assert_eq!(
+        recv(&peer, 1000)
+            .await
+            .expect("the allocation survives a dropped indication"),
+        b"df-after-failure"
+    );
+}
+
+/// The capability flag must list exactly the platforms `set_dont_fragment`
+/// implements, and `turn_unknown_attributes` must follow it (200 vs 420 is a
+/// single decision, not two).
+#[test]
+fn dont_fragment_support_matches_the_platforms_that_can_set_the_bit() {
+    assert_eq!(
+        DONT_FRAGMENT_SUPPORTED,
+        cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios"
+        )),
+        "DONT_FRAGMENT_SUPPORTED must match set_dont_fragment's platforms"
+    );
+
+    let mut body = Vec::new();
+    protocol::push_attribute(&mut body, ATTR_DONT_FRAGMENT, &[]);
+
+    // Both columns of the decision table, executable on any host: `false` is
+    // exactly the Windows/FreeBSD answer (unknown → 420), `true` the
+    // Linux/macOS one (known → 200/400/500).
+    assert_eq!(
+        turn_unknown_attributes_with(&body, false),
+        vec![ATTR_DONT_FRAGMENT],
+        "without a setsockopt path 0x001A must stay unknown"
+    );
+    assert!(
+        turn_unknown_attributes_with(&body, true).is_empty(),
+        "with a setsockopt path 0x001A is understood"
+    );
+
+    // And the process-wide wrapper follows the compile-time flag.
+    assert_eq!(
+        turn_unknown_attributes(&body).is_empty(),
+        DONT_FRAGMENT_SUPPORTED,
+        "the known-attribute set must follow the capability flag"
+    );
 }
 
 #[tokio::test]
@@ -1430,6 +1859,10 @@ async fn turn_metrics_appear_only_when_enabled() {
     assert!(text.contains("rstun_turn_bytes_total{direction=\"in\"} 0"));
     assert!(text.contains("rstun_turn_allocations_total{result=\"created\"} 0"));
     assert!(text.contains("rstun_turn_rejected_total{reason=\"loopback\"} 0"));
+    assert!(
+        text.contains("rstun_turn_rejected_total{reason=\"df\"} 0"),
+        "DONT-FRAGMENT failures have their own reason label"
+    );
 
     let plain = Arc::new(ServerStats::default());
     let context = Arc::new(ServerContext {

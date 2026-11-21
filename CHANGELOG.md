@@ -3,6 +3,41 @@
 版本线**独立于任何宿主项目**：`YY.QMM.Mmpp`（年.季度月.月日+序号），首发 `26.410.100`。
 `rstun-v*` 的 Release tag / 镜像 tag / 资产名都用这里给出的版本号。
 
+## Unreleased
+
+### TURN：`DONT-FRAGMENT`（0x001A）真实现 + IPv6 relay 回归
+
+- **行为变更**：在**能真的置 DF 的平台**（Linux、macOS/iOS）上，`Allocate` 携带
+  `DONT-FRAGMENT` 不再回 `420`（RFC 8656 §7.2 步骤 4 允许的兼容路径），而是在 relay socket
+  上**真置 DF**：Linux `IP_MTU_DISCOVER = IP_PMTUDISC_DO`（IPv6 socket 用
+  `IPV6_MTU_DISCOVER`），macOS/iOS `IP_DONTFRAG` / `IPV6_DONTFRAG`。置位在 allocation 的
+  整个生命周期内有效；`ChannelData` 没有属性位，沿用该设置。`setsockopt` 失败 →
+  `500 Server Error` 并计 `rstun_turn_rejected_total{reason="df"}`。
+  属性长度 ≠ 0（§18.9 规定无值部分）→ **`400`**。
+- **`Send` indication 带 DF（§11.2）**：只对该报文置位、发送后恢复内核默认
+  （`IP_PMTUDISC_WANT` / `0`），切换在同一 allocation 的互斥锁内串行化。
+  **置位失败 → 丢弃该 indication**（§11.2：置不上 DF 时「按未知 comprehension-required
+  属性处理，**因此丢弃该 Send indication**」）：不向 peer 转发、计 `rejected_df`、记日志。
+  畸形（长度 ≠ 0）的 DF 属性同样按未知属性语义丢弃并计数。
+- **平台口径**：`DONT_FRAGMENT_SUPPORTED = cfg!(any(target_os = "linux", "macos", "ios"))`。
+  其它平台（Windows，以及 FreeBSD 等选项名未经验证的 unix）上 `0x001A` 仍是未知
+  comprehension-required → `Allocate` 回 `420` + `UNKNOWN-ATTRIBUTES`（§7.2 步骤 4 明文允许），
+  同平台的 `Send` 带 DF 走「未知属性 ⇒ 丢弃」的同一语义。
+- **新增直接依赖 `libc`**（`[target.'cfg(unix)'.dependencies] libc = "0.2"`）：`socket2 0.6`
+  没有 MTU-discover/DF 的 API。它本来就是 tokio/socket2 的传递依赖，**不新增任何 crate**；
+  直接依赖计数 unix 口径 9→**10**（lean）/ 13→**14**（full），`gen-sbom.sh` 的断言与
+  README「依赖面」已同步；依赖树行数 89→90 / 359→360，二进制体积不变。
+- **IPv6 relay 回归**：lab 新增 `ipv6relay` 项（`--listen [::1]` + IPv6 客户端 + IPv6 peer），
+  断言 `XOR-RELAYED-ADDRESS` 是 IPv6、`Send`/`Data`/`ChannelData` 双向都有字节 ——
+  这条路径此前**完全没有仓内回归**。探针加 `--family inet|inet6`（XOR 编解码按族）。
+- **lab 新增 `df` 项**：`turnutils_uclient -g` 从 `error 420` 变成可中继。证据口径：
+  `tcpdump -i lo` 的 `flags [DF]` **不是**判别性的（Linux 默认 `IP_PMTUDISC_WANT` 对
+  不超过 MTU 的报文本来就置 DF），判别性证据是单测的 `getsockopt` 回读；lab 认领的是
+  「`-g` 能中继」+「线上带 DF」两件事，并在输出里说明证据来源。
+- 影响面：只有**带** `DONT-FRAGMENT` 的请求字节改变（`uclient -g` 等）。不带它的请求
+  与上一版逐字节一致（`plain_response_bytes_are_frozen`、3 配置 × 17 请求冻结对照未变）；
+  `raf` 项不再断言 `-g` → `420`。
+
 ## 26.410.102
 
 ### TURN：`REQUESTED-ADDRESS-FAMILY`（0x0017）不再回 420

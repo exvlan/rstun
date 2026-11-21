@@ -10,8 +10,14 @@ coturn and the two outputs diffed:
 
     python3 script/lab/rstun-turn-probe.py lifecycle --server 127.0.0.1:34980
     python3 script/lab/rstun-turn-probe.py relay     --server 127.0.0.1:34980
+    python3 script/lab/rstun-turn-probe.py relay     --server '[::1]:34980' --family inet6
     python3 script/lab/rstun-turn-probe.py auth      --server 127.0.0.1:34980 \
         --nonce-lifetime 1
+
+`--family inet6` moves the client and the peer to `::1` and asserts that
+`XOR-RELAYED-ADDRESS` names an IPv6 address (the IPv6 relay path that used to
+have no regression at all). The `loopback` / `permission-limit` modes keep
+their hard-coded IPv4 peers and are only meaningful with the default family.
 
 Exit code: 0 = every assertion passed; 1 = assertion failed; 2 = usage;
 77 = environment/tool problem (the shell wrapper turns that into SKIP).
@@ -54,6 +60,7 @@ ATTR_DATA = 0x0013
 ATTR_XOR_RELAYED_ADDRESS = 0x0016
 ATTR_EVEN_PORT = 0x0018
 ATTR_REQUESTED_TRANSPORT = 0x0019
+ATTR_DONT_FRAGMENT = 0x001A
 ATTR_USERNAME = 0x0006
 ATTR_MESSAGE_INTEGRITY = 0x0008
 ATTR_ERROR_CODE = 0x0009
@@ -78,7 +85,14 @@ class Probe:
             f"{self.user}:{self.realm}:{self.password}".encode()
         ).digest()
         self.timeout = args.timeout
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # `--family inet6`: client, peer and the relay all live on ::1. The
+        # XOR addresses have to be encoded/decoded per family, so this is a
+        # probe-wide setting, not a per-call one.
+        self.family = args.family
+        self.af = socket.AF_INET6 if args.family == "inet6" else socket.AF_INET
+        self.bind = ("::1", 0) if self.af == socket.AF_INET6 else ("127.0.0.1", 0)
+        self.show_relay = args.show_relay
+        self.socket = socket.socket(self.af, socket.SOCK_DGRAM)
         self.socket.settimeout(args.timeout)
         self.nonce = ""
         self.sequence = 0
@@ -122,10 +136,16 @@ class Probe:
         mac = hmac.new(self.key, prefix, hashlib.sha1).digest()
         return prefix + struct.pack("!HH", ATTR_MESSAGE_INTEGRITY, 20) + mac
 
-    @staticmethod
-    def _xor_address(address: tuple[str, int], transaction: bytes) -> bytes:
-        ip = socket.inet_aton(address[0])
+    def _xor_address(self, address: tuple[str, int], transaction: bytes) -> bytes:
         mask = struct.pack("!I", MAGIC_COOKIE) + transaction
+        if self.af == socket.AF_INET6:
+            ip = socket.inet_pton(socket.AF_INET6, address[0])
+            return (
+                b"\0\x02"
+                + struct.pack("!H", address[1] ^ (MAGIC_COOKIE >> 16))
+                + bytes(a ^ b for a, b in zip(ip, mask))
+            )
+        ip = socket.inet_aton(address[0])
         return (
             b"\0\x01"
             + struct.pack("!H", address[1] ^ (MAGIC_COOKIE >> 16))
@@ -135,12 +155,15 @@ class Probe:
     @staticmethod
     def _decode_xor_address(value: bytes, transaction: bytes) -> tuple[str, int]:
         family = value[1]
-        if family != 0x01:
-            raise ValueError("only IPv4 is supported by this probe")
         port = struct.unpack("!H", value[2:4])[0] ^ (MAGIC_COOKIE >> 16)
         mask = struct.pack("!I", MAGIC_COOKIE) + transaction
-        ip = bytes(a ^ b for a, b in zip(value[4:8], mask))
-        return socket.inet_ntoa(ip), port
+        if family == 0x01:
+            ip = bytes(a ^ b for a, b in zip(value[4:8], mask))
+            return socket.inet_ntoa(ip), port
+        if family == 0x02:
+            ip = bytes(a ^ b for a, b in zip(value[4:20], mask))
+            return socket.inet_ntop(socket.AF_INET6, ip), port
+        raise ValueError(f"unknown XOR address family {family:#04x}")
 
     def build_request(
         self,
@@ -179,7 +202,7 @@ class Probe:
     def reconnect(self) -> None:
         """New source port = new TURN 5-tuple (per-case isolation)."""
         self.socket.close()
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket = socket.socket(self.af, socket.SOCK_DGRAM)
         self.socket.settimeout(self.timeout)
         self.nonce = ""
 
@@ -295,6 +318,18 @@ class Probe:
                 else f"code={code} software={self._software(attributes)}"
             ),
         )
+        # A relay of the wrong family would make the client send to an address
+        # that cannot carry its traffic (`requested_address_family` modes cover
+        # the explicit requests). The port is never printed: it changes per run.
+        if relayed is not None:
+            relay_v6 = ":" in relayed[0]
+            self.check(
+                f"{label}-family",
+                relay_v6 == (self.af == socket.AF_INET6),
+                f"relay-family={'inet6' if relay_v6 else 'inet'}",
+            )
+            if self.show_relay:
+                print(f"info: relay={relayed[0]}:{relayed[1]}")
         return relayed
 
     def allocate(self) -> tuple[str, int] | None:
@@ -511,8 +546,8 @@ def canonical_relay(probe: Probe) -> None:
     if relayed is None:
         return
 
-    peer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    peer.bind(("127.0.0.1", 0))
+    peer = socket.socket(probe.af, socket.SOCK_DGRAM)
+    peer.bind(probe.bind)
     # 1s, not 0.5s: under a loaded host (full lab + coturn in parallel) the
     # relay round trip occasionally exceeds half a second, which surfaced as
     # `send-indication-bytes bytes=0` and a false diff against coturn.
@@ -579,8 +614,8 @@ def canonical_wrong_user(
     if relayed is None:
         return
 
-    peer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    peer.bind(("127.0.0.1", 0))
+    peer = socket.socket(probe.af, socket.SOCK_DGRAM)
+    peer.bind(probe.bind)
     peer_address = peer.getsockname()
 
     probe.set_identity(other_user, other_password)
@@ -691,7 +726,7 @@ def canonical_loopback(probe: Probe) -> None:
         return
     # Only meaningful against a wildcard listener: the exact-address checks
     # cannot see 127.0.0.1:<listen-port>, the loopback rule must.
-    targets = [probe.server, ("127.0.0.1", 9)]
+    targets = [probe.server, (probe.bind[0], 9)]
     for index, target in enumerate(targets):
         transaction = probe._transaction()
         probe.expect_error_with_tid(
@@ -853,9 +888,23 @@ def main() -> int:
         "--wait", type=float, default=0.0,
         help="seconds to hold the nonce before using it (auth mode)",
     )
+    parser.add_argument(
+        "--family", choices=("inet", "inet6"), default="inet",
+        help="client/peer address family (inet6 binds ::1 and asserts an IPv6 relay)",
+    )
+    parser.add_argument(
+        "--show-relay", action="store_true",
+        help="print the relayed transport address (its port changes per run)",
+    )
     args = parser.parse_args()
 
-    host, _, port = args.server.rpartition(":")
+    # `[::1]:34980` for IPv6, `127.0.0.1:34980` for IPv4.
+    server = args.server
+    if server.startswith("["):
+        host, _, rest = server[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+    else:
+        host, _, port = server.rpartition(":")
     if not host or not port.isdigit():
         print(f"invalid --server {args.server!r}", file=sys.stderr)
         return 2

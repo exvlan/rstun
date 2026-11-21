@@ -195,6 +195,8 @@ ALLOW_NON_RSTUN = {
     "--release": "cargo build --release",
     "--rm": "docker run --rm",
     "--tls": "script/lab/rstun-turn.sh --tls",
+    "--only": "script/lab/rstun-turn.sh --only <item>（lab 的单项选择）",
+    "--family": "script/lab/rstun-turn-probe.py --family inet|inet6（探针的地址族）",
 }
 
 # ---- 收集 rstun 真正定义的 flag --------------------------------------------

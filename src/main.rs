@@ -1583,6 +1583,7 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
             rejected_ports = counts.rejected_ports,
             rejected_family = counts.rejected_family,
             rejected_loopback = counts.rejected_loopback,
+            rejected_df = counts.rejected_df,
             bytes_dropped_in = counts.bytes_dropped_in,
             bytes_dropped_out = counts.bytes_dropped_out,
             handshake_failed = counts.handshake_failed,

@@ -29,9 +29,18 @@
 //! the allocation's relay family: a mismatch is `443 Peer Address Family
 //! Mismatch` (§8.2 MUST), a match refreshes normally.
 //!
-//! Deliberately absent: TCP allocations (RFC 6062) and `DONT-FRAGMENT`
-//! (0x001A). DF stays an unknown comprehension-required attribute (`420`),
-//! which §7.2 step 4 explicitly allows for a server that does not set the bit.
+//! Deliberately absent: TCP allocations (RFC 6062).
+//!
+//! `DONT-FRAGMENT` (0x001A, §18.9) is supported where the DF bit can really be
+//! set — Linux and macOS/iOS, see [`DONT_FRAGMENT_SUPPORTED`]. `Allocate` with
+//! the attribute arms the relay socket (`IP_MTU_DISCOVER` / `IP_DONTFRAG`; a
+//! `setsockopt` failure there is a `500`), a `Send` indication carrying it sets
+//! the bit for that datagram only (§11.2 — if the bit cannot be applied the
+//! indication is **discarded**, as §11.2 requires), and `ChannelData` inherits
+//! the allocation's setting because it has no attribute part. Everywhere else
+//! (Windows, and unix targets without a verified option) `0x001A` stays unknown
+//! comprehension-required → `420`, which §7.2 step 4 explicitly allows for a
+//! server that does not set the bit.
 //!
 //! ## Accounting model
 //!
@@ -97,6 +106,11 @@ pub const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
 pub const ATTR_REQUESTED_ADDRESS_FAMILY: u16 = 0x0017;
 /// `REQUESTED-TRANSPORT` (§14.7): protocol (1 byte) + RFFU.
 pub const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
+/// `DONT-FRAGMENT` (§18.9): **no value part** (length 0). In `Allocate` it asks
+/// the server to set the DF bit on every datagram the relay sends, and doubles
+/// as a capability probe; in a `Send` indication it asks for the bit on that
+/// one datagram (§11.2).
+pub const ATTR_DONT_FRAGMENT: u16 = 0x001A;
 /// `EVEN-PORT` (§14.6): R bit + reserved. coturn's `turnutils_uclient` sends
 /// it on every Allocate, so T1 accepts the "even port" half of it.
 pub const ATTR_EVEN_PORT: u16 = 0x0018;
@@ -108,6 +122,26 @@ pub const TRANSPORT_UDP: u8 = 17;
 /// IANA protocol number of TCP (`REQUESTED-TRANSPORT = 6` → `442`, RFC 6062 is
 /// out of scope).
 pub const TRANSPORT_TCP: u8 = 6;
+
+/// Whether `DONT-FRAGMENT` can really be honoured (RFC 8656 §7.2 step 4).
+///
+/// True only on the platforms [`set_dont_fragment`] implements: Linux
+/// (`IP_MTU_DISCOVER`), macOS/iOS (`IP_DONTFRAG`). Everywhere else — Windows,
+/// and unix targets whose option names nobody has verified (FreeBSD & co.) —
+/// `0x001A` stays unknown comprehension-required and is answered `420`, which
+/// §7.2 step 4 permits for a server that does not set the bit.
+pub const DONT_FRAGMENT_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios"
+));
+
+// Compile-time guard: the flag must never be true where there is no
+// `setsockopt` path, otherwise `Allocate` would answer `500` where §7.2 step 4
+// sanctions the `420`. Checked by `cargo check --target
+// x86_64-pc-windows-msvc` (and by any non-Linux/macOS unix build).
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+const _: () = assert!(!DONT_FRAGMENT_SUPPORTED);
 
 /// RFC 8656 §14 error codes.
 pub const ERROR_FORBIDDEN: u16 = 403;
@@ -261,6 +295,11 @@ pub struct Counters {
     pub rejected_ports: AtomicU64,
     pub rejected_family: AtomicU64,
     pub rejected_loopback: AtomicU64,
+    /// `DONT-FRAGMENT` handling failures: a relay socket that refused the DF
+    /// option on `Allocate` (→ `500`), or a `Send` indication that had to be
+    /// discarded because the bit could not be applied (§11.2) or because the
+    /// attribute carried a value part (§18.9).
+    pub rejected_df: AtomicU64,
     /// Bytes dropped by the per-allocation bandwidth buckets (`--turn-bandwidth`).
     pub bytes_dropped_in: AtomicU64,
     pub bytes_dropped_out: AtomicU64,
@@ -282,6 +321,7 @@ pub struct Snapshot {
     pub rejected_ports: u64,
     pub rejected_family: u64,
     pub rejected_loopback: u64,
+    pub rejected_df: u64,
     pub bytes_dropped_in: u64,
     pub bytes_dropped_out: u64,
     pub handshake_failed: u64,
@@ -425,6 +465,19 @@ pub struct Allocation {
     /// the same value, not the remaining one (§6.2).
     lifetime: u32,
     client: SocketAddr,
+    /// The creating `Allocate` carried `DONT-FRAGMENT` (§18.9), so the relay
+    /// socket has the DF bit on for its whole life. A `Send` indication then
+    /// needs no per-datagram toggle.
+    dont_fragment: bool,
+    /// Serialises the per-datagram DF toggle **between `Send` indications that
+    /// ask for DF** (§11.2). Only touched when `dont_fragment` is false (an
+    /// allocation created with DF never toggles) and only by DF-carrying
+    /// `Send`s: two of them may be handled concurrently (`--max-inflight`), and
+    /// neither may observe the other's temporary setting. Plain `Send`s and
+    /// `ChannelData` deliberately stay lock-free — the known limitation is
+    /// recorded in `.trellis/spec/backend/turn.md`. The toggle is synchronous
+    /// (`setsockopt` + `try_send_to`), so a plain mutex is enough.
+    df_lock: Mutex<()>,
     state: Arc<RwLock<AllocationState>>,
     /// Aborts the relay reader when the allocation goes away.
     relay_task: JoinHandle<()>,
@@ -439,6 +492,7 @@ impl std::fmt::Debug for Allocation {
             .field("transaction_id", &self.transaction_id)
             .field("lifetime", &self.lifetime)
             .field("client", &self.client)
+            .field("dont_fragment", &self.dont_fragment)
             .finish_non_exhaustive()
     }
 }
@@ -534,6 +588,7 @@ impl Turn {
             rejected_ports: counters.rejected_ports.load(Ordering::Relaxed),
             rejected_family: counters.rejected_family.load(Ordering::Relaxed),
             rejected_loopback: counters.rejected_loopback.load(Ordering::Relaxed),
+            rejected_df: counters.rejected_df.load(Ordering::Relaxed),
             bytes_dropped_in: counters.bytes_dropped_in.load(Ordering::Relaxed),
             bytes_dropped_out: counters.bytes_dropped_out.load(Ordering::Relaxed),
             handshake_failed: counters.handshake_failed.load(Ordering::Relaxed),
@@ -940,6 +995,22 @@ impl Turn {
             }
         }
 
+        // `DONT-FRAGMENT` (§18.9, §7.2 step 4): no value part, so a non-zero
+        // length is malformed → 400. Whether the bit can actually be set is only
+        // knowable once the relay socket exists; that happens below.
+        let dont_fragment = match parse_dont_fragment(body) {
+            Ok(requested) => requested,
+            Err(()) => {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    protocol::ERROR_BAD_REQUEST,
+                    "Bad Request",
+                    identity,
+                ));
+            }
+        };
+
         let requested_lifetime = match parse_lifetime(body) {
             // RFC 8656 §6.2: an absent (or zero) LIFETIME means "server
             // default"; zero is only an explicit release on Refresh.
@@ -1200,6 +1271,25 @@ impl Turn {
             ));
         };
 
+        // §7.2 step 4 / §18.9: the client asked for every datagram from this
+        // relay to carry DF. A socket that refuses the option is an internal
+        // failure (`500`), not a protocol one — the capability probe already
+        // succeeded, so answering `420` would be a lie.
+        if dont_fragment && let Err(error) = set_dont_fragment(&relay, true) {
+            self.counters.rejected_df.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%peer, %error, "rstun: TURN relay socket refused DONT-FRAGMENT");
+            // Dropping the last `Arc` closes the socket; the port must go back
+            // to the pool explicitly (nothing references it yet).
+            self.release_port(relay_addr.port());
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                protocol::ERROR_SERVER_ERROR,
+                "Server Error",
+                identity,
+            ));
+        }
+
         let sink = match transport {
             ClientTransport::Udp => match context.socket_for(local) {
                 Some(socket) => ClientSink::Udp(socket.clone()),
@@ -1252,6 +1342,8 @@ impl Turn {
             transaction_id: *transaction_id,
             lifetime: granted,
             client: peer,
+            dont_fragment,
+            df_lock: Mutex::new(()),
             state,
             relay_task,
         };
@@ -1841,6 +1933,50 @@ impl Turn {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
+        // `DONT-FRAGMENT` in a `Send` indication (§11.2). Two shapes make the
+        // indication **undeliverable**, and both are silent discards (an
+        // indication has no error response, §7.3):
+        //   * a value part — §18.9 gives this attribute no value at all;
+        //   * a `setsockopt` failure — §11.2: the server then "acts as if the
+        //     DONT-FRAGMENT attribute is an unknown comprehension-required
+        //     attribute (and thus the Send indication is discarded)".
+        let per_datagram_df = match parse_dont_fragment(message.body) {
+            Ok(requested) => requested,
+            Err(()) => {
+                self.counters.rejected_df.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(%peer, "rstun: TURN Send dropped: malformed DONT-FRAGMENT");
+                return;
+            }
+        };
+        if per_datagram_df && !allocation.dont_fragment {
+            // Only DF-carrying `Send`s take this lock: two of them may be
+            // handled concurrently (`--max-inflight`) and the second must not
+            // observe the first's temporary setting. Plain `Send`s and
+            // `ChannelData` stay lock-free (known limitation, documented in
+            // `.trellis/spec/backend/turn.md`).
+            let _guard = lock_lock(&allocation.df_lock);
+            if let Err(error) = set_dont_fragment(&allocation.relay, true) {
+                self.counters.rejected_df.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    relay = %allocation.relay_addr,
+                    %error,
+                    "rstun: TURN Send dropped: DONT-FRAGMENT could not be applied"
+                );
+                return;
+            }
+            self.relay_to_peer(&allocation, data, peer_address);
+            if let Err(error) = set_dont_fragment(&allocation.relay, false) {
+                // The bit stays on for this allocation: a later datagram may be
+                // sent with DF it did not ask for, which is harmless, so only
+                // log it.
+                tracing::warn!(
+                    relay = %allocation.relay_addr,
+                    %error,
+                    "rstun: TURN relay socket kept DONT-FRAGMENT"
+                );
+            }
+            return;
+        }
         self.relay_to_peer(&allocation, data, peer_address);
     }
 
@@ -2164,6 +2300,123 @@ fn parse_requested_address_family(body: &[u8]) -> Result<Option<u8>, ()> {
     }
 }
 
+/// `DONT-FRAGMENT` (§18.9) has **no value part**.
+///
+/// `Ok(false)` = absent, `Ok(true)` = present and well formed, `Err(())` =
+/// present with a value (the attribute carries no bytes, so any length but 0
+/// is malformed).
+fn parse_dont_fragment(body: &[u8]) -> Result<bool, ()> {
+    match attribute(body, ATTR_DONT_FRAGMENT) {
+        None => Ok(false),
+        Some([]) => Ok(true),
+        Some(_) => Err(()),
+    }
+}
+
+/// Set (or clear) the IPv4/IPv6 **Don't Fragment** bit on a relay socket.
+///
+/// `socket2` has no MTU-discover setter, so this is the raw `setsockopt`:
+///
+/// * Linux — `IP_MTU_DISCOVER = IP_PMTUDISC_DO` (DF set, PMTU enforced) and
+///   back to `IP_PMTUDISC_WANT` (the kernel default) to clear it; IPv6 sockets
+///   use the same values under `IPV6_MTU_DISCOVER`.
+/// * macOS/iOS — `IP_DONTFRAG` / `IPV6_DONTFRAG`, an `int` of 1 or 0.
+/// * Everything else (Windows, FreeBSD & co.) — `Unsupported`. Those targets
+///   never get here for `Allocate` (`DONT_FRAGMENT_SUPPORTED` is false, so the
+///   attribute is answered `420` first); a `Send` indication carrying it is
+///   discarded, which is exactly §11.2's "treat it as unknown".
+fn set_dont_fragment(socket: &UdpSocket, on: bool) -> std::io::Result<()> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+    {
+        let _ = (socket, on);
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+    {
+        use std::os::fd::AsRawFd;
+
+        // A real `setsockopt` failure cannot be provoked from a test on a
+        // healthy socket, and §11.2's "cannot set DF ⇒ discard the indication"
+        // branch has to stay covered. Production builds compile the hook out.
+        #[cfg(test)]
+        if df_failure::failing() {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        }
+
+        // The IPv4 and IPv6 options are distinct on both platforms; an
+        // `AF_INET6` relay socket needs the v6 spelling (macOS rejects the v4
+        // one there).
+        let ipv6 = socket.local_addr().is_ok_and(|address| address.is_ipv6());
+
+        #[cfg(target_os = "linux")]
+        let (level, name, value) = {
+            let (level, name) = if ipv6 {
+                (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER)
+            } else {
+                (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER)
+            };
+            let value = if on {
+                libc::IP_PMTUDISC_DO
+            } else {
+                libc::IP_PMTUDISC_WANT
+            };
+            (level, name, value)
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let (level, name, value) = {
+            let (level, name) = if ipv6 {
+                (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG)
+            } else {
+                (libc::IPPROTO_IP, libc::IP_DONTFRAG)
+            };
+            (level, name, i32::from(on))
+        };
+
+        // SAFETY: the fd is owned by `socket` for the whole call (the borrow
+        // keeps it alive) and the option value is a live, correctly sized
+        // `c_int`, read by the kernel for exactly `size_of_val` bytes.
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                level,
+                name,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+/// Test-only switch that makes [`set_dont_fragment`] fail, so the §11.2
+/// "cannot set DF ⇒ discard the `Send` indication" path is exercised instead of
+/// only read. Thread-local: `#[tokio::test]` runs a current-thread runtime, so
+/// the server task sees the same flag, and parallel tests cannot interfere.
+///
+/// Same platform gate as the callers: on a target without a `setsockopt` path
+/// nothing would ever call it.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+pub(crate) mod df_failure {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAILING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn set(failing: bool) {
+        FAILING.with(|flag| flag.set(failing));
+    }
+
+    pub(crate) fn failing() -> bool {
+        FAILING.with(Cell::get)
+    }
+}
+
 /// Does `family` (0x01 IPv4 / 0x02 IPv6) name the address family of `relay`?
 ///
 /// Anything else (including `0x00` and `0x03`) is "not supported", which is
@@ -2180,6 +2433,13 @@ fn family_matches(family: u8, relay: IpAddr) -> bool {
 
 /// Unknown comprehension-required attributes *in the TURN dialect*.
 fn turn_unknown_attributes(body: &[u8]) -> Vec<u16> {
+    turn_unknown_attributes_with(body, DONT_FRAGMENT_SUPPORTED)
+}
+
+/// The same decision table with the platform capability **injected**, so both
+/// columns are reachable from a test on any host: the `false` column is exactly
+/// what a Windows or FreeBSD build does (there DF stays unknown → `420`).
+fn turn_unknown_attributes_with(body: &[u8], dont_fragment_supported: bool) -> Vec<u16> {
     let mut unknown: Vec<u16> = Vec::new();
     for attribute in protocol::attributes(body) {
         let attr_type = attribute.attr_type;
@@ -2187,6 +2447,9 @@ fn turn_unknown_attributes(body: &[u8]) -> Vec<u16> {
             continue;
         }
         if protocol::is_known_attribute(attr_type)
+            // `DONT-FRAGMENT` is understood only where the DF bit can actually
+            // be set (§7.2 step 4): elsewhere it must stay unknown → 420.
+            || (dont_fragment_supported && attr_type == ATTR_DONT_FRAGMENT)
             || matches!(
                 attr_type,
                 ATTR_CHANNEL_NUMBER

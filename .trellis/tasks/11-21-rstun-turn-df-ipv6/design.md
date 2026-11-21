@@ -16,7 +16,8 @@ libc = "0.2"
 
 ```rust
 /// DF 是否真的可用：unix 上编译期确定；Windows 走 420 兼容路径。
-const DONT_FRAGMENT_SUPPORTED: bool = cfg!(unix);
+const DONT_FRAGMENT_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos", target_os = "ios"));
 ```
 
 - `turn_unknown_attributes()`：仅当 `DONT_FRAGMENT_SUPPORTED` 时把 `0x001A` 视为已知，
@@ -60,7 +61,8 @@ fn set_dont_fragment(socket: &UdpSocket, on: bool) -> std::io::Result<()> {
   `rejected_df` 或复用 `rejected_ports`？建议新增最小计数并入 `/metrics` 的
   `rstun_turn_rejected_total{reason="df"}`，需同步 ops 与文档）。
 - **Send indication 带 DF**：若 allocation 未开 DF，则 `set(true)` → 发送 → `set(false)`；
-  失败只记日志并照常发送（不要因为 DF 失败而丢用户的媒体包）。若 allocation 已开 DF，无需切换。
+  **置位失败 → 丢弃该 indication**（RFC 8656 §11.2 要求「按未知 comprehension-required 处理」，
+  即不转发），计 `rejected_df` 并记日志。若 allocation 已开 DF，无需切换。
 
 ## 4. IPv6 relay 回归
 
