@@ -67,3 +67,18 @@ cargo deny check licenses bans sources
   `RAF` 长度≠4 本仓 400、coturn 440/443 —— 本仓有意统一 400。
 - 既有 flake（非本任务）：`script/lab/rstun-turn-probe.py` 的 peer `settimeout(0.5)` 在负载下偶发
   `send-indication-bytes` 差异；重跑即绿，未在本次修改。
+
+## 发版执行记录（26.410.102，主会话）
+
+| 项 | 结果 |
+| --- | --- |
+| 代码提交 | `28e51b3`（RAF 实现 + 测试 + lab + 文档/spec）|
+| 冷复核 | 两轮，第二轮「可提交（无阻塞）」；rstun vs coturn 同参数探针逐条一致 |
+| 版本/CHANGELOG | 提交 `e0a16cc`（`26.410.102`，Unreleased 定稿）|
+| 附带修复 | frozen 基线构建改注入 `RSTUN_BUILD_VERSION=<当前版本串>`（版本 bump 不再假红）|
+| 附带修复 | `rstun-turn-probe.py` peer 超时 0.5s → 1.0s（既有 flake）|
+| crates.io | ✅ `rstun 26.410.102`；干净安装 `cargo install` → `rstun 26.410.102` |
+| Release | ✅ run `44850731590` 11/11 作业；11 资产（lean+full 各 4 zip + 2 SBOM + `rstun.rb`）|
+| 镜像 | `ghcr.io/exvlan/rstun:26.410.102`（amd64+arm64，full）|
+| **新 manifest digest** | `sha256:62c766adb88d405a33134ac85f3d364122df72c79aaf9cf89e12502d25a6d66d` |
+| 版本钉死点 | README / docker.md / contrib{k8s,compose,helm×2} 全部 → `26.410.102` |

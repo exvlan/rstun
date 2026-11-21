@@ -7,7 +7,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/exvlan/rstun
-  tag: "26.410.101"
+  tag: "26.410.102"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
