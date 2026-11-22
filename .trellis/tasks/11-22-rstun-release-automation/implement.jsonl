@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/release-artifacts.md", "reason": "Release 资产/幂等/自动发布契约"}
+{"file": ".trellis/spec/backend/distribution.md", "reason": "tap/deb/版本钉死点口径"}
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "门禁与冻结对照"}
+{"file": ".trellis/spec/backend/ops.md", "reason": "指标与 /metrics 约束（post-release 校验用）"}

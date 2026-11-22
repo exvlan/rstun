@@ -30,7 +30,8 @@
     "11-20-rstun-ops-close-fix",
     "11-21-rstun-dep-upgrades",
     "11-21-rstun-dist-complete",
-    "11-21-rstun-perf-refresh"
+    "11-21-rstun-perf-refresh",
+    "11-22-rstun-release-automation"
   ],
   "parent": null,
   "relatedFiles": [],
