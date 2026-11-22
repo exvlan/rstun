@@ -225,3 +225,24 @@ interop 真失败在 `pion`。根因：CI 的 `golang-go` 是 **1.22.2**，而 `
 修复：`release-preflight` 与 `qa-scheduled`（明天首跑会踩同一坑）都改用
 `actions/setup-go`（锁 SHA `40f1582b…`，`go-version: 1.24.x`），并从 apt 列表移除 `golang-go`；
 interop 失败时额外打印 `$LOG_DIR/*build*.log` 便于定位。
+
+### P0-3 preflight 复验（2026-11-22，Go 修复后）
+
+run [45021336583](https://github.com/exvlan/rstun/actions/runs/45021336583) **completed/success**：
+
+```
+Check version pins                                    success
+Gates (tests + clippy + fmt)                          success
+Install lab dependencies (coturn + python3 + iproute2) success
+Interop matrix (all)                                  success   ← pion 在 go1.24 下通过
+TURN acceptance (lean)                                success
+TURN acceptance (full: --tls --dtls)                  success
+SBOM (lean + full)                                    success
+Build release binary (lean) and Debian package (amd64) success
+Render Homebrew formula (placeholder sha256)          success
+cargo publish --dry-run                               success
+Summary                                               success   ← verdict=PASS
+```
+
+对照首跑 `45020548183`：除 Summary 外同样全绿，但 `INTEROP=failure`（pion）→ Summary 正确判 FAIL。
+修复（`actions/setup-go` 1.24 + 移除 apt `golang-go` + 失败打印 build 日志）后全绿。
