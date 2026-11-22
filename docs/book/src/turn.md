@@ -68,6 +68,9 @@ rstun server \
   轮询只看 `(mtime,len)`：若覆盖时文件大小与 mtime 都没变（例如 `cp -p`/保留时间戳），轮询
   不会感知 —— 此时用 `kill -HUP <pid>` 强制重载。
   到期时间看 `rstun_turn_tls_cert_expires_seconds`（秒，`openssl x509 -enddate` 同值）。
+  没有 `--health-listen` 时**没有任何 `/metrics`**（TURN 指标族同样不可见），轮换的唯一证据是
+  日志行 `TURN TLS certificate reloaded cert=…` 加上「进程未重启」（`StartedAt`/`RestartCount`）；
+  要用指标核对或告警，请配 `--health-listen`（内网地址）。
   DTLS 私钥必须是 PKCS#8（`openssl genpkey`），证书算法 ECDSA P-256 或 Ed25519；自签证书在浏览器
   里需要手动信任（`chrome://flags` 或导入系统信任库），否则 `turns:` 会在 ICE 阶段直接失败。
 - **REST 时钟**：`username` 里的过期时间是**服务器本地时钟**（unix 秒）。过期判定严格
