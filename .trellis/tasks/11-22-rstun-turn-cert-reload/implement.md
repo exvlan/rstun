@@ -115,3 +115,24 @@ cargo check --all-targets --target x86_64-pc-windows-msvc
 - 未配置 `turns:`/DTLS 监听时不注册 SIGHUP（该场景下 SIGHUP 仍是默认处置=终止进程）；
 - `(mtime,len)` 都不变（`cp -p`/保留时间戳）时轮询不感知，需 `kill -HUP` 强制；
 - 重载器任务 panic 会导致轮换静默停止（`/healthz` 仍 200）——未加活性观测。
+
+## 发版执行记录（26.410.104，主会话）
+
+与 RFC 6062（出站 TCP allocation）合并发布。
+
+| 项 | 结果 |
+| --- | --- |
+| 版本提交 | `b53a8ed` |
+| crates.io | ✅ `rstun 26.410.104`；干净安装通过，`--turn-tcp-relay` 在 `--help` 中出现 |
+| Release | ✅ `rstun-v26.410.104`，**13 资产**（8 zip + 2 SBOM + rb + 2 deb）|
+| 镜像 | `ghcr.io/exvlan/rstun:26.410.104`（amd64+arm64，full）|
+| **manifest digest** | `sha256:549ba69ed3b1af2c90f92a1230b9a7e2db6c97629478dc1ea7a0ec993b7b79d6` |
+| deb 抽检 | `Version: 26.410.104`，解包执行 `26.410.104+b53a8e` |
+| Homebrew tap | 已同步 `.104`（类体与 Release `rstun.rb` 一致，3 个 sha256 逐条核对）|
+| 版本钉死点 | README / docker.md / contrib{k8s,compose,helm×2} → `.104` |
+
+### 首次发布失败（基础设施，不是代码）
+
+run `44989059835` 的 `Build (macos-x86_64)` 失败于 macOS runner 的 **DNS 故障**：
+`error sending request … dns error: failed to lookup address information`（拉 `channel-rust-1.95.toml.sha256`）。
+`gh run rerun --failed` 后全绿；镜像未被重建，digest 保持首次成功值。
