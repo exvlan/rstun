@@ -29,9 +29,9 @@ T2（`turns:`/DTLS）已归档，行为表现状写明「证书热加载：当�
 4. **可观测**：
    - 指标：重载成功/失败计数（固定标签集）；
    - 日志：成功（含文件路径与 mtime）与失败原因（不含私钥内容）；
-   - **到期剩余时间（gauge）不在本版**：唯一的解析器 `x509-parser` 只是 `dtls` 的传递依赖，
-     提升为直接依赖会让 tls-only 树多 27 条 lock、full 直接依赖 14→15，违反「不新增运行时依赖」。
-     作为后续独立评估项（见 `design.md` D4）。
+   - 指标：证书到期剩余秒数 gauge（`rstun_turn_tls_cert_expires_seconds`）；
+     用 `x509-parser 0.16`（optional，由 `tls` feature 启用；已在 lock 中，不新增 crate）。
+     连带：unix full 直接依赖 14→15、`gen-sbom.sh` 与 README 依赖面需同步（用户已拍板接受）。
 5. **文档**：`docs/book` 的 `turns:`/DTLS 章节、部署注意（`SIGHUP`/轮询）、README 摘要、spec、`CHANGELOG`。
 
 ## 非目标
@@ -44,7 +44,8 @@ T2（`turns:`/DTLS）已归档，行为表现状写明「证书热加载：当�
 
 ## 约束（硬）
 
-- **不新增运行时依赖**（`tokio` 的 `signal` feature 属于现有 crate；避免引入 `notify`/`inotify` 类库）。
+- 只允许新增 **`x509-parser`（optional，`tls` feature）**——它已在 lock 内；
+  不得引入 `notify`/`inotify` 等文件监视库（`tokio/signal` 已启用，SIGHUP 零依赖）。
 - 指标必须遵守固定标签集（不得出现 per-file/per-path 标签）；`--turn`/TLS 未启用时不得输出这些指标。
 - Windows/macOS/Linux 都能编译；非 unix 平台没有 `SIGHUP` 时靠轮询。
 - 校验失败**绝不**降级为明文、也不关闭监听器（只保留旧材料）。
@@ -58,6 +59,8 @@ T2（`turns:`/DTLS）已归档，行为表现状写明「证书热加载：当�
 - [ ] 坏材料（不配对 / RSA / 非 PKCS#8 / 截断）→ 旧证书继续服务、重载失败计数 +1、进程存活；
 - [ ] 先写 cert 后写 key 的中间态不会被误判（去抖/两次校验）；
 - [ ] `SIGHUP` 与轮询两条路径都能触发（在支持的平台上各验一次）；
-- [ ] 指标：`rstun_turn_tls_reload_total{result=ok|failed}` 符合固定标签集；未启用 TLS 时不出现；
+- [ ] 指标：`rstun_turn_tls_reload_total{result=ok|failed}` 与
+      `rstun_turn_tls_cert_expires_seconds` 符合固定标签集；未启用 TLS 时不出现；
+      到期值与 `openssl x509 -enddate` 相差 ≤ 60s；
 - [ ] 全量门禁绿（含 `cargo test --all-features`、lab `tls`/`dtls` 项、docs 校验）；
 - [ ] 文档/spec/CHANGELOG 同步，写清「新连接用新证书、已有会话按协议语义」。

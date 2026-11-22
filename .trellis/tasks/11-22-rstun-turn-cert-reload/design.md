@@ -9,7 +9,7 @@
 | **D1** | 触发方式 | **SIGHUP（unix）+ 文件轮询（30s）共用同一个 `reload()`** | `tokio/signal` **已启用**、`signal-hook-registry` 已在依赖树 ⇒ SIGHUP **零新依赖**；轮询覆盖 Windows 与「不发信号」场景；`notify` 会新增 7–8 个 lock 条目并违反 PRD 的「不新增运行时依赖」 |
 | **D2** | 替换粒度 | **整体替换 `Arc<ServerConfig>` + `Config`（不是只换证书）** | 与启动校验同源（`with_single_cert` / DTLS 算法约束），一次 swap 天然原子，不会出现 TLS/DTLS 半新半旧；代价：TLS1.2 session-id 缓存随 `ServerConfig` 重建清空（TLS1.3 ticket 默认本就不发）——写进文档 |
 | **D3** | 失败策略 | **保留旧材料 + `reload_total{result="failed"}` + warn 日志** | 写入竞态（先写 cert 后写 key）不应打掉全部会话；到期风险交给运维告警（见 D4 的日志字段） |
-| **D4** | 证书到期指标 | **本版不加 gauge**；重载成功日志里打印 `not_after`（ISO8601）与 `days_left` | 唯一的到期解析器 `x509-parser` 只是 `dtls` 的**传递**依赖，提升为直接依赖会让 tls-only 树多 27 条 lock、full 直接依赖 14→15，并破坏 `gen-sbom.sh` 的断言。自写 DER 扫描属未验证方向，不做。若将来需要 gauge，单独立项评估依赖 |
+| **D4** | 证书到期指标 | **加 `rstun_turn_tls_cert_expires_seconds` gauge**；引入 `x509-parser 0.16`（**optional，由 `tls` feature 启用**，用 `default-features = false`）| 用户 2026-11-22 拍板接受新增依赖。`x509-parser 0.16.0` 已在 `Cargo.lock`（经 `webrtc-dtls` 传递），提升为直接依赖**不新增 crate**；代价：tls-only 树增加其传递依赖、**unix full 直接依赖 14→15**（Windows 14）、`gen-sbom.sh` 的 `EXPECTED_DIRECT.full` 要改、README 依赖面与 spec 同步。lean（无 tls/dtls）**不受影响**（仍 10）|
 
 ## 2. 共享材料槽位
 
@@ -55,21 +55,21 @@ spawn_cert_reloader(paths, needs_dtls, slot, counters)
 4. `Ok` → 换槽位、`reload_ok += 1`、`info!(not_after, days_left)`（`not_after` 由 rustls 已解析的
    `CertificateDer` 里能拿到的信息？——**不能**：`ServerConfig` 不暴露 notAfter。见 §3.1）。
 
-### 3.1 `not_after` 的来源（重要）
+### 3.1 `not_after` 的来源
 
-`rustls` 的 `ServerConfig` 不回读证书的 `notAfter`，本版又不引入 `x509-parser`。因此：
-
-- 日志只打印**文件路径与 mtime**，以及「重载成功」；
-- `days_left` **不在本版提供**（PRD 里「到期剩余秒数」改为「可选、后续任务」）。
-
-> 决策修正：D4 从「日志打印 not_after」降级为「不提供到期信息」，避免为了日志字段引入解析器或手写 DER。
-> 运维可用外部工具（`openssl x509 -enddate`）检查文件，或等后续单独立项。
+- `rustls::ServerConfig` 不回读 `notAfter`，所以由 `x509-parser` 直接从**证书链第一个 DER**
+  解析 `tbs_certificate.validity.not_after`；
+- 启动时算一次、每次重载成功后重算；gauge 每次 `/metrics` 抓取时用「缓存的时间戳 − now」输出
+  （不在抓取时做解析）；
+- 解析失败（理论上不会：同一份 DER 已通过 rustls 校验）→ gauge 暴露为 `-1` 并 warn 一次；
+- 日志：成功时打印 `not_after`（RFC3339）与 `days_left`（保留 1 位小数）。
 
 ## 4. 指标（固定标签集）
 
 | 指标 | 类型 | 标签 |
 | --- | --- | --- |
 | `rstun_turn_tls_reload_total` | counter | `result="ok" \| "failed"` |
+| `rstun_turn_tls_cert_expires_seconds` | gauge | 当前生效证书的 `notAfter − now`（秒；负值表示已过期）|
 
 - 放在现有 `--turn` 指标块（`src/ops.rs:414-504`），沿用 `rstun_turn_` 前缀 ⇒ 不破坏
   `ops.rs:1526` 与 `turn/tests.rs:1984/2026` 的 gate 断言；
@@ -116,7 +116,19 @@ Windows 上的行为写进文档：**最坏 30s 生效**，无信号触发。
 
 单 commit；revert 即回到「启动时加载一次」。运行期无需开关（热载是纯增量能力）。
 
-## 10. 待确认（主会话/评审）
+## 10. 依赖与数字影响（D4 的连带清单）
+
+| 项 | 变化 |
+| --- | --- |
+| `Cargo.toml` | `x509-parser = { version = "0.16", optional = true, default-features = false }`；`tls = [..., "dep:x509-parser"]` |
+| lock | `x509-parser 0.16.0` 已在 lock（经 webrtc-dtls），**不新增 crate**；tls-only 树会多出其传递依赖 |
+| 直接依赖 | lean **10**（不变）/ unix full **15**（+1）/ Windows full **14** |
+| `script/ci/gen-sbom.sh` | `EXPECTED_DIRECT.full` 14 → **15**（否则发版失败）|
+| `README` 依赖面表 | full 15、并注明 `x509-parser` 用于证书到期指标（仅 tls/dtls 构建）|
+| spec | `turn.md`/`ops.md` 指标与依赖说明 |
+| `cargo deny` | `x509-parser`/`asn1-rs`/`der-parser` 均为 MIT/Apache-2.0（已在树内，无新 license）|
+
+## 11. 待确认
 
 1. 轮询间隔固定 30s 还是加 `--tls-cert-poll <secs>`（0=禁用）？**默认取固定常量**，除非评审要求可配。
 2. 是否要在 Windows 上也提供「命令触发」（例如 `--tls-reload-request-file`）？本设计**不做**。

@@ -3,7 +3,16 @@
 > 顺序：先「共享槽位」（不改行为）→ 再「SIGHUP」→ 再「轮询/去抖」→ 最后 lab 与文档。
 > 不 commit / 不 bump 版本（主会话执行）。
 
-## 阶段 0 · 共享材料槽位（行为不变）
+## 阶段 0a · 依赖与数字（`x509-parser`）
+
+| # | 事项 | 验证 |
+| --- | --- | --- |
+| 0a.1 | `Cargo.toml`：`x509-parser = { version = "0.16", optional = true, default-features = false }`，`tls = [..., "dep:x509-parser"]` | `cargo tree -e normal --depth 1` lean 仍 10；`--all-features` 15 |
+| 0a.2 | `script/ci/gen-sbom.sh`：`EXPECTED_DIRECT.full` 14 → 15 | `bash script/ci/gen-sbom.sh` 能跑通（或 --help 分支）|
+| 0a.3 | `README` 依赖面表：full 15（lean 10、Windows full 14），注明 x509 用于到期指标 | 人工评审 |
+| 0a.4 | `.trellis/spec/backend/{turn,ops,distribution}.md` 同步依赖数字与指标 | 人工评审 |
+
+## 阶段 0b · 共享材料槽位（行为不变）
 
 | # | 事项 | 验证 |
 | --- | --- | --- |
@@ -32,7 +41,8 @@
 
 | # | 事项 | 验证 |
 | --- | --- | --- |
-| 3.1 | `rstun_turn_tls_reload_total{result}`（`ops.rs` 固定标签集 + 文档 + 逐行断言）| `turn_metrics_appear_only_when_enabled` 更新 |
+| 3.1 | `rstun_turn_tls_reload_total{result}` + `rstun_turn_tls_cert_expires_seconds`（`ops.rs` 固定标签集 + 文档 + 逐行断言）| `turn_metrics_appear_only_when_enabled` 更新 |
+| 3.1b | `x509-parser` 解析链首 DER 的 `notAfter`：启动一次 + 每次重载后重算；gauge = 缓存时间戳 − now | 单测：与 `openssl x509 -enddate` 比对（±60s）|
 | 3.2 | 退出日志打印 ok/failed 计数 | 退出日志断言 |
 | 3.3 | `--turn` 未开/TLS 未启用时不出现该指标 | 现有 gate 测试 |
 
