@@ -148,6 +148,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # go 必须用 setup-go 装，**不能**用容器 apt 的 `golang-go`：
+      #   * buildpack-deps:trixie 的 golang-go 是 1.22.x，而 `github.com/pion/stun/v3`
+      #     的 go.mod 要求 `go 1.24.0` → 旧 go 会触发 **toolchain 自动下载**，
+      #     容器内该下载失败，表现为 `pion-build.log` 里构建失败（run 45020548183）；
+      #   * 同时把 golang-go 从 apt 列表里去掉：它会把 `/usr/bin/go`（1.22）留在
+      #     系统 PATH 里，一旦某个 shell 解析到它就又触发下载 —— 版本只能有一个来源。
+      # 容器内没有 sudo：setup-go 解压到 runner 的 tool cache（root 可写），不需要 sudo。
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+
       # `rstun-interop.sh all` 的对手：coturn（turnserver + turnutils_*）、go（pion）、
       # python3（探针，只用标准库）。容器里缺一样，脚本会记 SKIP 而不是失败 ——
       # 所以下面**显式断言「没有 SKIP」**，否则这个 job 会在缺依赖时假绿。
@@ -156,7 +168,14 @@ jobs:
           set -euo pipefail
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            coturn golang-go python3 iproute2 ca-certificates curl
+            coturn python3 iproute2 ca-certificates curl
+          # pion v3 的 go.mod 要求 go 1.24.0；低于它会触发 toolchain 下载（容器内必败）。
+          go_version="$(go version | awk '{print $3}')"
+          if [ "$(printf '%s\ngo1.24\n' "$go_version" | sort -V | head -1)" != go1.24 ]; then
+            echo "::error::interop 需要 go >= 1.24（pion v3 的 go.mod），实际 $go_version"
+            exit 1
+          fi
+          go version
 
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
@@ -183,6 +202,18 @@ jobs:
             echo "::error::interop 出现了白名单之外的 SKIP（依赖没装齐）："
             printf '%s\n' "$unexpected"
             status=1
+          fi
+          # 脚本 stdout 只有一行 `FAIL pion 构建失败（<path>）`，真正原因在它自己落的
+          # `$LOG_DIR/*build*.log`（pion/webrtc 的编译输出）。失败时打尾部到 stdout；
+          # 找不到日志就跳过 —— 诊断不改变退出状态。
+          if [[ "$status" -ne 0 ]]; then
+            logdir="${RSTUN_INTEROP_DIR:-/tmp/opencode/rstun-interop}/logs"
+            for f in "$logdir"/*build*.log; do
+              [[ -f "$f" ]] || continue
+              echo "::group::$(basename "$f") (tail -40)"
+              tail -40 "$f" || true
+              echo "::endgroup::"
+            done
           fi
           exit "$status"
 
