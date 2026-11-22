@@ -31,6 +31,14 @@
   `rstun_turn_bytes_total`；UDP 中继的带宽语义不变。
 - lab 新增 `tcprelay` 项；`cleanup` 的残留断言同时检查 UDP（`ss -lun`）与 TCP（`ss -ltn`）。
 
+### 修复：过期 allocation 被替换时的端口记账错误
+
+- 同一 5 元组在「TTL 已过但 1s 扫描尚未回收」的窗口内重新 `Allocate` 时，旧端口没有归还
+  （反而把**新**端口标成空闲）——UDP 与 TCP allocation 都受影响。短 TTL 反复重分配会逐步耗尽
+  端口池；TCP 下因 `SO_REUSEPORT` 还可能让两个 allocation 绑到同一端口。
+- 已改为归还**被替换项**的端口，并补回归测试 `reallocating_over_an_expired_entry_releases_the_old_port`。
+  默认路径的响应字节不变。
+
 ## 26.410.103
 
 ### TURN：`DONT-FRAGMENT`（0x001A）真实现 + IPv6 relay 回归
