@@ -100,3 +100,29 @@ cargo deny check
 | repo secret | `gh secret delete CARGO_REGISTRY_TOKEN` |
 | tap `sync.yml` | 在 tap 仓 revert（外部仓，单独提交）|
 | 已自动发布的版本 | `cargo yank --version X`（不可删除）|
+
+## 阶段执行记录
+
+### P0（2026-11-22，已完成待提交）
+
+| 项 | 结果 |
+| --- | --- |
+| P0-1 版本钉死点 | `check-version-pins.sh`（真源 Cargo.toml，`--version` 必须一致，`EXPECTED_PINS=6` 断言）；CI `version-pins` 作业；负例：改 README/helm → exit 1 且定位 `file:行`；删行 → 报「找不到检查点」；`--version` 冲突 → exit 1；`v` 前缀 strip 与 release.yml 同语义 |
+| P0-2 打包预检 | CI `packaging` 作业：`cargo package --list` 排除断言 + `cargo publish --dry-run`；负例（去掉 `exclude tests/**`）被捕获；已发布版本上 dry-run 不假红 |
+| P0-3 preflight | 11 段只读（pins→tests→clippy→fmt→interop→TURN lean/full→SBOM→deb→brew→publish dry-run→summary）；`fetch-depth: 0`；装 coturn/golang；SKIP 判失败；日志落 `/tmp` 不脏树；`timeout 90min` |
+| P0-4 post-release-verify | 对 `26.410.104` 逐段本机跑通：13 资产、四平台架构、deb 元数据、tap formula（**raw.githubusercontent.com**）+3 个 sha256、镜像 amd64+arm64、digest；负例版本 → 失败 |
+
+### 复核（第二轮）
+
+- 阻塞项 B1：`post-release-verify` 原用匿名 `gh api` 读 tap —— `gh` 无登录态直接拒绝（实测 exit=4），
+  且 App token 不跨仓（404）。改为 `raw.githubusercontent.com`（匿名 200、无限流、无需 base64）；
+- M2：去掉 workflow 级 `VERSION`，只由 Normalize 步骤写 `GITHUB_ENV`（输入 `v26.410.104` 实测归一化正确）；
+- M3：preflight deb 段注明「只验 nfpm 元数据，不验 musl/static-pie」；
+- M5：`EXPECTED_PINS=6` 断言（删掉一处 check_pin → exit 1，变异验证通过）；
+- M6：`check-docs` 的 `--dry-run` 白名单为精确名；反证（改错 `--health-listen`）仍报错。
+
+### P1 设计修正（复核连带）
+
+- crates.io 幂等检查必须带 `User-Agent`（实测无 UA → 403，有 UA → 200/404）；
+- `publish-crates` 拆成**可复用 workflow + dispatch 包装**，演练不触发 Release/镜像；
+- `release-prep` 增加 `dry_run`（只输出 diff 预演）。

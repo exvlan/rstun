@@ -5,9 +5,11 @@ name: CI
 #   smoke      native 二进制起服务，真发 20 字节 Binding Request（UDP + TCP）
 #   smoke-ipv6 单独验 `--listen-v6`（v6-only 绑定，可与 v4 同端口共存）
 #
-# 另有两条与平台无关的必需作业：
-#   deny       供应链（cargo-deny：licenses / bans / sources；advisories 由 cargo audit 覆盖）
-#   docs       文档漂移（`script/ci/check-docs.sh` 比对 help 片段/参数名/指标名/链接）+ mdbook 构建
+# 另有四条与平台无关的必需作业：
+#   deny        供应链（cargo-deny：licenses / bans / sources；advisories 由 cargo audit 覆盖）
+#   docs        文档漂移（`script/ci/check-docs.sh` 比对 help 片段/参数名/指标名/链接）+ mdbook 构建
+#   version-pins 版本号 6 处钉死点（README/docker.md/k8s/compose/helm×2）必须等于 Cargo.toml
+#   packaging   crate 打包预检（`cargo package --list` 排除项 + `cargo publish --dry-run`）
 #
 # 构建有两种 feature 组合，test 作业两种都跑：
 #   lean  `--no-default-features`  默认发布形态（STUN + TURN UDP/TCP + REST + 带宽）
@@ -181,6 +183,69 @@ jobs:
 
       - name: mdbook build
         run: mdbook build docs/book
+
+  # 版本钉死点：发版要把同一个版本号改 6 处（README / docs/book/src/docker.md /
+  # k8s / compose / helm Chart+values）。漏一处就是「文档说 A、实际发 B」——
+  # 用户照文档拉镜像 404。只读、无外部依赖，几秒就能跑完。
+  version-pins:
+    name: version pins (Cargo.toml ↔ 6 处)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Check version pins
+        run: bash script/ci/check-version-pins.sh
+
+  # 打包预检：把「发版时才发现 crate 包坏了」提前到每次 PR。
+  #   `cargo package --list` 断言排除项（fuzz/ 独立 workspace、tests/ 含一次性密钥夹具、
+  #   .github/.trellis/.env 与源码无关）；
+  #   `cargo publish --dry-run` 真跑一遍打包 + 从 package 内容编译（只写本地临时目录，
+  #   不联网发布，所以不需要任何 token）。
+  packaging:
+    name: packaging (crate package + publish --dry-run)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
+        with:
+          toolchain: 1.95
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: packaging-${{ runner.os }}-${{ runner.arch }}
+
+      # 清单落到 `$RUNNER_TEMP`（仓库目录之外）：`cargo publish --dry-run` 会检查
+      # 工作树是否 dirty，把中间文件写进仓库会让它无谓失败。
+      - name: Assert package contents
+        run: |
+          set -euo pipefail
+          list="$RUNNER_TEMP/pkg.txt"
+          cargo package --list --allow-dirty | tee "$list"
+          if grep -nE '^(fuzz/|tests/|\.github/|\.trellis/|\.env)' "$list"; then
+            echo "::error::crate 包里混进了不该发布的路径（见上面的 file:line）"
+            exit 1
+          fi
+          echo "包内容不含 fuzz/ tests/ .github/ .trellis/ .env"
+
+      # 版本只有一个真源：Cargo.toml。`cargo metadata --locked` 同时验证 Cargo.lock
+      # 没有漂移（依赖改了却没提交锁文件 → 这里先红，不用等 dry-run）。
+      - name: Assert version sources agree
+        run: |
+          set -euo pipefail
+          manifest_version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          metadata_version="$(cargo metadata --format-version 1 --no-deps --locked \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$manifest_version" != "$metadata_version" ]; then
+            echo "::error::Cargo.toml 的 version=${manifest_version} 与 cargo metadata 的 ${metadata_version} 不一致"
+            exit 1
+          fi
+          echo "version=${manifest_version}（Cargo.toml 与 cargo metadata 一致，Cargo.lock 已同步）"
+
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run
 
   # 覆盖率：只在 Linux 跑一份（行/区域覆盖与平台无关），**非阻塞**。
   #

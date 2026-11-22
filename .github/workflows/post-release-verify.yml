@@ -1,0 +1,370 @@
+name: Post-release verify
+
+# 发布后的**只读**验收：对已存在的 Release 逐项核对「用户实际拿到的东西」。
+#
+# 为什么不能只信发布流水线自己的自检：流水线验的是 build 作业里的文件，
+# 用户拿到的是 **Release 资产**（zip 解压后的权限位、deb 元数据、tap 的 sha256、
+# 镜像的 manifest）。中间任何一步（上传/覆盖/打包）出问题，只有对资产实测才能发现。
+#
+# 只读承诺：不建/改 Release、不 push、不 publish。`permissions` 只有
+# `contents: read` + `packages: read`（ghcr 包默认 private，匿名 401，
+# 只读 inspect 也需要登录一次 —— 用仓库自带 GITHUB_TOKEN，不需要额外 PAT）。
+#
+# 用法：Actions → Post-release verify → Run workflow，version 填**不带 v** 的版本号
+# （例如 26.410.104）。任一项失败 → 整个 workflow 红，step summary 里逐项 PASS/FAIL。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "已发布的版本号（不带 v，例如 26.410.104）"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  # ghcr 镜像默认 private：匿名 inspect 是 401，用 GITHUB_TOKEN 只读登录。
+  packages: read
+
+concurrency:
+  group: post-release-verify-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  # 不在这里定义 VERSION：它只从 Normalize 步骤写入的 `$GITHUB_ENV` 读取，
+  # 避免「workflow 级 env 与 GITHUB_ENV 谁优先」的歧义（输入可能带 v）。
+  # TAG 同样在第一个 step 里从规范化后的 VERSION 派生。
+  REPO: ${{ github.repository }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    name: verify (${{ inputs.version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # 与 release.yml 的 prepare 同语义：误带 `v` 前缀也接受；tag 从规范化后的版本派生。
+      # 输入只经 step env 传进来，之后所有步骤统一读 `$GITHUB_ENV` 的 VERSION（单一来源）。
+      - name: Normalize version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          {
+            echo "VERSION=${version}"
+            echo "TAG=rstun-v${version}"
+          } >>"$GITHUB_ENV"
+          echo "version=${version} tag=rstun-v${version}"
+
+      # ---- 1. 资产清单：13 个，且每个名字都对得上 -----------------------------
+      # 只数「13」不够：`--clobber` 重发时可能少一个多一个、或名字里的版本串没换。
+      # 这里既断言数量分布，也断言 11 个已知名字逐个在场。
+      - name: Assert release assets (13)
+        id: assets
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name' >assets.txt; then
+            echo "::error::Release $TAG 不存在（或取不到资产列表）——确认版本号与 tag"
+            exit 1
+          fi
+          sort -o assets.txt assets.txt
+          cat assets.txt
+          count="$(wc -l <assets.txt)"
+          zips="$(grep -cE '^rstun-.*\.zip$' assets.txt || true)"
+          lean="$(grep -cE '^rstun-(linux|macos|windows)-.*\.zip$' assets.txt || true)"
+          full="$(grep -cE '^rstun-full-.*\.zip$' assets.txt || true)"
+          sboms="$(grep -cE '^rstun-.*\.cdx\.json$' assets.txt || true)"
+          debs="$(grep -cE '^rstun_.*\.deb$' assets.txt || true)"
+          echo "assets=${count} zips=${zips}（lean=${lean} full=${full}） sbom=${sboms} deb=${debs}"
+          [ "$count" -eq 13 ] || { echo "::error::期望 13 个资产，实际 ${count}"; exit 1; }
+          [ "$zips" -eq 8 ] && [ "$lean" -eq 4 ] && [ "$full" -eq 4 ] ||
+            { echo "::error::期望 8 个 zip（4 lean + 4 full），实际 ${zips}（lean=${lean} full=${full}）"; exit 1; }
+          [ "$sboms" -eq 2 ] && [ "$debs" -eq 2 ] ||
+            { echo "::error::期望 2 份 SBOM + 2 个 deb，实际 sbom=${sboms} deb=${debs}"; exit 1; }
+          # 逐个名字核对（版本串写错/漏传会在这里暴露，而不是等到用户下载 404）。
+          for want in \
+            "rstun-linux-x86_64-${VERSION}.zip" \
+            "rstun-linux-aarch64-${VERSION}.zip" \
+            "rstun-macos-x86_64-${VERSION}.zip" \
+            "rstun-windows-x86_64-${VERSION}.zip" \
+            "rstun-full-linux-x86_64-${VERSION}.zip" \
+            "rstun-full-linux-aarch64-${VERSION}.zip" \
+            "rstun-full-macos-x86_64-${VERSION}.zip" \
+            "rstun-full-windows-x86_64-${VERSION}.zip" \
+            "rstun-${VERSION}-lean.cdx.json" \
+            "rstun-${VERSION}-full.cdx.json" \
+            "rstun.rb" \
+            "rstun_${VERSION}_amd64.deb" \
+            "rstun_${VERSION}_arm64.deb"; do
+            grep -qxF "$want" assets.txt || { echo "::error::缺少资产 ${want}"; exit 1; }
+          done
+          echo "13 个资产齐全且命名正确"
+
+      - name: Download assets
+        id: download
+        continue-on-error: true
+        if: steps.assets.outcome == 'success'
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          gh release download "$TAG" -R "$REPO" -p '*.zip' -p '*.deb' -p 'rstun.rb' -D dist
+          ls -l dist
+          [ "$(ls -1 dist/*.zip dist/*.deb dist/rstun.rb 2>/dev/null | wc -l)" -eq 11 ] ||
+            { echo "::error::下载到的文件数不是 11（8 zip + 2 deb + rstun.rb）"; exit 1; }
+
+      # ---- 2. 架构：四个 lean zip 解包后用 `file` 验证 -------------------------
+      # 只验 zip 能解、二进制架构对；不执行非本机架构的二进制（那是 QEMU 的事）。
+      - name: Verify binary architectures (4 lean zips)
+        id: arch
+        continue-on-error: true
+        if: steps.download.outcome == 'success'
+        run: |
+          set -euo pipefail
+          rm -rf extracted
+          for platform in linux-x86_64 linux-aarch64 macos-x86_64 windows-x86_64; do
+            dir="extracted/${platform}"
+            mkdir -p "$dir"
+            unzip -q "dist/rstun-${platform}-${VERSION}.zip" -d "$dir"
+            binary="$dir/rstun"
+            [ "$platform" = windows-x86_64 ] && binary="$dir/rstun.exe"
+            [ -f "$binary" ] || { echo "::error::rstun-${platform}-${VERSION}.zip 里没有 $(basename "$binary")"; exit 1; }
+            info="$(file -b "$binary")"
+            echo "${platform}: ${info}"
+            case "$platform" in
+              linux-x86_64) echo "$info" | grep -qE 'ELF .*x86-64' ;;
+              linux-aarch64) echo "$info" | grep -qE 'ELF .*ARM aarch64' ;;
+              macos-x86_64) echo "$info" | grep -qE 'Mach-O .*x86_64' ;;
+              windows-x86_64) echo "$info" | grep -qE 'PE32\+.*x86-64' ;;
+            esac || { echo "::error::${platform} 的架构与预期不符（见上）"; exit 1; }
+          done
+
+      # ---- 3. 版本串：x86_64 linux 真执行；并与 tag 指向的 sha6 对齐 -----------
+      # 资产里的版本是 `<version>+<sha6>`。sha6 必须等于 tag 指向的提交 ——
+      # 否则「tag 说 A、二进制来自 B」（tag 被 force 移动 / 资产覆盖错树）。
+      - name: Verify --version and tag commit
+        id: version
+        continue-on-error: true
+        if: steps.download.outcome == 'success'
+        run: |
+          set -euo pipefail
+          binary=extracted/linux-x86_64/rstun
+          # zip 内的可执行位必须保留（否则用户解压后 `./rstun` 直接 Permission denied）。
+          [ -x "$binary" ] || { echo "::error::zip 内 rstun 丢了可执行位"; exit 1; }
+          out="$("$binary" --version)"
+          echo "binary --version: ${out}"
+          case "$out" in
+            *"$VERSION"*) ;;
+            *) echo "::error::--version 输出不含 ${VERSION}"; exit 1 ;;
+          esac
+          object_sha="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha)"
+          object_type="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.type)"
+          # annotated tag 指向 tag 对象，要再解一层才拿到 commit。
+          if [ "$object_type" = tag ]; then
+            object_sha="$(gh api "repos/${REPO}/git/tags/${object_sha}" --jq .object.sha)"
+          fi
+          sha6="${object_sha:0:6}"
+          echo "tag ${TAG} -> commit ${object_sha}（sha6=${sha6}）"
+          case "$out" in
+            *"+${sha6}") ;;
+            *) echo "::error::二进制版本串（${out}）的 +sha6 与 tag 指向的提交（${sha6}）不一致"; exit 1 ;;
+          esac
+
+      # ---- 4. deb：元数据 + 解包后的二进制真执行 ------------------------------
+      - name: Verify Debian packages
+        id: deb
+        continue-on-error: true
+        if: steps.download.outcome == 'success'
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            deb="dist/rstun_${VERSION}_${arch}.deb"
+            info="$(dpkg-deb -I "$deb")"
+            echo "== ${deb}"
+            echo "$info" | sed -n '1,15p'
+            got_version="$(printf '%s\n' "$info" | sed -n 's/^ *Version: *//p' | head -n1)"
+            got_arch="$(printf '%s\n' "$info" | sed -n 's/^ *Architecture: *//p' | head -n1)"
+            [ "$got_version" = "$VERSION" ] ||
+              { echo "::error::${deb} 的 Version=${got_version}，期望 ${VERSION}"; exit 1; }
+            [ "$got_arch" = "$arch" ] ||
+              { echo "::error::${deb} 的 Architecture=${got_arch}，期望 ${arch}"; exit 1; }
+          done
+          # amd64 在本机可执行：解包后跑 --version（安装路径是 /usr/local/bin/rstun）。
+          rm -rf deb-root
+          dpkg-deb -x "dist/rstun_${VERSION}_amd64.deb" deb-root
+          deb_bin=deb-root/usr/local/bin/rstun
+          [ -f "$deb_bin" ] || { echo "::error::deb 里没有 /usr/local/bin/rstun"; exit 1; }
+          chmod +x "$deb_bin"
+          out="$("$deb_bin" --version)"
+          echo "deb binary --version: ${out}"
+          case "$out" in
+            *"$VERSION"*) ;;
+            *) echo "::error::deb 内二进制 --version 不含 ${VERSION}"; exit 1 ;;
+          esac
+
+      # ---- 5. tap formula：类体一致 + 3 个 sha256 与资产实测一致 --------------
+      # tap 由人工同步（本任务 P0 不改 tap 仓）：这里是「同步漏了」的唯一自动守卫。
+      - name: Verify tap formula (class body + sha256)
+        id: formula
+        continue-on-error: true
+        if: steps.download.outcome == 'success'
+        run: |
+          set -euo pipefail
+          # tap 是**另一个仓库**，这里必须用**匿名 curl 读 raw 端点**：
+          #   * 不用 `gh`：没有登录态时 `gh` 直接拒绝（实测 `gh_exit=4: please run gh auth login`），
+          #     与目标仓库是否 public 无关；
+          #   * 不用 `api.github.com`：共享 runner IP 上匿名限流只有 60 次/小时，且要 base64 解码；
+          #   * 本仓的 `GITHUB_TOKEN` 是 App token，权限只覆盖本仓，跨仓读会 404。
+          # raw.githubusercontent.com 匿名可读、无限流焦虑、内容就是文件原文（实测 200）。
+          # 失败必须显式红，不能静默跳过（PRD 要求该步真跑）。
+          if ! curl -fsSL \
+            https://raw.githubusercontent.com/exvlan/homebrew-rstun/main/Formula/rstun.rb \
+            >dist/tap-rstun.rb; then
+            echo "::error::取不到 tap 的 Formula/rstun.rb（raw.githubusercontent.com 失败：网络/路径/分支变了？）"
+            exit 1
+          fi
+          echo "tap formula 首行：$(head -n1 dist/tap-rstun.rb)"
+          python3 - "$VERSION" <<'PY'
+          import hashlib
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          dist = pathlib.Path("dist")
+          failures = []
+
+
+          def fail(msg):
+              failures.append(msg)
+
+
+          def class_body(path):
+              """从 `^class Rstun` 起算（tap 可能没有生成器注释；注释不参与比对）。"""
+              text = path.read_text(encoding="utf-8")
+              m = re.search(r"^class Rstun\b.*\Z", text, re.M | re.S)
+              if not m:
+                  raise SystemExit(f"{path}: 找不到 `^class Rstun`")
+              return m.group(0).rstrip() + "\n"
+
+
+          release = class_body(dist / "rstun.rb")
+          tap = class_body(dist / "tap-rstun.rb")
+          if release != tap:
+              fail("tap 的 Formula/rstun.rb 与 Release 的 rstun.rb 类体不一致（人工同步漏了？）")
+
+          # formula 里的 version 必须就是本次版本（两份都查：它们可能一起写错）。
+          for label, body in (("Release rstun.rb", release), ("tap rstun.rb", tap)):
+              if f'version "{version}"' not in body:
+                  fail(f"{label} 的 version 不是 {version}")
+
+          # url 与紧随其后的 sha256 成对出现（macOS / linux-aarch64 / linux-x86_64）。
+          pairs = re.findall(r'url "([^"]+\.zip)"\s*\n\s*sha256 "([0-9a-f]{64})"', release)
+          if len(pairs) != 3:
+              fail(f"formula 里应当有 3 组 url+sha256（macOS / linux-aarch64 / linux-x86_64），实际 {len(pairs)}")
+          seen = 0
+          for url, want_sha in pairs:
+              name = url.rsplit("/", 1)[-1]
+              if version not in name:
+                  fail(f"formula 的 url 里版本串不对：{url}")
+                  continue
+              zip_path = dist / name
+              if not zip_path.is_file():
+                  fail(f"formula 引用的资产没有下载到：{name}")
+                  continue
+              got_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+              if got_sha != want_sha:
+                  fail(f"{name} 的 sha256 不一致：formula={want_sha} 实测={got_sha}")
+              else:
+                  print(f"ok: {name} sha256={got_sha}")
+              seen += 1
+          if seen != 3:
+              fail(f"只核对了 {seen} 个资产（期望 3）")
+
+          if failures:
+              for item in failures:
+                  print(f"FAIL: {item}", file=sys.stderr)
+              sys.exit(1)
+          print("tap formula 与 Release 一致，3 个 sha256 与实测资产一致")
+          PY
+
+      # ---- 6. 镜像：manifest 必须同时含 amd64 与 arm64 ------------------------
+      # ghcr 包默认 private：匿名 inspect 会 401。用仓库自带的 GITHUB_TOKEN 只读登录
+      # （permissions.packages=read），不需要任何 PAT。
+      - name: Verify container image (multi-arch manifest)
+        id: image
+        continue-on-error: true
+        env:
+          # 不把 token 写进脚本正文（日志里会被 mask，但没有理由多一次暴露面）。
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]'):${VERSION}"
+          docker buildx version
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
+          docker buildx imagetools inspect "$image" | tee "$RUNNER_TEMP/image-inspect.txt"
+          # 报告给下游的必须是 manifest list digest（不是单架构 digest）。
+          grep -qE '^Digest: *sha256:[0-9a-f]{64}' "$RUNNER_TEMP/image-inspect.txt" ||
+            { echo "::error::没有拿到 manifest list digest"; exit 1; }
+          docker buildx imagetools inspect --raw "$image" >"$RUNNER_TEMP/image-index.json"
+          python3 - "$RUNNER_TEMP/image-index.json" <<'PY'
+          import json
+          import sys
+
+          index = json.load(open(sys.argv[1], encoding="utf-8"))
+          archs = sorted(
+              {
+                  m.get("platform", {}).get("architecture")
+                  for m in index.get("manifests", [])
+                  if m.get("platform")
+              }
+              - {None}
+          )
+          print("镜像平台:", archs)
+          missing = {"amd64", "arm64"} - set(archs)
+          if missing:
+              raise SystemExit(f"镜像缺少架构 {sorted(missing)}（实际 {archs}）—— 单架构不能冒充双架构")
+          PY
+
+      # ---- 7. 结论：逐项 PASS/FAIL + 任一失败让 workflow 红 -------------------
+      - name: Summary
+        if: always()
+        env:
+          ASSETS: ${{ steps.assets.outcome || 'skipped' }}
+          DOWNLOAD: ${{ steps.download.outcome || 'skipped' }}
+          ARCH: ${{ steps.arch.outcome || 'skipped' }}
+          VERSION_CHECK: ${{ steps.version.outcome || 'skipped' }}
+          DEB: ${{ steps.deb.outcome || 'skipped' }}
+          FORMULA: ${{ steps.formula.outcome || 'skipped' }}
+          IMAGE: ${{ steps.image.outcome || 'skipped' }}
+        run: |
+          set -euo pipefail
+          verdict=PASS
+          for outcome in "$ASSETS" "$DOWNLOAD" "$ARCH" "$VERSION_CHECK" "$DEB" "$FORMULA" "$IMAGE"; do
+            [ "$outcome" = success ] || verdict=FAIL
+          done
+          {
+            echo "## Post-release verify —— \`${VERSION}\`"
+            echo ""
+            echo "| 项 | 状态 |"
+            echo "| --- | --- |"
+            echo "| 1. 资产 13 个且命名正确 | ${ASSETS} |"
+            echo "| （下载 11 个待验资产） | ${DOWNLOAD} |"
+            echo "| 2. 四平台 zip 架构 | ${ARCH} |"
+            echo "| 3. --version 与 tag 提交 sha6 | ${VERSION_CHECK} |"
+            echo "| 4. deb 元数据 + 二进制 --version | ${DEB} |"
+            echo "| 5. tap formula 类体 + 3 个 sha256 | ${FORMULA} |"
+            echo "| 6. 镜像双架构 manifest | ${IMAGE} |"
+            echo "| **结论** | **${verdict}** |"
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [ "$verdict" != PASS ]; then
+            echo "::error::post-release verify 未通过（见 step summary 的逐项状态）"
+            exit 1
+          fi

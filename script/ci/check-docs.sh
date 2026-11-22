@@ -183,6 +183,7 @@ ALLOW_NON_RSTUN = {
     "--build-arg": "docker build",
     "--check": "cargo fmt --all -- --check",
     "--depth": "cargo tree",
+    "--dry-run": "cargo publish --dry-run（发版预检）",
     "--dtls": "script/lab/rstun-turn.sh --dtls",
     "--features": "cargo build/install",
     "--ignore-certificate-errors-spki-list": "Chrome（docs/browser-acceptance.md 的证书信任步骤）",

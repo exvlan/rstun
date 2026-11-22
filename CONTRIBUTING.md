@@ -23,6 +23,7 @@ cargo test --no-default-features
 cargo test --all-features
 cargo deny check licenses bans sources     # 供应链（licenses/bans/sources）
 bash script/ci/check-docs.sh               # 文档里的 help 片段/参数名/指标名/链接
+bash script/ci/check-version-pins.sh       # 版本号 6 处钉死点（README/docker.md/k8s/compose/helm×2）
 mdbook build docs/book                     # 文档站能构建（改了 docs/book 才需要）
 ```
 
@@ -34,7 +35,8 @@ mdbook build docs/book                     # 文档站能构建（改了 docs/bo
 | 限速 / 反射防护 / 准入 | `bash script/lab/rstun-abuse.sh`（10 组） |
 | TURN（`src/turn*`） | `bash script/lab/rstun-turn.sh`（lean；`--tls`/`--dtls` 自动 full 构建） |
 | 压测 / 混沌 | `bash script/lab/rstun-load.sh`、`bash script/lab/rstun-chaos.sh`（需 root + `tc`） |
-| 打包 / 发布 | `bash script/ci/build-deb.sh`、`.github/workflows/release.yml` 的资产断言 |
+| 版本号 / 镜像示例 / 部署清单 | `bash script/ci/check-version-pins.sh`（6 处钉死点必须一致） |
+| 打包 / 发布 | `bash script/ci/build-deb.sh`、`.github/workflows/release.yml` 的资产断言；发版前跑 `release-preflight.yml`，发布后跑 `post-release-verify.yml`（两个都只读）|
 
 CI 里这些作业**都是必需的**（`continue-on-error` 只出现在覆盖率作业上）。
 

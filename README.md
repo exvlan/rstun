@@ -105,6 +105,12 @@ cargo install rstun --features full       # crates.io（完整版）
 
 ### 发版：`.github/workflows/release.yml` 手动 dispatch
 
+发版前先跑一次**只读预检**（Actions → **Release preflight** → Run workflow，`version` 填同一个号）：
+版本钉死点 → 单测 + clippy + fmt（lean/full）→ 42 项互操作 → TURN lean + full（含 `frozen` 字节冻结）
+→ SBOM → deb → brew 渲染 → `cargo publish --dry-run`；任何一段没绿就先修，别发。发布后再跑
+**Post-release verify**（只读）：逐项核对 13 个资产、四平台 zip 架构、`--version` 与 tag 指向的 `sha6`、
+两个 deb、tap formula 的三个 sha256、镜像双架构 manifest，结果写进 run summary。
+
 传 `version`（**不带 `v`**，如 `26.410.100`）即可，一次 dispatch 交付两样：
 
 | 产出          | 内容                                                                                                                                 |
@@ -115,6 +121,10 @@ cargo install rstun --features full       # crates.io（完整版）
 
 - `prepare` 作业先校验 `version` 形如 `^\d+\.\d+\.\d+(-[...])?$`，且**必须等于 `Cargo.toml` 的
   `version`** —— 不一致直接失败，避免「tag 说 A、二进制说 B」。
+- 版本号有 **6 处钉死点**：README 的「已发布」、`docs/book/src/docker.md` 的镜像示例、
+  `contrib/k8s/deployment.yaml`、`contrib/docker/compose.yaml`、`contrib/helm/{Chart,values}.yaml`。
+  `script/ci/check-version-pins.sh`（CI 的 `version-pins` 作业）在每次 push/PR 校验它们与
+  `Cargo.toml` 一致，漏一处直接红。
 - 版本串以 `<version>+<sha6>` 注入（`RSTUN_BUILD_VERSION`），二进制作业与镜像作业都会自检
   `--version` 里含这个串。
 - musl 静态产物在 `ubuntu-24.04` / `ubuntu-24.04-arm` 上 native 构建并跑 UDP+TCP 冒烟；

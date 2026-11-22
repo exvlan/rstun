@@ -70,23 +70,31 @@ cargo publish --dry-run        # 验证能打包并构建
 
 ### 3.1 `release.yml` 新增 `publish-crates` 作业
 
+**结构**：可复用 workflow `.github/workflows/publish-crates.yml`（`workflow_call`，输入 `version`）
++ 一个薄 dispatch 包装（同名 `workflow_dispatch`，用于对历史版本做幂等演练，**不会**触发
+Release/镜像重建）。`release.yml` 里加一个 `publish-crates` 作业调用可复用件。
+
+> 为什么拆开：重跑 `release.yml` 会重建镜像 → 已发布版本的 digest 变化（对端记录的 digest 失效）。
+> 演练只能走 dispatch 包装。
+
 ```yaml
-publish-crates:
-  needs: [prepare, build]
-  runs-on: ubuntu-24.04
-  steps:
-    - checkout
-    - uses: actions-rust-lang/setup-rust-toolchain (锁 SHA)
-    - name: Skip if already published
-      run: |
-        if curl -fsS "https://crates.io/api/v1/crates/rstun/${{ needs.prepare.outputs.version }}" >/dev/null; then
-          echo "already published; skipping" >> "$GITHUB_STEP_SUMMARY"; echo "skip=1" >> $GITHUB_ENV
-        fi
-    - name: cargo publish
-      if: env.skip != '1'
-      env:
-        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      run: cargo publish
+# publish-crates.yml（workflow_call + workflow_dispatch，输入 version）
+steps:
+  - checkout
+  - uses: actions-rust-lang/setup-rust-toolchain (锁 SHA)
+  - name: Skip if already published
+    run: |
+      # crates.io 对**无 User-Agent** 的请求回 403（复核实测），必须带 UA。
+      if curl -fsS -A 'rstun-release/1.0 (+https://github.com/exvlan/rstun)' \
+           "https://crates.io/api/v1/crates/rstun/${VERSION}" >/dev/null; then
+        echo "already published; skipping" >> "$GITHUB_STEP_SUMMARY"
+        echo "skip=1" >> "$GITHUB_ENV"
+      fi
+  - name: cargo publish
+    if: env.skip != '1'
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    run: cargo publish
 ```
 
 - 与 `release` 作业并行（互不阻塞）；失败只让工作流红，不撤 Release；
@@ -115,8 +123,10 @@ jobs:
 - 无 PAT；不需要主仓权限；
 - 也可在 tap 仓加 `repository_dispatch` 由主仓发布后触发（需主仓 token 写 tap，故选轮询更简单）。
 
-### 3.3 `release-prep.yml`（dispatch: version）
+### 3.3 `release-prep.yml`（dispatch: version + `dry_run`）
 
+0. **`dry_run`（默认 `false`）**：为 `true` 时只计算并输出将要修改的行（`git diff` 预演），
+   不 commit、不打 tag、不 dispatch —— 用于安全演练；
 1. 校验 version 格式与 `> Cargo.toml` 当前值（防止重复/回退）；
 2. `sed` 改 `Cargo.toml` 版本 + `cargo metadata` 刷新 lock；
 3. `CHANGELOG.md`：`## Unreleased` → `## <version>`；
