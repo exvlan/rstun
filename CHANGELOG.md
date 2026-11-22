@@ -12,7 +12,7 @@
 - **发布后验收 `post-release-verify`**（只读）：13 资产命名、四平台 zip 架构、`--version` 与 tag
   指向一致、两个 deb 的版本/架构、Homebrew formula 类体与 3 个 sha256、镜像 amd64+arm64 manifest。
 - **CI 新增 `version-pins` 与 `packaging` 作业**：6 处版本钉死点必须等于 `Cargo.toml`；
-  `cargo package --list` 断言打包内容、`cargo publish --dry-run` 提前暴露打包问题。
+  `cargo package` 的清单断言（不含夹具/密钥）与 `cargo publish --dry-run` 提前暴露打包问题。
 - **crates.io 自动发布**（`publish-crates`，`release.yml` 内并行作业）：**幂等**（已发布即跳过，
   重跑不红）；版本必须等于检出树的 `Cargo.toml`。
 - **`release-prep` 一键发版**：bump `Cargo.toml`/lock、收口 `## Unreleased`、同步 6 处钉死点、
