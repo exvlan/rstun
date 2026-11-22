@@ -3,6 +3,23 @@
 版本线**独立于任何宿主项目**：`YY.QMM.Mmpp`（年.季度月.月日+序号），首发 `26.410.100`。
 `rstun-v*` 的 Release tag / 镜像 tag / 资产名都用这里给出的版本号。
 
+## Unreleased
+
+### 发布与回归自动化（维护者可见）
+
+- **发版前预检 `release-preflight`**（只读）：版本钉死点、测试/clippy/fmt、interop 矩阵、
+  TURN lean/full、SBOM、deb/brew 渲染、`cargo publish --dry-run` 一次跑完，结论写 step summary。
+- **发布后验收 `post-release-verify`**（只读）：13 资产命名、四平台 zip 架构、`--version` 与 tag
+  指向一致、两个 deb 的版本/架构、Homebrew formula 类体与 3 个 sha256、镜像 amd64+arm64 manifest。
+- **CI 新增 `version-pins` 与 `packaging` 作业**：6 处版本钉死点必须等于 `Cargo.toml`；
+  `cargo package --list` 断言打包内容、`cargo publish --dry-run` 提前暴露打包问题。
+- **crates.io 自动发布**（`publish-crates`，`release.yml` 内并行作业）：**幂等**（已发布即跳过，
+  重跑不红）；版本必须等于检出树的 `Cargo.toml`。
+- **`release-prep` 一键发版**：bump `Cargo.toml`/lock、收口 `## Unreleased`、同步 6 处钉死点、
+  commit/push、打 tag、dispatch release；`dry_run` 默认 `true`（只出预演，不写远端）。
+- **Homebrew tap 自动同步**：`exvlan/homebrew-rstun` 每日 05:30 UTC 反向拉取最新 Release 的
+  formula（内容不变则不提交，零 PAT）。
+
 ## 26.410.104
 
 ### TURN：`turns:` / DTLS 证书热加载（`SIGHUP` + 30s 轮询，免重启）
