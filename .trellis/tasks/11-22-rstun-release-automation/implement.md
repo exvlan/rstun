@@ -146,3 +146,20 @@ Summary                                 success
 
 即 P0 的「发布后验收」不再依赖人肉核对：13 资产、四平台架构、`--version` 与 tag sha6 对齐、两个 deb、
 tap formula 类体与 3 个 sha256、镜像 amd64+arm64 全部由 workflow 断言。
+
+## P1 决策记录（主会话，2026-11-22）
+
+| # | 取舍 | 决定 | 理由 |
+| --- | --- | --- | --- |
+| 1 | `publish-crates` 的前置 | **`needs: [prepare, build]`（保持）** | 构建矩阵坏了就不该发 crate：crate 只依赖源码，但「四平台编不出」是更基础的信号；30–50s 的等待可接受 |
+| 2 | crate 与 Release 资产是否互相阻塞 | **不阻塞（保持并行）** | 两者失败面不同：资产坏可 `--clobber` 重发；crate 错只能 yank + 新版本。任一红都由人介入，不该互相拖死 |
+| 3 | tap 同步状态 | **已合入并实测**（`exvlan/homebrew-rstun` 的 `sync.yml`，每日 05:30 UTC） | spec 里「属 P1-2、合入前人工」的旧表述已纠正；`post-release-verify` 的 formula 段是漏同步的自动守卫 |
+| 4 | `## Unreleased` 缺失 | **保持 fail-fast，不预置空段** | `release-prep` 依赖该段；预置空段会发出「没有 changelog 的版本」。已在 `CONTRIBUTING.md` 写「合入功能时维护 Unreleased」 |
+| 5 | `main` 分支保护 | **当前未保护**（`protected=false`），prep 直接 push | 若将来开启保护，prep 会 fail-fast；届时改用「测试分支演练 + merge」 |
+
+## 下次发版的操作前提（写给未来的自己）
+
+1. 合入功能/修复时在 `CHANGELOG.md` 顶部维护 `## Unreleased`（否则 prep 拒绝）；
+2. 发版前跑 `release-preflight`（只读，30–50 分钟）；
+3. `release-prep` 先 `dry_run=true` 看 diff，再 `dry_run=false`；
+4. 发布后跑 `post-release-verify`，并确认 tap 同步（最迟次日 05:30 UTC，也可手动 dispatch）。
