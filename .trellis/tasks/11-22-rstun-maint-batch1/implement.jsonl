@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/turn.md", "reason": "TLS/DTLS 证书与服务契约（含热载语义）"}
+{"file": ".trellis/spec/backend/ops.md", "reason": "指标固定标签集（reload_total/expires_seconds）"}
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "性能测量契约（busy%、100k 客户端饱和）"}
+{"file": ".trellis/spec/backend/distribution.md", "reason": "体积/依赖面口径"}

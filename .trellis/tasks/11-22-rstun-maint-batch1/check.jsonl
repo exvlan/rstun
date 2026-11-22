@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/turn.md", "reason": "TLS/DTLS 证书与服务契约（含热载语义）"}
+{"file": ".trellis/spec/backend/ops.md", "reason": "指标固定标签集（reload_total/expires_seconds）"}
