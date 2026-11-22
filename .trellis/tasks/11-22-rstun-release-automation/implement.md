@@ -192,3 +192,36 @@ Summary                                 success
 - 幂等与 dry_run 的门控从 `env.*`（`GITHUB_ENV` 在 step-level `if:` 的可见性无文档保证）
   改为 `steps.<id>.outputs`；实测四态（200/404/403/000）与 dry_run 三层保证；
 - 补发/演练的 `--ref` 规则写进 README/spec，并注明 `26.410.104` 及更早的 tag 无该文件（只能 `--ref main`）。
+
+### P1-3 `release-prep` dry_run 演练（Actions，2026-11-22）
+
+- 第一次 run `45020950315` **按设计失败**在 `Retitle CHANGELOG` —— 因为 `CHANGELOG.md` 当时没有
+  `## Unreleased`（fail-fast 生效，且发生在任何写入之前）；
+- 补上 `## Unreleased`（本次自动化条目）后重跑 run
+  [45021188926](https://github.com/exvlan/rstun/actions/runs/45021188926) **completed/success**：
+
+```
+Preconditions (branch + clean tree + git identity) success
+Normalize and validate version                     success
+Bump Cargo.toml and refresh Cargo.lock             success
+Retitle CHANGELOG                                  success
+Bump version pins                                  success
+Preview (dry_run)                                  success
+Commit and push                                    skipped   ← 零远端写
+Tag and push tag                                   skipped
+Dispatch release workflow                          skipped
+Summary                                            success
+```
+
+即：预演路径（默认 `dry_run=true`）在 Actions 上完整跑通，且**没有产生 commit/tag/dispatch**。
+写入路径的证据来自本地裸仓演练（commit/tag 指向 bump commit、重打 tag 拒绝且不 force、dispatch 带 `--ref`）。
+
+### preflight 首次真跑发现的环境缺陷（已修）
+
+run `45020548183`：除 Summary 外全部 success，Summary 判 FAIL —— **判定正确**：
+interop 真失败在 `pion`。根因：CI 的 `golang-go` 是 **1.22.2**，而 `pion/stun v3.1.7` 要求 **go 1.24.0**
+→ `go mod tidy` 触发 toolchain 自动下载，CI 网络下失败（本地 Go 1.24.4，所以一直绿）。
+
+修复：`release-preflight` 与 `qa-scheduled`（明天首跑会踩同一坑）都改用
+`actions/setup-go`（锁 SHA `40f1582b…`，`go-version: 1.24.x`），并从 apt 列表移除 `golang-go`；
+interop 失败时额外打印 `$LOG_DIR/*build*.log` 便于定位。
