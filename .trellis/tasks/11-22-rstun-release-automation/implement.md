@@ -163,3 +163,32 @@ tap formula 类体与 3 个 sha256、镜像 amd64+arm64 全部由 workflow 断�
 2. 发版前跑 `release-preflight`（只读，30–50 分钟）；
 3. `release-prep` 先 `dry_run=true` 看 diff，再 `dry_run=false`；
 4. 发布后跑 `post-release-verify`，并确认 tap 同步（最迟次日 05:30 UTC，也可手动 dispatch）。
+
+### P1-1 幂等 Actions 真跑（2026-11-22）
+
+`gh workflow run publish-crates.yml --ref main -f version=26.410.104` → run
+[45020473352](https://github.com/exvlan/rstun/actions/runs/45020473352) **completed/success**：
+
+```
+Normalize version                       success
+Validate version against Cargo.toml     success
+Skip if already published               success   ← 命中 200 → skip=1
+Guard token                             skipped
+cargo publish                           skipped
+Summary                                 success
+```
+
+即：**已发布版本重跑不红、不需要 token、不会重复上传**。`--ref main` 的原因：
+`rstun-v26.410.104` 的 tag 树里还没有本 workflow 文件（它 2026-11-22 才落地）。
+
+### P1-2 tap 反向同步（2026-11-22 已合入）
+
+- `exvlan/homebrew-rstun/.github/workflows/sync.yml`：每日 05:30 UTC + 手动 dispatch；
+- 实测 run `45018325505`：`latest rstun release: rstun-v26.410.104` → 内容无变化 → **不产生提交**
+  （tap HEAD 仍是 `739de12`）；零 PAT、只用 tap 自己的 `GITHUB_TOKEN`。
+
+### 复核修正（P1）
+
+- 幂等与 dry_run 的门控从 `env.*`（`GITHUB_ENV` 在 step-level `if:` 的可见性无文档保证）
+  改为 `steps.<id>.outputs`；实测四态（200/404/403/000）与 dry_run 三层保证；
+- 补发/演练的 `--ref` 规则写进 README/spec，并注明 `26.410.104` 及更早的 tag 无该文件（只能 `--ref main`）。
