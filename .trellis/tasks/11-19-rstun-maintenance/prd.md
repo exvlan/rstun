@@ -39,9 +39,9 @@
 
 ## 验收标准
 
-- [ ] M1：`cargo install rstun` 在干净环境成功；crates.io 页面可访问且版本正确
-- [ ] M2：arm64 与 macOS x86_64 各有一份实跑证据（命令 + 输出）写入 `research/`
-- [ ] M3：至少一次「发布前矩阵全绿 + fuzz 10 分钟无崩溃」的完整记录
+- [x] M1：`cargo install rstun` 在干净环境成功；crates.io 页面可访问且版本正确（`26.410.100` 起，逐版复验）
+- [x] M2：arm64 与 macOS x86_64 各有一份实跑证据（见 `research/M2-platform-evidence.md`）
+- [x] M3：至少一次「发布前矩阵全绿 + fuzz 10 分钟无崩溃」的完整记录（见 `research/M3-long-term-regression.md`）
 
 ## 风险
 

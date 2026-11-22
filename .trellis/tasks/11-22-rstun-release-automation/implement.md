@@ -246,3 +246,16 @@ Summary                                               success   ← verdict=PASS
 
 对照首跑 `45020548183`：除 Summary 外同样全绿，但 `INTEROP=failure`（pion）→ Summary 正确判 FAIL。
 修复（`actions/setup-go` 1.24 + 移除 apt `golang-go` + 失败打印 build 日志）后全绿。
+
+### qa-scheduled 首跑预演（2026-11-22）
+
+run [45021337538](https://github.com/exvlan/rstun/actions/runs/45021337538) **completed/success**：
+
+```
+interop matrix (container: buildpack-deps:trixie + coturn + go 1.24)  success
+fuzz (parse, 600s)                                                   success
+bench smoke (numbers only)                                           success
+```
+
+- 容器内 interop 通过 → 证明 setup-go 修复在容器 job 同样有效（明天 04:00 UTC 定时首跑不会再因 pion 红）；
+- fuzz 600s 无崩溃 → 同时作为维护任务 M3 的证据（见 `11-19-rstun-maintenance/research/M3-long-term-regression.md`）。
