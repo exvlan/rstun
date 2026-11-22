@@ -71,6 +71,12 @@
 2. 反证：桩 `/metrics` 缺 counter → exit 1；`ok` 冻结 → exit 1。
 3. `rstun-chaos.sh`：`--only reorder` 连跑 **8 次全绿**（含恰好 230 应答的一次）；整盘 3 次全绿；结束后 `qdisc noqueue`、`lo mtu 65536`。
 4. 覆盖率：lcov 的 `SF:` 只含源文件（不含 `tests_interop.rs`）；summary 与 lcov 口径一致。
+4a. interop 的 **Go 依赖下界**：`pion/stun v3` 的 `go.mod` 要求 **go 1.24.0**，
+   而 Ubuntu 24.04 / `buildpack-deps:trixie` 的 `golang-go` 是 1.22.x —— 用 apt 版会触发
+   `GOTOOLCHAIN=auto` 下载，CI 网络下失败（表现为 `FAIL pion`，细节只在
+   `$RSTUN_INTEROP_DIR/logs/pion-build.log`）。因此 preflight/qa 必须用
+   `actions/setup-go`（`go-version: 1.24.x`）并**从 apt 列表移除 `golang-go`**，
+   同时保留 `go >= 1.24` 断言；interop 失败时必须打印 `*build*.log` 尾部。
 5. workflow：`yaml.safe_load` 通过；`permissions` 含 `issues: write`；action 全为 40 位 SHA。
 
 ## 7. Wrong vs Correct
