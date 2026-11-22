@@ -204,6 +204,12 @@ Options:
           TURN: per-allocation bandwidth cap in bytes/second, each direction (default 1 MiB/s; 0 =
           unlimited). Over the cap packets are dropped
 
+      --turn-tcp-relay
+          TURN: also serve RFC 6062 **TCP allocations** (`REQUESTED-TRANSPORT=6`, outbound `Connect`
+          + `ConnectionBind`). Off by default: without it a TCP Allocate is still `442` and the
+          byte-frozen path is untouched. The passive mode (`ConnectionAttempt`, `uclient -P`) is not
+          implemented yet
+
   -h, --help
           Print help (see a summary with '-h')
 ```

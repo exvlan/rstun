@@ -481,6 +481,24 @@ impl OpsState {
                 counts.expired,
             );
 
+            // RFC 6062 (`--turn-tcp-relay`): live data connections and the
+            // per-reason refusal counters. Same fixed label style as above.
+            header(
+                &mut out,
+                "rstun_turn_tcp_connections",
+                "Live RFC 6062 TCP data connections by state (pending = Connect \
+                 succeeded, waiting for ConnectionBind).",
+                "gauge",
+            );
+            for (state, value) in [("pending", counts.tcp_pending), ("bound", counts.tcp_bound)] {
+                sample(
+                    &mut out,
+                    "rstun_turn_tcp_connections",
+                    &[("state", state)],
+                    value,
+                );
+            }
+
             header(
                 &mut out,
                 "rstun_turn_rejected_total",
@@ -493,6 +511,11 @@ impl OpsState {
                 ("family", counts.rejected_family),
                 ("loopback", counts.rejected_loopback),
                 ("df", counts.rejected_df),
+                ("tcp_connect", counts.rejected_tcp_connect),
+                ("tcp_bind", counts.rejected_tcp_bind),
+                ("tcp_send", counts.rejected_tcp_send),
+                ("tcp_buffer", counts.rejected_tcp_buffer),
+                ("tcp_quota", counts.rejected_tcp_quota),
             ] {
                 sample(
                     &mut out,

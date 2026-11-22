@@ -10,7 +10,7 @@
 #   bash script/lab/rstun-turn.sh --no-build       # 复用 target/debug/rstun（探测其 feature）
 #   bash script/lab/rstun-turn.sh --tls --dtls     # 只跑 TLS/DTLS 项（自动 --features full 构建）
 #   bash script/lab/rstun-turn.sh --only relay     # 只跑一项
-#     （startup|relay|auth|lifecycle|wrong-user|raf|df|ipv6relay|wildcard|
+#     （startup|relay|tcprelay|auth|lifecycle|wrong-user|raf|df|ipv6relay|wildcard|
 #       permission-limit|quota|ports|tls|dtls|rest|bandwidth|cleanup|frozen|coturn）
 #   bash script/lab/rstun-turn.sh --keep           # 保留日志（默认只清进程）
 #   FROZEN_BASE=<sha> bash script/lab/rstun-turn.sh --only frozen
@@ -67,7 +67,7 @@ FAILED=()
 SKIPPED=()
 PASSED=()
 
-ALL_ITEMS=(startup relay auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls rest bandwidth cleanup frozen coturn)
+ALL_ITEMS=(startup relay tcprelay auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls rest bandwidth cleanup frozen coturn)
 
 usage() {
   sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
@@ -103,7 +103,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [[ -n "$ONLY" ]]; then
   case "$ONLY" in
-    startup | relay | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | rest | bandwidth | cleanup | frozen | coturn) : ;;
+    startup | relay | tcprelay | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | rest | bandwidth | cleanup | frozen | coturn) : ;;
     *) echo "--only 未知项: $ONLY（可用：${ALL_ITEMS[*]}）" >&2; exit 2 ;;
   esac
 fi
@@ -168,6 +168,13 @@ metric() { # name
 relay_listeners() {
   # Listening UDP sockets whose local port is inside the relay range.
   ss -lunH 2>/dev/null | awk '{print $4}' | awk -F: -v lo="$RELAY_LO" -v hi="$RELAY_HI" '
+    { port = $NF + 0; if (port >= lo && port <= hi) print $NF }
+  ' | sort -u
+}
+
+relay_tcp_listeners() {
+  # RFC 6062 TCP relay listeners are LISTEN sockets, invisible to `ss -lun`.
+  ss -ltnH 2>/dev/null | awk '{print $4}' | awk -F: -v lo="$RELAY_LO" -v hi="$RELAY_HI" '
     { port = $NF + 0; if (port >= lo && port <= hi) print $NF }
   ' | sort -u
 }
@@ -331,6 +338,54 @@ run_relay() {
     ok "$name-probe" "$(grep -c '^ok:' "$LOG_DIR/$name-probe.log") assertions"
   else
     fail "$name-probe" "see $LOG_DIR/$name-probe.log"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 2b. tcprelay: RFC 6062 outbound Connect + ConnectionBind ----------
+#
+# Outbound only: Allocate(TCP) → Connect → ConnectionBind → raw bytes. The
+# `turnutils_uclient -T` shortcut is **not** usable as the assertion here:
+# `-T` implies `-y` (client-to-client), and the second client's side needs a
+# `ConnectionAttempt` indication — the passive mode this task leaves out. The
+# probe performs the standard client flow (and runs identically against coturn).
+run_tcprelay() {
+  local name=tcprelay
+  start_turn "$name" --tcp --turn-tcp-relay
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if python3 "$PROBE" tcp-relay --server "127.0.0.1:$BASE" \
+    --user "$USER_NAME" --password "$USER_PASS" --realm "$REALM" \
+    >"$LOG_DIR/$name-probe.log" 2>&1; then
+    local assertions
+    assertions="$(grep -c '^ok:' "$LOG_DIR/$name-probe.log")"
+    # The probe exits 0 only when every check passed, but a check that silently
+    # stops running would still exit 0: pin the count so a dropped assertion is
+    # a failure, not a smaller green.
+    if (( assertions < 11 )); then
+      fail "$name" "probe reported $assertions assertions (expected 11); see $LOG_DIR/$name-probe.log"
+      stop_server "$name"
+      return
+    fi
+  else
+    fail "$name" "see $LOG_DIR/$name-probe.log"
+    stop_server "$name"
+    return
+  fi
+  # The TCP relay is a real listener while the allocation lives, and LIFETIME=0
+  # (part of the probe) must take it away.
+  local leftover
+  leftover="$(relay_tcp_listeners)"
+  if [[ -n "$leftover" ]]; then
+    fail "$name" "TCP relay listener left behind: $(echo "$leftover" | tr '\n' ' ')"
+  else
+    ok "$name" "$assertions assertions, no TCP relay listener left in $RELAY_LO-$RELAY_HI"
+  fi
+  if command -v turnutils_uclient >/dev/null 2>&1; then
+    log "info: $name: uclient -T not used (it implies -y; the peer side needs ConnectionAttempt, out of scope)"
   fi
   stop_server "$name"
 }
@@ -973,12 +1028,13 @@ run_cleanup() {
     sleep 0.2
     waited=$((waited + 1))
   done
-  local leftover
+  local leftover leftover_tcp
   leftover="$(relay_listeners)"
-  if [[ "$active" == "0" && -z "$leftover" ]]; then
-    ok "$name" "created=$created, allocations=0 and no relay listener in $RELAY_LO-$RELAY_HI"
+  leftover_tcp="$(relay_tcp_listeners)"
+  if [[ "$active" == "0" && -z "$leftover" && -z "$leftover_tcp" ]]; then
+    ok "$name" "created=$created, allocations=0 and no UDP/TCP relay listener in $RELAY_LO-$RELAY_HI"
   else
-    fail "$name" "created=$created allocations=$active leftover=[$(echo "$leftover" | tr '\n' ' ')]"
+    fail "$name" "created=$created allocations=$active leftover=[$(echo "$leftover $leftover_tcp" | tr '\n' ' ')]"
   fi
   stop_server "$name"
 }
@@ -1168,7 +1224,7 @@ run_coturn() {
     rstun_tls_args=(--turn-tls-listen "127.0.0.1:$TLS_PORT" --turn-dtls-listen "127.0.0.1:$DTLS_PORT" \
       --tls-cert "$CERT_DIR/cert.pem" --tls-key "$CERT_DIR/key.pem")
   fi
-  start_turn_users "$name-rstun" "${rstun_tls_args[@]}"
+  start_turn_users "$name-rstun" --tcp --turn-tcp-relay "${rstun_tls_args[@]}"
   if ! wait_health "$HEALTH_PORT"; then
     fail "$name" "rstun did not become healthy"
     stop_server "$name-rstun"
@@ -1187,6 +1243,17 @@ run_coturn() {
   fi
   diff -u "$LOG_DIR/$name-coturn-relay.log" "$LOG_DIR/$name-rstun-relay.log" \
     >"$LOG_DIR/$name-relay-diff.log" 2>&1 || ok_all=false
+
+  # RFC 6062 outbound: the same `tcp-relay` client flow (Allocate(TCP) →
+  # Connect → ConnectionBind → raw bytes → LIFETIME=0) must produce the same
+  # 11 lines on both servers. This is the PRD's "逐行一致" evidence; the
+  # `tcprelay` item alone only proves rstun passes.
+  python3 "$PROBE" tcp-relay --server "127.0.0.1:$coturn_port" \
+    >"$LOG_DIR/$name-coturn-tcprelay.log" 2>&1 || ok_all=false
+  python3 "$PROBE" tcp-relay --server "127.0.0.1:$BASE" \
+    >"$LOG_DIR/$name-rstun-tcprelay.log" 2>&1 || ok_all=false
+  diff -u "$LOG_DIR/$name-coturn-tcprelay.log" "$LOG_DIR/$name-rstun-tcprelay.log" \
+    >"$LOG_DIR/$name-tcprelay-diff.log" 2>&1 || ok_all=false
 
   python3 "$PROBE" lifecycle --server "127.0.0.1:$coturn_port" --lenient-refresh \
     >"$LOG_DIR/$name-coturn-lifecycle.log" 2>&1 || ok_all=false
@@ -1238,6 +1305,7 @@ run_coturn() {
 
   log "coturn comparison (same client, same steps):"
   log "  relay probe:    $(diff -q "$LOG_DIR/$name-coturn-relay.log" "$LOG_DIR/$name-rstun-relay.log" >/dev/null && echo identical || echo DIFFERENT)"
+  log "  tcp-relay:      $(diff -q "$LOG_DIR/$name-coturn-tcprelay.log" "$LOG_DIR/$name-rstun-tcprelay.log" >/dev/null && echo identical || echo DIFFERENT)"
   log "  wrong-user:     $(diff -q "$LOG_DIR/$name-coturn-wrong-user.log" "$LOG_DIR/$name-rstun-wrong-user.log" >/dev/null && echo identical || echo DIFFERENT)"
   log "  uclient:        coturn exit=$coturn_exit  rstun exit=$rstun_exit"
   log "  TLS  (uclient -S -t): coturn=$coturn_tls_result  rstun=$rstun_tls_result"
@@ -1289,7 +1357,7 @@ run_coturn() {
   local secure_note="TLS+DTLS relays ok on both"
   [[ "$coturn_tls_result" == SKIP ]] && secure_note="TLS/DTLS SKIP (lean build)"
   if $ok_all && [[ $coturn_exit -eq 0 && $rstun_exit -eq 0 ]]; then
-    ok "$name" "relay/lifecycle/441 identical; ${secure_note}; REST behaviour identical"
+    ok "$name" "relay/tcp-relay/lifecycle/441 identical; ${secure_note}; REST behaviour identical"
   else
     fail "$name" "see $LOG_DIR/$name-*.log"
   fi
@@ -1303,6 +1371,7 @@ run_item() {
   case "$1" in
     startup) run_startup ;;
     relay) run_relay ;;
+    tcprelay) run_tcprelay ;;
     auth) run_auth ;;
     lifecycle) run_lifecycle ;;
     wrong-user) run_wrong_user ;;

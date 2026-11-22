@@ -455,6 +455,12 @@ fn error_codes_have_expected_values() {
     assert_eq!(ERROR_PEER_ADDRESS_FAMILY_MISMATCH, 443);
     assert_eq!(ERROR_ALLOCATION_QUOTA_REACHED, 486);
     assert_eq!(ERROR_INSUFFICIENT_CAPACITY, 508);
+    // RFC 6062 §6.3
+    assert_eq!(ERROR_CONNECTION_ALREADY_EXISTS, 446);
+    assert_eq!(ERROR_CONNECTION_TIMEOUT_OR_FAILURE, 447);
+    assert_eq!(CONNECT_METHOD, 0x00a);
+    assert_eq!(CONNECTION_BIND_METHOD, 0x00b);
+    assert_eq!(ATTR_CONNECTION_ID, 0x002a);
 }
 
 #[test]
@@ -486,6 +492,12 @@ fn unknown_comprehension_required_attributes_are_reported() {
     protocol::push_attribute(&mut known, ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
     protocol::push_attribute(&mut known, ATTR_LIFETIME, &300_u32.to_be_bytes());
     assert!(turn_unknown_attributes(&known).is_empty());
+
+    // RFC 6062 §6.2.1: CONNECTION-ID must not be answered 420 before
+    // `Connect` / `ConnectionBind` get to run.
+    let mut connection_id = Vec::new();
+    protocol::push_attribute(&mut connection_id, ATTR_CONNECTION_ID, &[0, 0, 0, 1]);
+    assert!(turn_unknown_attributes(&connection_id).is_empty());
 }
 
 #[test]
@@ -752,6 +764,50 @@ async fn permissions_and_channels_expire() {
     assert!(recv(&peer, 300).await.is_none());
 }
 
+/// An expired-but-not-swept allocation is *replaced* by the next `Allocate` on
+/// the same 5-tuple. The port that goes back to the pool must be the replaced
+/// entry's, not the new one's: releasing the live port would let a second
+/// allocation claim it (and `SO_REUSEPORT` would even let two TCP relays share
+/// it), while the old port would stay marked used forever.
+#[tokio::test]
+async fn reallocating_over_an_expired_entry_releases_the_old_port() {
+    let harness = start(Config::default()).await;
+    let mut client = Client::connect(harness.server).await;
+    client.challenge().await;
+    let first_reply = client.allocate().await;
+    assert_eq!(error_code(&first_reply), None);
+    let first_relay = relayed_address(&first_reply);
+
+    let key = Key {
+        client: client.socket.local_addr().expect("client address"),
+        transport: ClientTransport::Udp,
+        server: harness.server,
+    };
+    let allocation = harness.turn.get(&key, Instant::now()).expect("allocation");
+    // TTL elapsed, but the 1 s sweep has not run yet: the entry is still in the
+    // table, so the next Allocate inserts a *new* one over it.
+    lock_write(&allocation.state).expires_at = Instant::now() - Duration::from_secs(1);
+    drop(allocation);
+
+    let second_reply = client.allocate().await;
+    assert_eq!(error_code(&second_reply), None);
+    let second_relay = relayed_address(&second_reply);
+    assert_ne!(
+        second_relay.port(),
+        first_relay.port(),
+        "the expired entry's port is still marked used when the new one is picked"
+    );
+    let used = lock_lock(&harness.turn.used_ports);
+    assert!(
+        !used.contains(&first_relay.port()),
+        "the replaced entry's port must go back to the pool"
+    );
+    assert!(
+        used.contains(&second_relay.port()),
+        "the live allocation's port must stay taken"
+    );
+}
+
 #[tokio::test]
 async fn quota_and_port_exhaustion() {
     // Quota: one allocation per user.
@@ -892,6 +948,78 @@ impl TcpClient {
         let frame = self.sign(request(method, &transaction_id, &attributes));
         self.write(&frame).await;
         self.read_stun().await
+    }
+
+    /// Unauthenticated request of any method → 401 + NONCE.
+    async fn challenge_with(&mut self, method: u16, extra: Vec<(u16, Vec<u8>)>) -> Vec<u8> {
+        let transaction_id = self.next_id();
+        let frame = request(method, &transaction_id, &extra);
+        self.write(&frame).await;
+        let response = self.read_stun().await;
+        for (attr_type, value) in attributes_of(&response) {
+            if attr_type == protocol::ATTR_NONCE {
+                self.nonce = String::from_utf8(value).expect("nonce is text");
+            }
+        }
+        response
+    }
+
+    /// Allocate with an explicit `REQUESTED-TRANSPORT`, challenge included.
+    async fn allocate_with(&mut self, transport: u8) -> Vec<u8> {
+        let attributes = vec![(ATTR_REQUESTED_TRANSPORT, vec![transport, 0, 0, 0])];
+        self.challenge_with(ALLOCATE_METHOD, attributes.clone())
+            .await;
+        self.request(ALLOCATE_METHOD, attributes).await
+    }
+
+    async fn allocate_tcp(&mut self) -> Vec<u8> {
+        self.allocate_with(TRANSPORT_TCP).await
+    }
+
+    /// Signed `Connect`; the peer address is XORed with this request's tid.
+    async fn connect_peer(&mut self, peer: SocketAddr) -> Vec<u8> {
+        let transaction_id = self.next_id();
+        let frame = self.signed_frame(
+            CONNECT_METHOD,
+            &transaction_id,
+            vec![(
+                ATTR_XOR_PEER_ADDRESS,
+                protocol::xor_mapped_address_value(peer, &transaction_id),
+            )],
+        );
+        self.write(&frame).await;
+        self.read_stun().await
+    }
+
+    /// Signed `ConnectionBind` after the ordinary 401 dance (a data connection
+    /// has its own nonce challenge; nothing says it inherits the control one).
+    async fn connection_bind(&mut self, id: u32) -> Vec<u8> {
+        let extra = vec![(ATTR_CONNECTION_ID, id.to_be_bytes().to_vec())];
+        self.challenge_with(CONNECTION_BIND_METHOD, extra.clone())
+            .await;
+        self.request(CONNECTION_BIND_METHOD, extra).await
+    }
+
+    async fn refresh(&mut self, seconds: u32) -> Vec<u8> {
+        self.request(
+            REFRESH_METHOD,
+            vec![(ATTR_LIFETIME, seconds.to_be_bytes().to_vec())],
+        )
+        .await
+    }
+
+    /// `request` without writing/reading: the caller frames it itself.
+    fn signed_frame(
+        &self,
+        method: u16,
+        transaction_id: &TransactionId,
+        extra: Vec<(u16, Vec<u8>)>,
+    ) -> Vec<u8> {
+        let mut attributes = extra;
+        attributes.push((protocol::ATTR_USERNAME, USER.as_bytes().to_vec()));
+        attributes.push((protocol::ATTR_REALM, REALM.as_bytes().to_vec()));
+        attributes.push((protocol::ATTR_NONCE, self.nonce.as_bytes().to_vec()));
+        self.sign(request(method, transaction_id, &attributes))
     }
 }
 
@@ -1448,7 +1576,7 @@ async fn allocate_with_dont_fragment_sets_the_relay_socket() {
     );
     let (set, _) = dont_fragment_values();
     assert_eq!(
-        dont_fragment_option(&allocation.relay, relay.is_ipv6()),
+        dont_fragment_option(allocation.relay.udp().expect("UDP relay"), relay.is_ipv6()),
         set,
         "the relay socket carries DF for its whole life"
     );
@@ -1555,7 +1683,10 @@ async fn send_indication_dont_fragment_is_per_datagram() {
         "this allocation did not ask for DF"
     );
     let (_, cleared) = dont_fragment_values();
-    assert_eq!(dont_fragment_option(&allocation.relay, false), cleared);
+    assert_eq!(
+        dont_fragment_option(allocation.relay.udp().expect("UDP relay"), false),
+        cleared
+    );
 
     // DF on this datagram only.
     let transaction_id = client.next_id();
@@ -1574,7 +1705,7 @@ async fn send_indication_dont_fragment_is_per_datagram() {
     );
     let mut restored = false;
     for _ in 0..100 {
-        if dont_fragment_option(&allocation.relay, false) == cleared {
+        if dont_fragment_option(allocation.relay.udp().expect("UDP relay"), false) == cleared {
             restored = true;
             break;
         }
@@ -1863,6 +1994,23 @@ async fn turn_metrics_appear_only_when_enabled() {
         text.contains("rstun_turn_rejected_total{reason=\"df\"} 0"),
         "DONT-FRAGMENT failures have their own reason label"
     );
+    // RFC 6062: gauges and per-reason counters, emitted with --turn.
+    assert!(text.contains("rstun_turn_tcp_connections{state=\"pending\"} 0"));
+    assert!(text.contains("rstun_turn_tcp_connections{state=\"bound\"} 0"));
+    for reason in [
+        "tcp_connect",
+        "tcp_bind",
+        "tcp_send",
+        "tcp_buffer",
+        "tcp_quota",
+    ] {
+        assert!(
+            text.contains(&format!(
+                "rstun_turn_rejected_total{{reason=\"{reason}\"}} 0"
+            )),
+            "missing TCP refusal reason {reason}"
+        );
+    }
 
     let plain = Arc::new(ServerStats::default());
     let context = Arc::new(ServerContext {
@@ -1913,4 +2061,592 @@ async fn broadcast_and_v4_mapped_peers_are_refused() {
             "{peer} must be refused"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 6062 (TCP allocations): outbound Connect + ConnectionBind
+// ---------------------------------------------------------------------------
+
+/// A TURN-over-TCP server harness (`serve_tcp`, the path `turnutils_uclient -T`
+/// uses) with `--turn-tcp-relay` on.
+struct TcpHarness {
+    server: SocketAddr,
+    turn: Arc<Turn>,
+}
+
+async fn start_tcp(config: Config) -> TcpHarness {
+    start_tcp_with(config, long_term_auth()).await
+}
+
+async fn start_tcp_with(config: Config, auth: auth::Auth) -> TcpHarness {
+    let listener = crate::tcp_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+    let server = listener.local_addr().unwrap();
+    let turn = Arc::new(Turn::new(config, "rstun/test"));
+    let stats = Arc::new(ServerStats::default());
+    stats.set_turn(turn.clone());
+    let context = Arc::new(ServerContext {
+        plan: None,
+        udp: Vec::new(),
+        mapped_address: false,
+        admission: None,
+        fingerprint: None,
+        alternate_server: None,
+        auth: Some(auth),
+    });
+    tokio::spawn(crate::serve_tcp(
+        listener,
+        context,
+        Arc::from("rstun/test"),
+        stats,
+    ));
+    TcpHarness { server, turn }
+}
+
+fn tcp_relay_config() -> Config {
+    Config {
+        tcp_relay: true,
+        ..Config::default()
+    }
+}
+
+fn connection_id(response: &[u8]) -> Option<u32> {
+    let message = protocol::parse(response).ok()?;
+    let value = protocol::attributes(message.body)
+        .find(|attribute| attribute.attr_type == ATTR_CONNECTION_ID)?
+        .value;
+    let bytes = <[u8; 4]>::try_from(value).ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
+/// One TCP peer with a listener and an accept task.
+async fn peer_listener() -> (tokio::net::TcpListener, SocketAddr) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    (listener, address)
+}
+
+/// Allocate a TCP relay and connect to `peer`; returns the connection id.
+async fn allocate_and_connect(client: &mut TcpClient, peer: SocketAddr) -> (SocketAddr, u32) {
+    let allocation = client.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None, "TCP Allocate");
+    let relay = relayed_address(&allocation);
+    let connected = client.connect_peer(peer).await;
+    assert_eq!(error_code(&connected), None, "Connect");
+    let id = connection_id(&connected).expect("CONNECTION-ID");
+    (relay, id)
+}
+
+#[tokio::test]
+async fn tcp_allocation_needs_the_switch_and_a_stream_control_connection() {
+    // Switch off: the classic `442`, over TCP as well as UDP.
+    let off = start_tcp(Config::default()).await;
+    let mut client = TcpClient::connect(off.server).await;
+    assert_eq!(error_code(&client.allocate_tcp().await), Some(442));
+
+    // Switch on, UDP control connection: RFC 6062 §5.1 step 2 → 400.
+    let on = start(Config {
+        tcp_relay: true,
+        ..Config::default()
+    })
+    .await;
+    let mut udp = Client::connect(on.server).await;
+    udp.challenge().await;
+    let allocation = udp
+        .request(
+            ALLOCATE_METHOD,
+            vec![(ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_TCP, 0, 0, 0])],
+        )
+        .await;
+    assert_eq!(error_code(&allocation), Some(400));
+
+    // Switch on, TCP control connection: 200 with a relayed address and no
+    // CONNECTION-ID (RFC 6062 §5.1 adds none; coturn agrees).
+    let harness = start_tcp(tcp_relay_config()).await;
+    let mut client = TcpClient::connect(harness.server).await;
+    let allocation = client.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None);
+    let relay = relayed_address(&allocation);
+    assert_ne!(relay.port(), 0);
+    assert_eq!(
+        connection_id(&allocation),
+        None,
+        "Allocate has no CONNECTION-ID"
+    );
+    assert!(
+        attributes_of(&allocation)
+            .iter()
+            .any(|(attr, _)| *attr == protocol::ATTR_SOFTWARE)
+    );
+    // The relay is a real TCP listener: a plain connect succeeds.
+    assert!(TcpStream::connect(relay).await.is_ok());
+
+    // A UDP allocation still works on the same build (regression).
+    let mut udp = Client::connect(on.server).await;
+    udp.challenge().await;
+    assert_eq!(error_code(&udp.allocate().await), None);
+}
+
+#[tokio::test]
+async fn tcp_allocation_rejects_datagram_only_attributes() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    for extra in [
+        vec![(ATTR_DONT_FRAGMENT, Vec::new())],
+        vec![(ATTR_EVEN_PORT, vec![0x80])],
+        vec![(ATTR_RESERVATION_TOKEN, vec![0_u8; 8])],
+    ] {
+        let mut client = TcpClient::connect(harness.server).await;
+        client
+            .challenge_with(
+                ALLOCATE_METHOD,
+                vec![(ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_TCP, 0, 0, 0])],
+            )
+            .await;
+        let mut attributes = vec![(ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_TCP, 0, 0, 0])];
+        attributes.extend(extra);
+        let response = client.request(ALLOCATE_METHOD, attributes).await;
+        assert_eq!(
+            error_code(&response),
+            Some(400),
+            "attribute must be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn connect_error_paths_follow_rfc_6062() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    // No allocation on this connection → 437.
+    let mut bare = TcpClient::connect(harness.server).await;
+    bare.challenge().await;
+    assert_eq!(
+        error_code(&bare.connect_peer("127.0.0.1:9".parse().unwrap()).await),
+        Some(437)
+    );
+
+    // A UDP allocation is not a TCP one: Connect → 437.
+    let mut udp = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&udp.allocate_with(TRANSPORT_UDP).await), None);
+    assert_eq!(
+        error_code(&udp.connect_peer("127.0.0.1:9".parse().unwrap()).await),
+        Some(437)
+    );
+
+    // Missing XOR-PEER-ADDRESS → 400.
+    let mut client = TcpClient::connect(harness.server).await;
+    let allocation = client.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None);
+    assert_eq!(
+        error_code(&client.request(CONNECT_METHOD, vec![]).await),
+        Some(400)
+    );
+
+    // Forbidden local policy: unspecified / multicast / the relay itself → 403.
+    let relay = relayed_address(&allocation);
+    for peer in [
+        "0.0.0.0:9000".parse().unwrap(),
+        "239.1.2.3:9000".parse().unwrap(),
+        relay,
+    ] {
+        assert_eq!(error_code(&client.connect_peer(peer).await), Some(403));
+    }
+    // Wrong address family → 443 (§5.2 uses the same rule as permissions).
+    assert_eq!(
+        error_code(&client.connect_peer("[::1]:9000".parse().unwrap()).await),
+        Some(443)
+    );
+
+    // A peer that refuses the connection → 447.
+    let (listener, closed) = peer_listener().await;
+    drop(listener);
+    assert_eq!(error_code(&client.connect_peer(closed).await), Some(447));
+    assert!(client.turn_rejected_connect(harness.turn.as_ref()) >= 1);
+}
+
+#[tokio::test]
+async fn connect_from_another_user_on_the_same_tuple_is_441() {
+    let harness = start_tcp_with(tcp_relay_config(), long_term_auth_two_users()).await;
+    let mut client = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&client.allocate_tcp().await), None);
+
+    // Bob reuses Alice's TCP 5-tuple with his own (valid) credentials. The nonce
+    // is IP-bound, not user-bound, so this authenticates and must then be
+    // refused with `441` exactly like the other methods (§5 general rule).
+    let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let transaction_id = client.next_id();
+    let attributes = vec![
+        (
+            ATTR_XOR_PEER_ADDRESS,
+            protocol::xor_mapped_address_value(peer, &transaction_id),
+        ),
+        (protocol::ATTR_USERNAME, b"otheruser".to_vec()),
+        (protocol::ATTR_REALM, REALM.as_bytes().to_vec()),
+        (protocol::ATTR_NONCE, client.nonce.as_bytes().to_vec()),
+    ];
+    let key = auth::long_term_key(KeyAlgorithm::Md5, "otheruser", REALM, "otherpass");
+    let frame = auth::seal(
+        request(CONNECT_METHOD, &transaction_id, &attributes),
+        &Identity {
+            username: "otheruser".to_string(),
+            keys: vec![(KeyAlgorithm::Md5, key)],
+        },
+    );
+    client.write(&frame).await;
+    assert_eq!(error_code(&client.read_stun().await), Some(441));
+    // Alice's allocation is untouched.
+    assert_eq!(harness.turn.active(), 1);
+}
+
+impl TcpClient {
+    fn turn_rejected_connect(&self, turn: &Turn) -> u64 {
+        turn.snapshot().rejected_tcp_connect
+    }
+}
+
+#[tokio::test]
+async fn connect_is_idempotent_per_peer_only_until_the_first_succeeds() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let (listener, peer_addr) = peer_listener().await;
+    let accept = tokio::spawn(async move {
+        let (stream, seen) = listener.accept().await.unwrap();
+        (stream, seen)
+    });
+    let mut client = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&client.allocate_tcp().await), None);
+    let first = client.connect_peer(peer_addr).await;
+    assert_eq!(error_code(&first), None);
+    assert!(
+        connection_id(&first).is_some(),
+        "Connect carries CONNECTION-ID"
+    );
+    // coturn alignment: `Connect ok` has no SOFTWARE.
+    assert!(
+        !attributes_of(&first)
+            .iter()
+            .any(|(attr, _)| *attr == protocol::ATTR_SOFTWARE)
+    );
+    // Same peer again (pending, not bound yet) → 446.
+    assert_eq!(error_code(&client.connect_peer(peer_addr).await), Some(446));
+    let _ = accept.await.expect("peer accepted");
+}
+
+#[tokio::test]
+async fn connection_bind_relays_raw_bytes_both_ways() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let (listener, peer_addr) = peer_listener().await;
+    let accept = tokio::spawn(async move {
+        let (stream, seen) = listener.accept().await.unwrap();
+        (stream, seen)
+    });
+    let mut control = TcpClient::connect(harness.server).await;
+    let (relay, id) = allocate_and_connect(&mut control, peer_addr).await;
+    let (mut peer, seen) = accept.await.expect("peer accepted");
+    // §5.2: the peer data connection originates from the relayed address.
+    assert_eq!(seen.port(), relay.port(), "source must be the relay port");
+    assert_eq!(seen.ip(), relay.ip());
+
+    // Peer speaks before the client binds: RFC 6062 §5.2 requires buffering.
+    peer.write_all(b"early").await.unwrap();
+
+    let mut data = TcpClient::connect(harness.server).await;
+    let bound = data.connection_bind(id).await;
+    assert_eq!(error_code(&bound), None, "ConnectionBind");
+    assert!(
+        attributes_of(&bound)
+            .iter()
+            .any(|(attr, _)| *attr == protocol::ATTR_SOFTWARE)
+    );
+
+    let mut early = [0_u8; 5];
+    data.read_exact(&mut early).await;
+    assert_eq!(
+        &early, b"early",
+        "pre-bind bytes are delivered after the bind"
+    );
+
+    data.write(b"client->peer").await;
+    let mut towards_peer = [0_u8; 12];
+    peer.read_exact(&mut towards_peer).await.unwrap();
+    assert_eq!(&towards_peer, b"client->peer");
+
+    peer.write_all(b"peer->client").await.unwrap();
+    let mut towards_client = [0_u8; 12];
+    data.read_exact(&mut towards_client).await;
+    assert_eq!(&towards_client, b"peer->client");
+
+    let snapshot = harness.turn.snapshot();
+    assert_eq!(snapshot.tcp_bound, 1);
+    assert_eq!(snapshot.bytes_in, 12);
+    assert_eq!(snapshot.bytes_out, 5 + 12);
+}
+
+#[tokio::test]
+async fn connection_bind_rejects_a_wrong_id_and_closes_the_connection() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let (listener, peer_addr) = peer_listener().await;
+    let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+    let mut control = TcpClient::connect(harness.server).await;
+    let (_, _id) = allocate_and_connect(&mut control, peer_addr).await;
+    let _ = accept.await.expect("peer accepted");
+
+    let mut data = TcpClient::connect(harness.server).await;
+    let response = data.connection_bind(0xDEAD_BEEF).await;
+    assert_eq!(error_code(&response), Some(400));
+    // The server answers 400 and then closes (coturn sends a RST instead).
+    let mut tail = [0_u8; 1];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut data.stream, &mut tail),
+    )
+    .await
+    .expect("connection closed")
+    .expect("read");
+    assert_eq!(read, 0);
+    assert!(harness.turn.snapshot().rejected_tcp_bind >= 1);
+}
+
+#[tokio::test]
+async fn half_close_propagates_in_both_directions() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let (listener, peer_addr) = peer_listener().await;
+    let accept = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        stream
+    });
+    let mut control = TcpClient::connect(harness.server).await;
+    let (_, id) = allocate_and_connect(&mut control, peer_addr).await;
+    let mut peer = accept.await.expect("peer accepted");
+    let mut data = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&data.connection_bind(id).await), None);
+
+    // client write-half closed → peer reads EOF, connection still usable.
+    tokio::io::AsyncWriteExt::shutdown(&mut data.stream)
+        .await
+        .unwrap();
+    let mut buffer = [0_u8; 16];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut peer, &mut buffer),
+    )
+    .await
+    .expect("peer EOF")
+    .expect("read");
+    assert_eq!(read, 0, "client half-close reaches the peer as EOF");
+
+    // peer → client still works after the client's EOF.
+    peer.write_all(b"still-open").await.unwrap();
+    let mut towards_client = [0_u8; 10];
+    data.read_exact(&mut towards_client).await;
+    assert_eq!(&towards_client, b"still-open");
+
+    // peer write-half closed → client reads EOF; only now does the table drop.
+    peer.shutdown().await.unwrap();
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut data.stream, &mut buffer),
+    )
+    .await
+    .expect("client EOF")
+    .expect("read");
+    assert_eq!(read, 0, "peer half-close reaches the client as EOF");
+    for _ in 0..100 {
+        if harness.turn.snapshot().tcp_bound == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(harness.turn.snapshot().tcp_bound, 0);
+}
+
+#[tokio::test]
+async fn lifetime_zero_closes_data_connections_and_frees_the_relay_port() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let (listener, peer_addr) = peer_listener().await;
+    let accept = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        stream
+    });
+    let mut control = TcpClient::connect(harness.server).await;
+    let (relay, id) = allocate_and_connect(&mut control, peer_addr).await;
+    let mut peer = accept.await.expect("peer accepted");
+    let mut data = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&data.connection_bind(id).await), None);
+
+    assert_eq!(error_code(&control.refresh(0).await), None);
+    // Control connection stays open (deliberate difference from coturn, which
+    // also tears the control connection down).
+    assert_eq!(harness.turn.active(), 0);
+
+    let mut buffer = [0_u8; 8];
+    let peer_read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut peer, &mut buffer),
+    )
+    .await
+    .expect("peer closed")
+    .expect("read");
+    assert_eq!(peer_read, 0, "data connection closed with its allocation");
+    let data_read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut data.stream, &mut buffer),
+    )
+    .await
+    .expect("client data connection closed")
+    .expect("read");
+    assert_eq!(data_read, 0);
+    assert_eq!(harness.turn.snapshot().tcp_bound, 0);
+
+    // The TCP relay port is back in the pool: it can be bound again.
+    let mut rebound = false;
+    for _ in 0..100 {
+        if crate::tcp_listener(relay).is_ok() {
+            rebound = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(rebound, "relay port {relay} must be free after LIFETIME=0");
+}
+
+#[tokio::test]
+async fn pending_connection_is_closed_after_the_bind_window() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let (listener, peer_addr) = peer_listener().await;
+    let accept = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        stream
+    });
+    let mut control = TcpClient::connect(harness.server).await;
+    let (_, _id) = allocate_and_connect(&mut control, peer_addr).await;
+    let mut peer = accept.await.expect("peer accepted");
+    assert_eq!(harness.turn.snapshot().tcp_pending, 1);
+    // The sweep is what enforces the 30 s window; drive it directly.
+    harness
+        .turn
+        .sweep(Instant::now() + TCP_BIND_TIMEOUT + Duration::from_secs(2));
+    let mut buffer = [0_u8; 4];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut peer, &mut buffer),
+    )
+    .await
+    .expect("peer closed")
+    .expect("read");
+    assert_eq!(read, 0, "an unbound peer data connection is closed");
+    assert_eq!(harness.turn.snapshot().tcp_pending, 0);
+}
+
+#[tokio::test]
+async fn channel_bind_and_send_are_refused_on_a_tcp_allocation() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let mut client = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&client.allocate_tcp().await), None);
+    let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    let tid = client.next_id();
+    let mut channel = CHANNEL_MIN.to_be_bytes().to_vec();
+    channel.extend_from_slice(&[0, 0]);
+    let bind = client.signed_frame(
+        CHANNEL_BIND_METHOD,
+        &tid,
+        vec![
+            (ATTR_CHANNEL_NUMBER, channel),
+            (
+                ATTR_XOR_PEER_ADDRESS,
+                protocol::xor_mapped_address_value(peer, &tid),
+            ),
+        ],
+    );
+    client.write(&bind).await;
+    assert_eq!(error_code(&client.read_stun().await), Some(400));
+
+    // A `Send` indication on a TCP allocation is discarded and counted.
+    let indication = send_indication(&transaction_id(9), peer, b"drop-me");
+    client.write(&indication).await;
+    for _ in 0..100 {
+        if harness.turn.snapshot().rejected_tcp_send >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(harness.turn.snapshot().rejected_tcp_send, 1);
+}
+
+#[tokio::test]
+async fn per_allocation_connection_quota_is_508() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let mut client = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&client.allocate_tcp().await), None);
+    let mut listeners = Vec::new();
+    for _ in 0..TCP_MAX_CONNECTIONS_PER_ALLOCATION {
+        let (listener, address) = peer_listener().await;
+        assert_eq!(
+            error_code(&client.connect_peer(address).await),
+            None,
+            "connections below the cap are allowed"
+        );
+        listeners.push(listener);
+    }
+    let (extra_listener, extra_address) = peer_listener().await;
+    assert_eq!(
+        error_code(&client.connect_peer(extra_address).await),
+        Some(508)
+    );
+    assert!(harness.turn.snapshot().rejected_tcp_quota >= 1);
+    drop(extra_listener);
+    drop(listeners);
+}
+
+#[tokio::test]
+async fn connection_bind_cannot_replay_an_already_bound_id() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let (listener, peer_addr) = peer_listener().await;
+    let accept = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        stream
+    });
+    let mut control = TcpClient::connect(harness.server).await;
+    let (_, id) = allocate_and_connect(&mut control, peer_addr).await;
+    let _peer = accept.await.expect("peer accepted");
+    let mut first = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&first.connection_bind(id).await), None);
+
+    // A second connection replaying the same CONNECTION-ID is 400 + close.
+    let mut replay = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&replay.connection_bind(id).await), Some(400));
+    let mut tail = [0_u8; 1];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut replay.stream, &mut tail),
+    )
+    .await
+    .expect("replay connection closed")
+    .expect("read");
+    assert_eq!(read, 0);
+    assert_eq!(harness.turn.snapshot().tcp_bound, 1);
+}
+
+#[tokio::test]
+async fn pre_bind_buffer_overflow_closes_the_peer_connection() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let (listener, peer_addr) = peer_listener().await;
+    let accept = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        stream
+    });
+    let mut control = TcpClient::connect(harness.server).await;
+    let (_, id) = allocate_and_connect(&mut control, peer_addr).await;
+    let mut peer = accept.await.expect("peer accepted");
+    // More than TCP_PREBIND_BUFFER arrives before the client binds.
+    let flood = vec![0x5a_u8; TCP_PREBIND_BUFFER + 8 * 1024];
+    peer.write_all(&flood).await.ok();
+    for _ in 0..200 {
+        if harness.turn.snapshot().rejected_tcp_buffer >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(harness.turn.snapshot().rejected_tcp_buffer, 1);
+    // The connection is gone: the bind can no longer find it.
+    let mut data = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&data.connection_bind(id).await), Some(400));
+    assert_eq!(harness.turn.snapshot().tcp_pending, 0);
 }

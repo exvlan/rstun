@@ -32,7 +32,7 @@ rstun server \
 | 端口与配额 | `--relay-ports` 耗尽 → `508`；每用户 `--max-allocations-per-user`（默认 8）/ 每 IP `--max-allocations-per-ip`（默认 16）超限 → `486`；每 allocation permission 超 `--permission-limit`（默认 10）→ **`508`**（RFC 8656 §10.2；一条请求带多个 peer 时**整条原子校验**，不做部分生效） |
 | 响应属性 | 成功响应带 `SOFTWARE`（RFC 8656 §14.10 SHOULD），401/438 挑战不带；`ChannelBind` 隐式创建的 permission 与 `CreatePermission` 共用同一个上限 |
 | 数据面 | `Send` 仅在 permission 覆盖 peer 时转发（否则静默丢弃）；relay 收到 peer 数据时，命中 channel → `ChannelData`，否则 → `Data` indication；`ChannelData` 不解析 STUN；**UDP 上声明长度大于实际报文的 `ChannelData` 静默丢弃**（不转发截断内容）；TCP 客户端写队列有界（64 帧，溢出丢 relayed 数据）|
-| 其它 transport | `REQUESTED-TRANSPORT=6`（TCP allocation / RFC 6062）→ `442`；`EVEN-PORT`（含 R=1 reservation token）支持；`REQUESTED-ADDRESS-FAMILY`（0x0017，§18.6）已解析：与 relay 地址族一致 → 正常分配（relay 族跟随客户端：IPv4 客户端 + IPv4、IPv6 客户端 + IPv6）；请求的族本端提供不了（如 IPv4 客户端请求 `0x02`）或族值非 `0x01`/`0x02` → **`440 Address Family not Supported`**；长度 ≠ 4 → `400`；**保留 24 位忽略**（非零不报错）；`Refresh` 上族不匹配 → **`443 Peer Address Family Mismatch`**（§8.2 MUST）、匹配 → 正常续期、长度 ≠ 4 → `400`；`RESERVATION-TOKEN` 与 `EVEN-PORT`/RAF 互斥 → **`400`**（§7.2 步骤 5 先于步骤 7，异族 token 也是 400）；`ADDITIONAL-ADDRESS-FAMILY`（0x8000，comprehension-optional）未实现 → 忽略（因此步骤 6 的「RAF+AAF → 400」不生效）；`DONT-FRAGMENT`（0x001A，§18.9）在 **Linux/macOS/iOS** 上真支持（`Allocate` 置 DF、长度 ≠ 0 → `400`、`setsockopt` 失败 → `500`；`Send` 带它而置不上 DF → **丢弃该 indication**，§11.2），其它平台（Windows/FreeBSD 等）仍按未知 comprehension-required → `420`（§7.2 步骤 4 允许）|
+| 其它 transport | `REQUESTED-TRANSPORT=6`（TCP allocation / RFC 6062）：**默认 `442`**；加 `--turn-tcp-relay` 后走下面的「RFC 6062」小节（仅出站 `Connect` + `ConnectionBind`）；`EVEN-PORT`（含 R=1 reservation token）支持；`REQUESTED-ADDRESS-FAMILY`（0x0017，§18.6）已解析：与 relay 地址族一致 → 正常分配（relay 族跟随客户端：IPv4 客户端 + IPv4、IPv6 客户端 + IPv6）；请求的族本端提供不了（如 IPv4 客户端请求 `0x02`）或族值非 `0x01`/`0x02` → **`440 Address Family not Supported`**；长度 ≠ 4 → `400`；**保留 24 位忽略**（非零不报错）；`Refresh` 上族不匹配 → **`443 Peer Address Family Mismatch`**（§8.2 MUST）、匹配 → 正常续期、长度 ≠ 4 → `400`；`RESERVATION-TOKEN` 与 `EVEN-PORT`/RAF 互斥 → **`400`**（§7.2 步骤 5 先于步骤 7，异族 token 也是 400）；`ADDITIONAL-ADDRESS-FAMILY`（0x8000，comprehension-optional）未实现 → 忽略（因此步骤 6 的「RAF+AAF → 400」不生效）；`DONT-FRAGMENT`（0x001A，§18.9）在 **Linux/macOS/iOS** 上真支持（`Allocate` 置 DF、长度 ≠ 0 → `400`、`setsockopt` 失败 → `500`；`Send` 带它而置不上 DF → **丢弃该 indication**，§11.2），其它平台（Windows/FreeBSD 等）仍按未知 comprehension-required → `420`（§7.2 步骤 4 允许）|
 | TLS（`--turn-tls-listen`）| **仅 full 构建**（`tls` feature；lean 给出该 flag 会拒绝启动并说明）。在 TCP 分帧之上套 TLS 1.2/1.3（`tokio-rustls`，ring provider）。`--tls-cert`/`--tls-key` 在**启动时**解析：路径不可读、证书/私钥不配对、给了监听却没给材料 → **启动失败**（绝不降级明文）。握手 5s 超时、失败计数（退出日志 `handshake_failed`），日志不含证书内容。TLS 与明文**不共用端口** |
 | DTLS（`--turn-dtls-listen`）| **仅 full 构建**（`dtls` feature，含 `tls`）。DTLS 1.2（`webrtc-dtls`，纯 Rust）。**一个 datagram = 一个 STUN/TURN 消息或一个 `ChannelData`**（与 UDP 同构，无 4 字节对齐）；5 元组的 client transport 记为 `Dtls`；握手在每客户端独立任务里做（5s 超时），不阻塞 accept。私钥必须是 **PKCS#8** 且算法为 **ECDSA P-256 / Ed25519**（`webrtc-dtls` 的限制，启动时明确报错）|
 | REST 临时凭据（`--rest-secret`）| coturn `use-auth-secret` 兼容：`username = <expiry-unix>:<label>`、`password = base64(HMAC-SHA1(secret, username))`（**标准 base64**，带 `=` 填充）。过期 → `401`（不是 438：nonce 仍有效，换凭据而不是换 nonce）；HMAC 不匹配 → `401`。**与长期凭据并存时 REST 优先**（用户名能解出时间戳即走 REST，不再查用户表）；`<expiry>:<label>` 的 label 可含 `:`（按**第一个** `:` 切分，coturn 同）|
@@ -40,7 +40,8 @@ rstun server \
 | 观测（T2 增量）| `rstun_turn_bytes_dropped_total{direction=in\|out}`（带宽丢包字节）；退出日志另有 `handshake_failed`。T2 不新增其它指标，握手失败不进 `/metrics` 以免改变标签集合 |
 | 防回环 | 拒绝：`unspecified` / `multicast` / 本进程**监听地址** / 该 allocation 自己的 relay / **loopback peer**（仅当请求到达的 socket 本身绑定在回环地址时放行，供本地开发与 `-y` 矩阵）→ `403`。`--listen 0.0.0.0` 或公网监听下回环 peer 一律拒绝（否则「peer=127.0.0.1:<监听端口>」漏检）。同一进程内**其它 allocation 的 relay 地址允许** —— `turnutils_uclient -y` / 同 NAT WebRTC 的正常路径。**已知盲区**：宿主自身公网 IP 无法在不引入接口枚举依赖的情况下判定 |
 | 回收 | allocation 过期 / `LIFETIME=0` → abort relay 读任务 → 关闭 socket → 端口归还池；测试断言过期后 `ss -lun` 在 relay 段内无监听 |
-| 观测 | `/metrics`：`rstun_turn_allocations`（gauge）、`rstun_turn_bytes_total{direction=in\|out}`、`rstun_turn_allocations_total{result=created\|expired}`、`rstun_turn_rejected_total{reason=quota\|ports\|family\|loopback\|df}`；退出日志打印同一组数字。**未开 `--turn` 时这些指标不出现** |
+| 观测 | `/metrics`：`rstun_turn_allocations`（gauge）、`rstun_turn_bytes_total{direction=in\|out}`、`rstun_turn_allocations_total{result=created\|expired}`、`rstun_turn_rejected_total{reason=quota\|ports\|family\|loopback\|df\|tcp_connect\|tcp_bind\|tcp_send\|tcp_buffer\|tcp_quota}`、`rstun_turn_tcp_connections{state=pending\|bound}`（gauge）；退出日志打印同一组数字。**未开 `--turn` 时这些指标不出现**；`tcp_*` 在没开 `--turn-tcp-relay` 时恒为 0 |
+| **RFC 6062（`--turn-tcp-relay`，默认关）** | `Allocate(REQUESTED-TRANSPORT=6)` 只在 **TCP/TLS 控制连接**上成功（UDP/DTLS → `400`），带 `DONT-FRAGMENT`/`EVEN-PORT`/`RESERVATION-TOKEN` → `400`；成功响应带 TCP `XOR-RELAYED-ADDRESS` + `XOR-MAPPED-ADDRESS` + `LIFETIME` + `SOFTWARE`，**不带 `CONNECTION-ID`**。`Connect` 从 relay 地址出站连 peer（超时 ≥30s，失败 `447`），成功回 `200` + `CONNECTION-ID`，**不带 `SOFTWARE`**（对齐 coturn）；重复 peer `446`，无 allocation/非 TCP allocation `437`，无 peer 地址 `400`，禁用地址 `403`，每 allocation 超过 16 条数据连接 `508`。`ConnectionBind` 在**新连接**上（必须是首个未成功的 TURN 请求）用同一凭据绑定，之后该连接是**裸字节**（不再解析 STUN）；错/过期/重复 ID → `400` 后关闭（coturn 只发 RST，本实现更规范）。`ChannelBind` → `400`；`Send`/`ChannelData` 丢弃并计 `tcp_send`。预绑定 peer 数据最多缓冲 64 KiB（超限关连接 + `tcp_buffer`）；pending 连接 30s 未 bind 关闭；`LIFETIME=0`/过期关闭全部数据连接（**控制连接保留**，coturn 会一起关，记为有意差异）。**被动模式（`ConnectionAttempt`，peer 主动连入 relay）本期不做**。`--turn-bandwidth` 不作用于 TCP allocation 的裸字节流（逐包丢弃会破坏字节流），只计 `rstun_turn_bytes_total` |
 
 部署注意：
 
@@ -79,7 +80,8 @@ rstun server \
   高 churn 下可能多拒绝一次 `486`，下一次扫描恢复。
 - **防回环已知盲区**：不枚举宿主接口，故「peer = 宿主自身公网 IP:端口」无法识别；
   需要该能力时应改用 coturn 或引入接口枚举（T2 评估，新增依赖需单独立项）。
-- 不支持：TCP allocation（RFC 6062）、ACME/OCSP、证书热加载。
+- 不支持：RFC 6062 的**被动模式**（`ConnectionAttempt`，peer 主动连入 relay）、ACME/OCSP、证书热加载。
+- **RFC 6062 部署注意**：TCP relay 端口需要放行 **TCP**（`--relay-ports` 同一段，UDP 与 TCP 各自独立占端口）；`Connect` 从 relay 地址出站依赖 `SO_REUSEPORT`（Linux/macOS），**Windows 上回退为临时源端口**（peer 看到的源端口不是 relay 端口，连接本身仍可用）。数据连接是 accepted TCP 连接，**占用一个 `--max-inflight` 名额**。
 - **`DONT-FRAGMENT`（0x001A）**：在**能真的置 DF 的平台**上支持（Linux、macOS/iOS；
   上一节的 `df` 行）。五处细节值得记住：
   1. `Allocate` 带它 → relay socket 置 `IP_PMTUDISC_DO`（Linux）/ `IP_DONTFRAG=1`（macOS），
@@ -149,16 +151,16 @@ bash script/lab/rstun-turn.sh --only ipv6relay  # IPv6 relay 单项（无 ::1 �
 |      | `rstun`                                                                                                                                                                                         | coturn                                        |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
 | 定位 | 只做 STUN/TURN 的**最小服务**：Binding + **NAT 行为发现** + TURN 中继（`--turn`，强制长期凭据/REST） | 完整 STUN/TURN（中继）+ 鉴权 + 多租户 |
-| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）+ 鉴权（短期/长期，默认关闭）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`；RFC 8656 中继（UDP/TCP 客户端传输、`turns:` TLS、DTLS 1.2、REST 凭据、带宽配额；**无 TCP allocation**） | RFC 5389 / 5780 全量 / TURN（含 TCP allocation、ACME 等） |
+| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）+ 鉴权（短期/长期，默认关闭）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`；RFC 8656 中继（UDP/TCP 客户端传输、`turns:` TLS、DTLS 1.2、REST 凭据、带宽配额）；RFC 6062 **出站** TCP allocation（`--turn-tcp-relay`，无被动模式） | RFC 5389 / 5780 全量 / TURN（含 TCP allocation 双向、ACME 等） |
 | 配置 | 纯命令行参数（无配置文件） | 上百行 `turnserver.conf`、数据库/鉴权后端 |
 | 鉴权 | 短期 / 长期凭据 + RFC 8489 SHA256、USERHASH；用户来自 `--auth-user` 或 `--auth-file`，**无数据库**；TURN 复用同一套长期凭据，或 `--rest-secret`（可并存，REST 优先）| 长期凭据 + 数据库/Redis/文件后端，TURN 也受保护；`use-auth-secret` 与静态用户**互斥** |
 | 依赖 | 纯 Rust，无 OpenSSL/libevent | 依赖 libevent/OpenSSL + 系统配置 |
 | 部署 | 单二进制 / 一个几十 MB 的镜像 | 发行版包 / 官方镜像 + 配置卷 |
-| 用途 | 需要「公网 STUN 映射 + NAT 行为发现」，以及**小规模**的 TURN 中继（中继本身恒为 UDP） | 需要完整 TURN（TCP allocation、多租户、ACME）的基础设施 |
+| 用途 | 需要「公网 STUN 映射 + NAT 行为发现」，以及**小规模**的 TURN 中继（UDP 中继 + RFC 6062 出站 TCP 中继） | 需要完整 TURN（TCP allocation 双向、多租户、ACME）的基础设施 |
 
-结论：**需要 TCP allocation（RFC 6062）、ACME 自动证书或多租户数据库时仍然用 coturn**。
-本服务的 TURN 覆盖 UDP/TCP/`turns:`/DTLS 中继、REST 临时凭据与带宽配额，用户清单是
-静态文件 / 单个 flag / 一个共享 secret。
+结论：**需要 RFC 6062 被动模式（`ConnectionAttempt`）、ACME 自动证书或多租户数据库时仍然用 coturn**。
+本服务的 TURN 覆盖 UDP/TCP/`turns:`/DTLS 中继、RFC 6062 出站 TCP allocation（`--turn-tcp-relay`）、
+REST 临时凭据与带宽配额，用户清单是静态文件 / 单个 flag / 一个共享 secret。
 
 TLS/DTLS/REST 的行为已与本地 coturn **同参数对跑**（`rstun-turn.sh` 的 `coturn` 项）：
 `turnutils_uclient` 的 `-S -t`（TLS）与 `-S`（DTLS）两侧都完成中继；REST 探针输出逐行一致

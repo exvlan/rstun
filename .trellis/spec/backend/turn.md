@@ -31,7 +31,8 @@
 | 成功响应 | 均带 `SOFTWARE`（§14.10 SHOULD）并按请求算法签名；401/438 不带 SOFTWARE |
 | TCP 写队列 | **有界**（`TCP_SINK_CAPACITY = 64`）+ `try_send`；溢出丢 relayed 数据，不无界增长 |
 | TTL | permission 5 分钟、channel 10 分钟、allocation 600s（受 `--allocation-lifetime` 上限约束）；1s 扫描回收 |
-| 指标 | `rstun_turn_allocations`、`rstun_turn_bytes_total{direction}`、`rstun_turn_allocations_total{result}`、`rstun_turn_rejected_total{reason=quota\|ports\|family\|loopback\|df}`；仅 `--turn` 输出 |
+| 指标 | `rstun_turn_allocations`、`rstun_turn_bytes_total{direction}`、`rstun_turn_allocations_total{result}`、`rstun_turn_rejected_total{reason=quota\|ports\|family\|loopback\|df\|tcp_connect\|tcp_bind\|tcp_send\|tcp_buffer\|tcp_quota}`、`rstun_turn_tcp_connections{state=pending\|bound}`；仅 `--turn` 输出 |
+| RFC 6062 开关 | `--turn-tcp-relay` **默认关**；关时 `REQUESTED-TRANSPORT=6` 仍 `442`、`Connect`/`ConnectionBind` 不是 TURN 方法（仍 400），默认路径字节冻结不变 |
 
 ## 3. 判定顺序（四个 request 方法）
 
@@ -114,6 +115,20 @@
   比较/拒绝路径；由 `requested_address_family_parsing` 的 `Ok(None)` 与
   `requested_address_family_selects_the_relay_family` 中「无/匹配 RAF → 200」隐含保证。
   将来若给 TURN 加字节冻结，应按 `--turn` + 固定 transaction id 增补一组。
+
+## 5a. RFC 6062 契约（`--turn-tcp-relay`，出站）
+
+| 项 | 契约 |
+| --- | --- |
+| 范围 | **只做出站**：`Allocate(TCP)` + `Connect` + `ConnectionBind`。被动模式（`ConnectionAttempt` / `uclient -P`）不在范围，`turnutils_uclient -T`（隐含 `-y`）因此不能作为验收判据 |
+| `Allocate` TCP | 控制面必须 TCP/TLS（UDP/DTLS → `400`）；带 `DONT-FRAGMENT`/`EVEN-PORT`/`RESERVATION-TOKEN` → `400`；成功 `200` + TCP `XOR-RELAYED-ADDRESS` + `XOR-MAPPED-ADDRESS` + `LIFETIME` + `SOFTWARE`，**无 `CONNECTION-ID`**；`Refresh`/`LIFETIME` 语义同 UDP |
+| 端口池 | `used_tcp_ports` 独立于 UDP 池；listener 以 `SO_REUSEPORT` 绑定（`Connect` 从该地址出站）|
+| `Connect` | 无 allocation / 非 TCP allocation → `437`；他人 allocation → `441`；缺/非法 `XOR-PEER-ADDRESS` → `400`；禁用地址 → `403`（含 family `443`）；重复 peer（connecting/pending/bound）→ `446`；出站失败/超时（`TCP_CONNECT_TIMEOUT = 30s`）→ `447`；每 allocation 数据连接上限 16 → `508` + `tcp_quota`；成功 `200` + `CONNECTION-ID`，**不带 `SOFTWARE`**（对齐 coturn）|
+| `ConnectionBind` | 必须 stream 传输、新连接（该 5 元组无 allocation）、`CONNECTION_ID` 4 字节且指向 pending、同用户名、未过期；否则 `400` 且**发完响应再关连接**（401/438 挑战保留，不关）；成功后该连接裸字节，不再解析 STUN |
+| 生命周期 | pending 30s 未 bind → 关闭（`sweep`）；`LIFETIME=0`/allocation 过期 → 关闭全部数据连接（**控制连接保留**，与 coturn 的差异）；任一方向干净 EOF 只半关闭，错误/stop 信号关双向 |
+| 缓冲 | 预绑定 peer→client 最多 `TCP_PREBIND_BUFFER = 64 KiB`，超限关连接 + `tcp_buffer`；绑定后先刷缓冲再双向 copy |
+| 其它方法 | `CreatePermission` 正常 `200`；`ChannelBind` → `400`；`Send`/`ChannelData` 丢弃 + `tcp_send` |
+| 资源 | 数据连接是 accepted TCP 连接，占一个 `--max-inflight` 名额（写进文档） |
 
 ## 5b. T2 契约（`turns:` / DTLS / REST / 带宽）
 

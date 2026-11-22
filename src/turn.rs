@@ -12,10 +12,15 @@
 //!   coturn's `use-auth-secret`). There is no unauthenticated operation: the
 //!   startup path refuses to enable `--turn` without one of them.
 //! * A **UDP** relay allocation (`REQUESTED-TRANSPORT = 17`) regardless of the
-//!   client transport. A TCP allocation (RFC 6062, `REQUESTED-TRANSPORT = 6`)
-//!   is answered `442`.
+//!   client transport. With `--turn-tcp-relay` a **TCP** allocation (RFC 6062,
+//!   `REQUESTED-TRANSPORT = 6`) is also served: `Allocate` returns a TCP relay
+//!   listener, `Connect` dials a peer from that address and `ConnectionBind`
+//!   turns a second connection into the raw-byte client data connection.
+//!   Without the switch the RFC 6062 methods are not TURN at all (the old
+//!   `442` / `400` answers are byte-identical).
 //! * `Send` / `Data` indications and `ChannelData` (4-byte header; padded only on
-//!   a stream transport).
+//!   a stream transport). A TCP allocation has none of these: `Send` and
+//!   `ChannelData` are discarded, `ChannelBind` is `400`.
 //! * `EVEN-PORT` (including the R=1 reservation token), because coturn's
 //!   `turnutils_uclient` sends it on every Allocate.
 //! * `--turn-bandwidth`: two token buckets per allocation (client→peer,
@@ -29,7 +34,11 @@
 //! the allocation's relay family: a mismatch is `443 Peer Address Family
 //! Mismatch` (§8.2 MUST), a match refreshes normally.
 //!
-//! Deliberately absent: TCP allocations (RFC 6062).
+//! Deliberately absent: the **inbound** half of RFC 6062 (`ConnectionAttempt`,
+//! i.e. a peer dialling the relay listener). Outbound `Connect` +
+//! `ConnectionBind` is what `turnutils_uclient -T` exercises; the passive mode
+//! needs an "allocation → control connection" reverse channel and is a later
+//! sub-item.
 //!
 //! `DONT-FRAGMENT` (0x001A, §18.9) is supported where the DF bit can really be
 //! set — Linux and macOS/iOS, see [`DONT_FRAGMENT_SUPPORTED`]. `Allocate` with
@@ -51,6 +60,13 @@
 //! goes back to the pool at the same moment, which is what makes the acceptance
 //! check "`ss -lun` has no leftover relay socket" meaningful.
 //!
+//! TCP data connections (RFC 6062) live in a **global** `CONNECTION-ID` table
+//! ([`Turn::connections`]) rather than in an allocation: they are their own
+//! accepted TCP connection and must not share the control connection's
+//! 5-tuple. Each one is a task that owns the peer socket; `sweep` closes the
+//! ones that never bound within 30 s, and removing an allocation signals every
+//! connection it owns to stop (§5.5 MUST).
+//!
 //! Counters are atomics shared by every task, read by `/metrics` and by the exit
 //! log — one source, no double bookkeeping. When `--turn` is off the whole
 //! module is inert: no table, no task, no metric line.
@@ -61,8 +77,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::auth::{self, Identity};
@@ -85,6 +102,13 @@ pub const DATA_METHOD: u16 = 0x007;
 pub const CREATE_PERMISSION_METHOD: u16 = 0x008;
 /// `ChannelBind` (§11).
 pub const CHANNEL_BIND_METHOD: u16 = 0x009;
+/// `Connect` (RFC 6062 §6.1): on the **control** connection, asks the server to
+/// dial an `XOR-PEER-ADDRESS` from the TCP allocation's relay address.
+pub const CONNECT_METHOD: u16 = 0x00a;
+/// `ConnectionBind` (RFC 6062 §6.1): on a **new** connection, binds it to a
+/// pending peer data connection named by `CONNECTION-ID`; afterwards that
+/// connection carries raw application bytes only.
+pub const CONNECTION_BIND_METHOD: u16 = 0x00b;
 
 /// `CHANNEL-NUMBER` (§14.1): channel (u16) + RFFU.
 pub const ATTR_CHANNEL_NUMBER: u16 = 0x000C;
@@ -116,11 +140,15 @@ pub const ATTR_DONT_FRAGMENT: u16 = 0x001A;
 pub const ATTR_EVEN_PORT: u16 = 0x0018;
 /// `RESERVATION-TOKEN` (§14.9): 8 opaque bytes naming an EVEN-PORT reservation.
 pub const ATTR_RESERVATION_TOKEN: u16 = 0x0022;
+/// `CONNECTION-ID` (RFC 6062 §6.2.1): 32-bit unsigned, names one peer data
+/// connection. Appears in a `Connect` success response and in the
+/// `ConnectionBind` request that claims it.
+pub const ATTR_CONNECTION_ID: u16 = 0x002a;
 
 /// IANA protocol number of UDP.
 pub const TRANSPORT_UDP: u8 = 17;
-/// IANA protocol number of TCP (`REQUESTED-TRANSPORT = 6` → `442`, RFC 6062 is
-/// out of scope).
+/// IANA protocol number of TCP (`REQUESTED-TRANSPORT = 6`, RFC 6062). Only
+/// honoured when `--turn-tcp-relay` is on; otherwise `442` as before.
 pub const TRANSPORT_TCP: u8 = 6;
 
 /// Whether `DONT-FRAGMENT` can really be honoured (RFC 8656 §7.2 step 4).
@@ -154,6 +182,11 @@ pub const ERROR_UNSUPPORTED_TRANSPORT: u16 = 442;
 pub const ERROR_PEER_ADDRESS_FAMILY_MISMATCH: u16 = 443;
 pub const ERROR_ALLOCATION_QUOTA_REACHED: u16 = 486;
 pub const ERROR_INSUFFICIENT_CAPACITY: u16 = 508;
+/// RFC 6062 §6.3: the same `XOR-PEER-ADDRESS` already has a peer data
+/// connection (pending or bound) on this allocation.
+pub const ERROR_CONNECTION_ALREADY_EXISTS: u16 = 446;
+/// RFC 6062 §6.3: the outbound TCP connection failed or timed out.
+pub const ERROR_CONNECTION_TIMEOUT_OR_FAILURE: u16 = 447;
 
 /// First/last channel number of the `ChannelData` range (§12).
 ///
@@ -192,6 +225,27 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// How long an `EVEN-PORT` reservation token stays usable (RFC 8656 §7.2).
 pub const RESERVATION_LIFETIME: Duration = Duration::from_secs(30);
 
+// ---------------------------------------------------------------------------
+// RFC 6062 (TCP allocations) tunables
+// ---------------------------------------------------------------------------
+
+/// `Connect` budget. RFC 6062 §5.2 says the timeout **MUST be at least 30
+/// seconds**; this is deliberately its own constant (not `TCP_READ_TIMEOUT`,
+/// which is a per-frame control-plane budget and must stay free to change).
+pub const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a **pending** peer data connection may wait for its
+/// `ConnectionBind` before the server closes it (RFC 6062 §5.2/§5.4 MUST).
+pub const TCP_BIND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap on bytes buffered from the peer before the client data connection is
+/// bound (RFC 6062 §5.2/§7 allows closing the connection instead of growing
+/// memory without bound). Purely the application copy; the kernel receive
+/// window provides the first line of backpressure.
+pub const TCP_PREBIND_BUFFER: usize = 64 * 1024;
+/// Per-allocation cap on simultaneous peer data connections (pending + bound).
+/// RFC 6062 does not cap this; exceeding it is `508 Insufficient Capacity`
+/// (same shape as the relay-port and permission limits).
+pub const TCP_MAX_CONNECTIONS_PER_ALLOCATION: usize = 16;
+
 /// Parsed `--turn` configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
@@ -210,6 +264,10 @@ pub struct Config {
     /// peer→client) whose capacity is one second of tokens. Over the cap the
     /// offending packet is dropped and counted; the allocation lives on.
     pub bandwidth: u64,
+    /// `--turn-tcp-relay`: serve RFC 6062 TCP allocations (`Allocate` with
+    /// `REQUESTED-TRANSPORT = 6`, plus `Connect` / `ConnectionBind`). Off by
+    /// default so a request that used to get `442` still does, byte for byte.
+    pub tcp_relay: bool,
 }
 
 impl Default for Config {
@@ -221,6 +279,7 @@ impl Default for Config {
             permission_limit: DEFAULT_PERMISSION_LIMIT,
             lifetime: Duration::from_secs(DEFAULT_ALLOCATION_LIFETIME_SECONDS),
             bandwidth: DEFAULT_BANDWIDTH,
+            tcp_relay: false,
         }
     }
 }
@@ -303,6 +362,15 @@ pub struct Counters {
     /// Bytes dropped by the per-allocation bandwidth buckets (`--turn-bandwidth`).
     pub bytes_dropped_in: AtomicU64,
     pub bytes_dropped_out: AtomicU64,
+    /// RFC 6062 rejections, one bucket per reason (design §5):
+    /// `Connect` failed/timed out (`447`), `ConnectionBind` was refused
+    /// (`400`), a `Send`/`ChannelData` hit a TCP allocation, the pre-bind
+    /// buffer overflowed, or the per-allocation connection cap was hit.
+    pub rejected_tcp_connect: AtomicU64,
+    pub rejected_tcp_bind: AtomicU64,
+    pub rejected_tcp_send: AtomicU64,
+    pub rejected_tcp_buffer: AtomicU64,
+    pub rejected_tcp_quota: AtomicU64,
     /// TLS/DTLS handshakes that failed or timed out (`--turn-tls-listen` /
     /// `--turn-dtls-listen`). Kept out of `/metrics` on purpose: the label
     /// space stays exactly the T1 one plus `rstun_turn_bytes_dropped_total`.
@@ -324,6 +392,14 @@ pub struct Snapshot {
     pub rejected_df: u64,
     pub bytes_dropped_in: u64,
     pub bytes_dropped_out: u64,
+    pub rejected_tcp_connect: u64,
+    pub rejected_tcp_bind: u64,
+    pub rejected_tcp_send: u64,
+    pub rejected_tcp_buffer: u64,
+    pub rejected_tcp_quota: u64,
+    /// Live RFC 6062 data connections, by state (gauges).
+    pub tcp_pending: u64,
+    pub tcp_bound: u64,
     pub handshake_failed: u64,
 }
 
@@ -450,10 +526,53 @@ impl TokenBucket {
     }
 }
 
+/// What an allocation relays through.
+///
+/// RFC 8656 allocations have one UDP socket; RFC 6062 allocations have one TCP
+/// listener whose address is the relayed transport address.
+enum Relay {
+    Udp(Arc<UdpSocket>),
+    Tcp(TcpRelay),
+}
+
+/// The listening half of a TCP relay allocation.
+///
+/// Outbound `Connect` dials from this address (see [`dial_from_relay`]); that is
+/// why the listener sets `SO_REUSEPORT` — without it the kernel refuses to bind
+/// a second socket to a port that is already listening (see
+/// [`crate::tcp_relay_listener`]).
+struct TcpRelay {
+    listener: TcpListener,
+}
+
+impl Relay {
+    fn udp(&self) -> Option<&Arc<UdpSocket>> {
+        match self {
+            Self::Udp(socket) => Some(socket),
+            Self::Tcp(_) => None,
+        }
+    }
+
+    fn port(&self) -> Option<u16> {
+        match self {
+            Self::Udp(socket) => socket.local_addr().ok().map(|address| address.port()),
+            Self::Tcp(relay) => relay
+                .listener
+                .local_addr()
+                .ok()
+                .map(|address| address.port()),
+        }
+    }
+
+    fn is_tcp(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
+}
+
 /// One live allocation.
 pub struct Allocation {
     key: Key,
-    relay: Arc<UdpSocket>,
+    relay: Relay,
     relay_addr: SocketAddr,
     /// Credentials that created the allocation: a different user on the same
     /// 5-tuple gets `441` and cannot touch it (RFC 8656 §5).
@@ -479,8 +598,9 @@ pub struct Allocation {
     /// (`setsockopt` + `try_send_to`), so a plain mutex is enough.
     df_lock: Mutex<()>,
     state: Arc<RwLock<AllocationState>>,
-    /// Aborts the relay reader when the allocation goes away.
-    relay_task: JoinHandle<()>,
+    /// Aborts the relay reader when the allocation goes away. `None` for a TCP
+    /// allocation: its data plane is one task per `CONNECTION-ID`, not a reader.
+    relay_task: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Allocation {
@@ -493,14 +613,18 @@ impl std::fmt::Debug for Allocation {
             .field("lifetime", &self.lifetime)
             .field("client", &self.client)
             .field("dont_fragment", &self.dont_fragment)
+            .field("tcp", &self.relay.is_tcp())
             .finish_non_exhaustive()
     }
 }
 
 impl Drop for Allocation {
     fn drop(&mut self) {
-        // Stopping the reader is what lets the socket (and its port) go.
-        self.relay_task.abort();
+        // Stopping the reader is what lets the socket (and its port) go. A TCP
+        // relay has no reader task; dropping `relay` closes its listener.
+        if let Some(task) = &self.relay_task {
+            task.abort();
+        }
     }
 }
 
@@ -514,13 +638,83 @@ impl Allocation {
     fn relay_addr(&self) -> SocketAddr {
         self.relay_addr
     }
+
+    fn is_tcp(&self) -> bool {
+        self.relay.is_tcp()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 6062 connection table
+// ---------------------------------------------------------------------------
+
+/// The client half of a bound data connection, handed from the accepted
+/// connection's task to the peer connection's task.
+///
+/// Type-erased on purpose: the reader is either a plain-TCP or a TLS half, and
+/// the connection table must not be generic over that.
+pub(crate) struct DataConnection {
+    pub(crate) reader: Box<dyn AsyncRead + Send + Unpin>,
+    /// The control-style bounded writer queue of that connection. Raw peer→
+    /// client bytes go through it, so ordering with the `ConnectionBind`
+    /// success response is preserved and a client that stops reading applies
+    /// backpressure instead of growing memory.
+    pub(crate) sender: mpsc::Sender<Vec<u8>>,
+    /// The writer task that owns the write half; awaiting it after the queue is
+    /// closed is what makes the half-close visible to the client.
+    pub(crate) writer_task: JoinHandle<()>,
+    /// Keeps the accepted-connection slot (`--max-inflight`) alive for the life
+    /// of the data connection. Dropped when the relay task ends.
+    pub(crate) _permit: Option<crate::limit::Permit>,
+}
+
+/// One RFC 6062 peer data connection, keyed by `CONNECTION-ID`.
+struct TcpConnection {
+    /// The allocation (control connection's 5-tuple) that owns it.
+    allocation: Key,
+    /// Username that created the allocation; `ConnectionBind` must use the same
+    /// credentials (RFC 6062 §4.3).
+    username: String,
+    peer: SocketAddr,
+    state: ConnState,
+    /// When the pending connection must be closed (sweep). `None` once bound:
+    /// a bound connection is owned by its task.
+    expires_at: Option<Instant>,
+    /// Wakes the peer task on any forced close (allocation removal, sweep
+    /// timeout, pre-bind buffer overflow). Unused (`Err`) once the task ended.
+    stop: watch::Sender<bool>,
+    /// Given to the peer task on a successful `ConnectionBind`; `None` in every
+    /// other state.
+    bind: Option<oneshot::Sender<DataConnection>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnState {
+    /// The outbound TCP connect is still in progress.
+    Connecting,
+    /// Connected to the peer, waiting for `ConnectionBind`.
+    Pending,
+    /// `ConnectionBind` succeeded; the data path is live.
+    Bound,
+}
+
+impl TcpConnection {
+    fn pending(&self) -> bool {
+        matches!(self.state, ConnState::Connecting | ConnState::Pending)
+    }
+}
+
+/// A client transport is a *stream* when `ConnectionBind` (and thus a data
+/// connection) can exist on it: RFC 6062 §5.4 step 1 refuses the rest with 400.
+fn is_stream_transport(transport: ClientTransport) -> bool {
+    matches!(transport, ClientTransport::Tcp)
 }
 
 // ---------------------------------------------------------------------------
 // The server
 // ---------------------------------------------------------------------------
 
-/// The TURN table: allocations, relay port pool and counters.
+/// The TURN table: allocations, relay port pools and counters.
 ///
 /// `Turn` is immutable except for the two locks; it is stored in an `Arc` and
 /// reached from the request paths through [`ServerStats`](crate::ServerStats)
@@ -532,8 +726,15 @@ pub struct Turn {
     software: String,
     allocations: RwLock<HashMap<Key, Arc<Allocation>>>,
     used_ports: Mutex<HashSet<u16>>,
+    /// TCP relay ports, kept **separate** from `used_ports`: the same port
+    /// number means different things to UDP and TCP, and sharing the pool would
+    /// make one allocation of either kind block the other for no reason.
+    used_tcp_ports: Mutex<HashSet<u16>>,
     /// `EVEN-PORT` (R=1) reservations: token → (odd port, deadline).
     reservations: Mutex<HashMap<[u8; 8], Reservation>>,
+    /// RFC 6062 data connections by `CONNECTION-ID`. `Arc<Mutex<…>>` because the
+    /// per-connection task also removes its own entry when it ends.
+    connections: Arc<Mutex<HashMap<u32, TcpConnection>>>,
     counters: Arc<Counters>,
 }
 
@@ -562,7 +763,9 @@ impl Turn {
             software: software.into(),
             allocations: RwLock::new(HashMap::new()),
             used_ports: Mutex::new(HashSet::new()),
+            used_tcp_ports: Mutex::new(HashSet::new()),
             reservations: Mutex::new(HashMap::new()),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             counters: Arc::new(Counters::default()),
         }
     }
@@ -578,6 +781,15 @@ impl Turn {
     /// One consistent snapshot for `/metrics` and the exit log.
     pub fn snapshot(&self) -> Snapshot {
         let counters = &self.counters;
+        let (tcp_pending, tcp_bound) = {
+            let connections = lock_lock(&self.connections);
+            let pending = connections
+                .values()
+                .filter(|connection| connection.pending())
+                .count() as u64;
+            let bound = connections.len() as u64 - pending;
+            (pending, bound)
+        };
         Snapshot {
             active: self.active(),
             bytes_in: counters.bytes_in.load(Ordering::Relaxed),
@@ -591,6 +803,13 @@ impl Turn {
             rejected_df: counters.rejected_df.load(Ordering::Relaxed),
             bytes_dropped_in: counters.bytes_dropped_in.load(Ordering::Relaxed),
             bytes_dropped_out: counters.bytes_dropped_out.load(Ordering::Relaxed),
+            rejected_tcp_connect: counters.rejected_tcp_connect.load(Ordering::Relaxed),
+            rejected_tcp_bind: counters.rejected_tcp_bind.load(Ordering::Relaxed),
+            rejected_tcp_send: counters.rejected_tcp_send.load(Ordering::Relaxed),
+            rejected_tcp_buffer: counters.rejected_tcp_buffer.load(Ordering::Relaxed),
+            rejected_tcp_quota: counters.rejected_tcp_quota.load(Ordering::Relaxed),
+            tcp_pending,
+            tcp_bound,
             handshake_failed: counters.handshake_failed.load(Ordering::Relaxed),
         }
     }
@@ -614,24 +833,57 @@ impl Turn {
     }
 
     fn insert(&self, allocation: Allocation) {
-        let replaced = lock_write(&self.allocations).insert(allocation.key, Arc::new(allocation));
+        let key = allocation.key;
+        let replaced = lock_write(&self.allocations).insert(key, Arc::new(allocation));
         // Replacing an expired-but-not-yet-swept entry must not leak its port;
-        // the old socket dies with the last `Arc` right after this.
+        // the old socket dies with the last `Arc` right after this. Its data
+        // connections go too (§5.5). Note it is the **previous** entry's port
+        // that goes back to its pool — the new allocation's port is in use.
         if let Some(previous) = replaced {
-            self.release_port(previous.relay_addr.port());
+            self.release_port(previous.relay_addr.port(), previous.is_tcp());
+            self.close_connections_for(&key);
+            drop(previous);
         }
     }
 
-    /// Return one relay port to the pool (idempotent).
-    fn release_port(&self, port: u16) {
-        lock_lock(&self.used_ports).remove(&port);
+    /// Return one relay port to the pool it came from (idempotent).
+    fn release_port(&self, port: u16, tcp: bool) {
+        if tcp {
+            lock_lock(&self.used_tcp_ports).remove(&port);
+        } else {
+            lock_lock(&self.used_ports).remove(&port);
+        }
     }
 
-    /// Remove one allocation, returning its relay port to the pool.
+    /// Remove one allocation, returning its relay port to the pool and closing
+    /// every data connection it owns (RFC 6062 §5.5).
     fn remove(&self, key: &Key) -> Option<Arc<Allocation>> {
         let allocation = lock_write(&self.allocations).remove(key)?;
-        self.release_port(allocation.relay_addr.port());
+        self.release_port(allocation.relay_addr.port(), allocation.is_tcp());
+        self.close_connections_for(key);
         Some(allocation)
+    }
+
+    /// Signal every RFC 6062 data connection of `key` to stop. Pending ones are
+    /// dropped with their peer socket; bound ones are closed by their task.
+    fn close_connections_for(&self, key: &Key) {
+        let ids: Vec<u32> = {
+            let connections = lock_lock(&self.connections);
+            connections
+                .iter()
+                .filter(|(_, connection)| connection.allocation == *key)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in ids {
+            if let Some(connection) = lock_lock(&self.connections).remove(&id) {
+                // The peer task wakes up and tears both halves down; a task that
+                // is not running yet (still connecting) simply finds its entry
+                // gone when the connect returns.
+                let _ = connection.stop.send(true);
+                tracing::debug!(id, "rstun: TURN TCP connection closed with its allocation");
+            }
+        }
     }
 
     /// Allocations belonging to one closed TCP connection: their writer task
@@ -674,6 +926,27 @@ impl Turn {
         None
     }
 
+    /// Take the lowest free **TCP** relay port and listen on it.
+    ///
+    /// The listener binds with `SO_REUSEPORT` (see [`crate::tcp_relay_listener`])
+    /// so `Connect` can dial out from the same address — RFC 6062 §5.2 requires
+    /// the peer data connection to originate from the relayed transport address.
+    fn take_tcp_port(&self, ip: IpAddr) -> Option<TcpRelay> {
+        let (lo, hi) = self.config.relay_ports;
+        let mut used = lock_lock(&self.used_tcp_ports);
+        for port in lo..=hi {
+            if used.contains(&port) {
+                continue;
+            }
+            let Ok(listener) = crate::tcp_relay_listener(SocketAddr::new(ip, port)) else {
+                continue;
+            };
+            used.insert(port);
+            return Some(TcpRelay { listener });
+        }
+        None
+    }
+
     /// Bind an even relay port and keep the next (odd) port reserved for the
     /// `EVEN-PORT` (R=1) token (RFC 8656 §7.2).
     fn take_even_port_with_reservation(&self, ip: IpAddr) -> Option<(Arc<UdpSocket>, u16)> {
@@ -702,14 +975,14 @@ impl Turn {
         let now = Instant::now();
         let reservation = lock_lock(&self.reservations).remove(&token)?;
         if reservation.expires_at <= now {
-            self.release_port(reservation.port);
+            self.release_port(reservation.port, false);
             return None;
         }
         match crate::udp_socket(SocketAddr::new(ip, reservation.port)) {
             Ok(socket) => Some(Arc::new(socket)),
             Err(_) => {
                 // Give the port back rather than leave it reserved forever.
-                self.release_port(reservation.port);
+                self.release_port(reservation.port, false);
                 None
             }
         }
@@ -755,7 +1028,32 @@ impl Turn {
         };
         for token in stale {
             if let Some(reservation) = lock_lock(&self.reservations).remove(&token) {
-                self.release_port(reservation.port);
+                self.release_port(reservation.port, false);
+            }
+        }
+
+        // RFC 6062 §5.2/§5.4: a peer data connection that never got its
+        // `ConnectionBind` MUST be closed after 30 s. Connecting entries are
+        // included — a dial that hangs is bounded by `TCP_CONNECT_TIMEOUT`.
+        let stale_connections: Vec<u32> = {
+            let connections = lock_lock(&self.connections);
+            connections
+                .iter()
+                .filter(|(_, connection)| {
+                    connection
+                        .expires_at
+                        .is_some_and(|deadline| deadline <= now)
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in stale_connections {
+            if let Some(connection) = lock_lock(&self.connections).remove(&id) {
+                let _ = connection.stop.send(true);
+                tracing::debug!(
+                    id,
+                    "rstun: TURN TCP connection expired before ConnectionBind"
+                );
             }
         }
         removed
@@ -799,7 +1097,14 @@ impl Turn {
     /// `None` means "not ours": the STUN path keeps deciding (a Binding request,
     /// a malformed frame, an indication we do not answer). `Some(Ok(decision))`
     /// is a fully handled TURN message.
-    pub(crate) fn handle(
+    ///
+    /// Async only for RFC 6062 `Connect`, which dials the peer from the relay
+    /// address. Every other request completes without awaiting anything, so the
+    /// datagram path keeps its old serial behaviour (a TCP allocation cannot
+    /// exist on a datagram transport, hence `Connect` is rejected before the
+    /// dial on UDP/DTLS).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle(
         &self,
         datagram: &[u8],
         peer: SocketAddr,
@@ -857,26 +1162,35 @@ impl Turn {
         if class != MessageClass::Request {
             return None;
         }
-        if !matches!(
-            method,
-            ALLOCATE_METHOD | REFRESH_METHOD | CREATE_PERMISSION_METHOD | CHANNEL_BIND_METHOD
-        ) {
+        // RFC 6062 methods only exist as TURN when the switch is on. Off, they
+        // fall through to the STUN path exactly as before (`400`), keeping the
+        // classic answers byte-identical.
+        let rfc6062 =
+            self.config.tcp_relay && matches!(method, CONNECT_METHOD | CONNECTION_BIND_METHOD);
+        if !(rfc6062
+            || matches!(
+                method,
+                ALLOCATE_METHOD | REFRESH_METHOD | CREATE_PERMISSION_METHOD | CHANNEL_BIND_METHOD
+            ))
+        {
             return None;
         }
-        Some(Ok(self.handle_request(
-            datagram,
-            &message,
-            method,
-            peer,
-            local,
-            client_transport,
-            context,
-            sink,
-        )))
+        Some(Ok(self
+            .handle_request(
+                datagram,
+                &message,
+                method,
+                peer,
+                local,
+                client_transport,
+                context,
+                sink,
+            )
+            .await))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_request(
+    async fn handle_request(
         &self,
         datagram: &[u8],
         message: &protocol::Message<'_>,
@@ -932,7 +1246,14 @@ impl Turn {
             CHANNEL_BIND_METHOD => {
                 self.channel_bind(message, peer, local, transport, context, &identity)
             }
-            _ => unreachable!("handle_request is only called for the four methods"),
+            CONNECT_METHOD => {
+                self.connect(message, peer, local, transport, context, &identity)
+                    .await
+            }
+            CONNECTION_BIND_METHOD => {
+                self.connection_bind(message, peer, local, transport, &identity)
+            }
+            _ => unreachable!("handle_request is only called for TURN methods"),
         }
     }
 
@@ -973,9 +1294,12 @@ impl Turn {
             ));
         }
         // The wire value is `protocol (1 byte) | RFFU (3 bytes)`.
-        match requested[0] {
-            TRANSPORT_UDP => {}
-            TRANSPORT_TCP => {
+        let tcp_relay = match requested[0] {
+            TRANSPORT_UDP => false,
+            // RFC 6062: only with the explicit switch, and only on a TCP/TLS
+            // control connection (§5.1 step 2). Off, this is the old `442`.
+            TRANSPORT_TCP if self.config.tcp_relay => true,
+            _ => {
                 return Decision::Respond(signed_error(
                     transaction_id,
                     ALLOCATE_METHOD,
@@ -984,12 +1308,30 @@ impl Turn {
                     identity,
                 ));
             }
-            _ => {
+        };
+        if tcp_relay {
+            // RFC 6062 §5.1 step 2 / §4.1: a TCP allocation needs a stream
+            // control connection, and it MUST NOT carry DONT-FRAGMENT,
+            // EVEN-PORT or RESERVATION-TOKEN (there is no datagram to fragment
+            // and no port pair to reserve).
+            if !is_stream_transport(transport) {
                 return Decision::Respond(signed_error(
                     transaction_id,
                     ALLOCATE_METHOD,
-                    ERROR_UNSUPPORTED_TRANSPORT,
-                    "Unsupported Transport Protocol",
+                    protocol::ERROR_BAD_REQUEST,
+                    "Bad Request",
+                    identity,
+                ));
+            }
+            if attribute(body, ATTR_DONT_FRAGMENT).is_some()
+                || attribute(body, ATTR_EVEN_PORT).is_some()
+                || attribute(body, ATTR_RESERVATION_TOKEN).is_some()
+            {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    protocol::ERROR_BAD_REQUEST,
+                    "Bad Request",
                     identity,
                 ));
             }
@@ -1204,9 +1546,30 @@ impl Turn {
             ));
         }
 
-        let (relay, new_token) = if let Some(token) = reservation_token {
+        let (relay, new_token) = if tcp_relay {
+            // RFC 6062: a dedicated TCP relay port (separate pool, §4 `Connect`
+            // dials from it) and no `EVEN-PORT` / `RESERVATION-TOKEN`, which
+            // were rejected above.
+            match self.take_tcp_port(relay_ip) {
+                Some(relay) => (Relay::Tcp(relay), None),
+                None => {
+                    self.counters.rejected_ports.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        ports = ?self.config.relay_ports,
+                        "rstun: TURN TCP relay port range exhausted"
+                    );
+                    return Decision::Respond(signed_error(
+                        transaction_id,
+                        ALLOCATE_METHOD,
+                        ERROR_INSUFFICIENT_CAPACITY,
+                        "Insufficient Capacity",
+                        identity,
+                    ));
+                }
+            }
+        } else if let Some(token) = reservation_token {
             match self.take_reserved_port(relay_ip, token) {
-                Some(relay) => (relay, None),
+                Some(relay) => (Relay::Udp(relay), None),
                 None => {
                     self.counters.rejected_ports.fetch_add(1, Ordering::Relaxed);
                     return Decision::Respond(signed_error(
@@ -1229,7 +1592,7 @@ impl Turn {
                             expires_at: now + RESERVATION_LIFETIME,
                         },
                     );
-                    (relay, Some(token))
+                    (Relay::Udp(relay), Some(token))
                 }
                 None => {
                     self.counters.rejected_ports.fetch_add(1, Ordering::Relaxed);
@@ -1244,7 +1607,7 @@ impl Turn {
             }
         } else {
             match self.take_port(relay_ip, wants_even) {
-                Some(relay) => (relay, None),
+                Some(relay) => (Relay::Udp(relay), None),
                 None => {
                     self.counters.rejected_ports.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
@@ -1261,7 +1624,16 @@ impl Turn {
                 }
             }
         };
-        let Ok(relay_addr) = relay.local_addr() else {
+        let relay_addr = match &relay {
+            Relay::Udp(socket) => socket.local_addr(),
+            Relay::Tcp(relay) => relay.listener.local_addr(),
+        };
+        let Ok(relay_addr) = relay_addr else {
+            // Unreachable on a bound socket; still return the port to its pool
+            // rather than leak a slot in the range.
+            if let Some(port) = relay.port() {
+                self.release_port(port, tcp_relay);
+            }
             return Decision::Respond(signed_error(
                 transaction_id,
                 ALLOCATE_METHOD,
@@ -1274,13 +1646,17 @@ impl Turn {
         // §7.2 step 4 / §18.9: the client asked for every datagram from this
         // relay to carry DF. A socket that refuses the option is an internal
         // failure (`500`), not a protocol one — the capability probe already
-        // succeeded, so answering `420` would be a lie.
-        if dont_fragment && let Err(error) = set_dont_fragment(&relay, true) {
+        // succeeded, so answering `420` would be a lie. TCP allocations never
+        // carry DF (the attribute was rejected above).
+        if dont_fragment
+            && let Some(socket) = relay.udp()
+            && let Err(error) = set_dont_fragment(socket, true)
+        {
             self.counters.rejected_df.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%peer, %error, "rstun: TURN relay socket refused DONT-FRAGMENT");
             // Dropping the last `Arc` closes the socket; the port must go back
             // to the pool explicitly (nothing references it yet).
-            self.release_port(relay_addr.port());
+            self.release_port(relay_addr.port(), false);
             return Decision::Respond(signed_error(
                 transaction_id,
                 ALLOCATE_METHOD,
@@ -1294,7 +1670,7 @@ impl Turn {
             ClientTransport::Udp => match context.socket_for(local) {
                 Some(socket) => ClientSink::Udp(socket.clone()),
                 None => {
-                    self.release_port(relay_addr.port());
+                    self.release_port(relay_addr.port(), tcp_relay);
                     return Decision::Respond(signed_error(
                         transaction_id,
                         ALLOCATE_METHOD,
@@ -1307,7 +1683,7 @@ impl Turn {
             ClientTransport::Tcp | ClientTransport::Dtls => match sink {
                 Some(sink) => ClientSink::Queue(sink.clone()),
                 None => {
-                    self.release_port(relay_addr.port());
+                    self.release_port(relay_addr.port(), tcp_relay);
                     return Decision::Respond(signed_error(
                         transaction_id,
                         ALLOCATE_METHOD,
@@ -1326,14 +1702,19 @@ impl Turn {
             inbound: TokenBucket::new(self.config.bandwidth, now),
             outbound: TokenBucket::new(self.config.bandwidth, now),
         }));
-        let relay_task = spawn_relay_reader(
-            relay.clone(),
-            state.clone(),
-            sink.clone(),
-            peer,
-            transport,
-            self.counters.clone(),
-        );
+        // A TCP allocation has no relay reader: its data plane is one task per
+        // peer data connection (RFC 6062), started by `Connect`.
+        let relay_task = match &relay {
+            Relay::Udp(relay) => Some(spawn_relay_reader(
+                relay.clone(),
+                state.clone(),
+                sink.clone(),
+                peer,
+                transport,
+                self.counters.clone(),
+            )),
+            Relay::Tcp(_) => None,
+        };
         let allocation = Allocation {
             key,
             relay,
@@ -1641,6 +2022,18 @@ impl Turn {
                 identity,
             ));
         }
+        // RFC 6062 §3: a TCP allocation's data plane is raw bytes keyed by
+        // `CONNECTION-ID`; there is no channel to bind. Failing loudly beats a
+        // 200 that would never relay.
+        if allocation.is_tcp() {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CHANNEL_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
 
         let Some(channel) = attribute(message.body, ATTR_CHANNEL_NUMBER) else {
             return Decision::Respond(signed_error(
@@ -1760,6 +2153,384 @@ impl Turn {
             identity,
             &self.software,
         ))
+    }
+
+    // -- RFC 6062: Connect / ConnectionBind --------------------------------
+
+    /// `Connect` (RFC 6062 §5.2): dial `XOR-PEER-ADDRESS` from the allocation's
+    /// relay address, buffer what the peer says, and hand back a
+    /// `CONNECTION-ID` for the pending peer data connection.
+    ///
+    /// `SOFTWARE` is deliberately **absent** from the success response, which is
+    /// what coturn does too (`Connect ok` is 32 bytes there); every other TURN
+    /// response keeps it. Recorded in `docs/book/src/turn.md`.
+    async fn connect(
+        &self,
+        message: &protocol::Message<'_>,
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        context: &ServerContext,
+        identity: &Identity,
+    ) -> Decision {
+        let transaction_id = &message.transaction_id;
+        // §4.1 / §5.2: peer data connections exist only on a TCP/TLS control
+        // connection. (A TCP allocation cannot be created anywhere else either,
+        // but be explicit rather than answering 437 for a shape we never serve.)
+        if !is_stream_transport(transport) {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECT_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        let key = Key {
+            client: peer,
+            transport,
+            server: local,
+        };
+        let now = Instant::now();
+        let Some(allocation) = self.get(&key, now) else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECT_METHOD,
+                ERROR_ALLOCATION_MISMATCH,
+                "Allocation Mismatch",
+                identity,
+            ));
+        };
+        if allocation.username != identity.username {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECT_METHOD,
+                ERROR_WRONG_CREDENTIALS,
+                "Wrong Credentials",
+                identity,
+            ));
+        }
+        // Only TCP allocations have peer data connections; anything else on
+        // this 5-tuple is an allocation mismatch for this method.
+        if !allocation.is_tcp() {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECT_METHOD,
+                ERROR_ALLOCATION_MISMATCH,
+                "Allocation Mismatch",
+                identity,
+            ));
+        }
+        // §5.2 step 4: `XOR-PEER-ADDRESS` is mandatory and must decode.
+        let Some(peer_address) = attribute(message.body, ATTR_XOR_PEER_ADDRESS)
+            .and_then(|value| protocol::decode_xor_mapped_address(value, transaction_id))
+        else {
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECT_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        };
+        // §5.2 step 5 (local policy): the same four address classes and
+        // loopback rules as permissions. `check_peers` answers 443 for a family
+        // mismatch and 403 for a forbidden address.
+        if let Some(response) = self.check_peers(
+            &allocation,
+            &[peer_address],
+            local,
+            context,
+            CONNECT_METHOD,
+            transaction_id,
+            identity,
+        ) {
+            return Decision::Respond(response);
+        }
+        let (id, stop_rx) = {
+            let mut connections = lock_lock(&self.connections);
+            // §5.2 steps 2/3: one peer data connection per peer address.
+            if connections
+                .values()
+                .any(|connection| connection.allocation == key && connection.peer == peer_address)
+            {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    CONNECT_METHOD,
+                    ERROR_CONNECTION_ALREADY_EXISTS,
+                    "Connection Already Exists",
+                    identity,
+                ));
+            }
+            let live = connections
+                .values()
+                .filter(|connection| connection.allocation == key)
+                .count();
+            if live >= TCP_MAX_CONNECTIONS_PER_ALLOCATION {
+                self.counters
+                    .rejected_tcp_quota
+                    .fetch_add(1, Ordering::Relaxed);
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    CONNECT_METHOD,
+                    ERROR_INSUFFICIENT_CAPACITY,
+                    "Insufficient Capacity",
+                    identity,
+                ));
+            }
+            let id = loop {
+                let candidate = fresh_connection_id();
+                if !connections.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            let (stop_tx, stop_rx) = watch::channel(false);
+            connections.insert(
+                id,
+                TcpConnection {
+                    allocation: key,
+                    username: identity.username.clone(),
+                    peer: peer_address,
+                    state: ConnState::Connecting,
+                    // Leave room for the dial's own budget: the sweep must not
+                    // reap a connect that is still running.
+                    expires_at: Some(now + TCP_CONNECT_TIMEOUT + SWEEP_INTERVAL),
+                    stop: stop_tx,
+                    bind: None,
+                },
+            );
+            (id, stop_rx)
+        };
+
+        // §5.2 step 6: dial from the relayed transport address, bounded by the
+        // RFC's ≥30 s budget.
+        let dialed = tokio::time::timeout(
+            TCP_CONNECT_TIMEOUT,
+            dial_from_relay(allocation.relay_addr(), peer_address),
+        )
+        .await;
+        let stream = match dialed {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                lock_lock(&self.connections).remove(&id);
+                self.counters
+                    .rejected_tcp_connect
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    %peer,
+                    %peer_address,
+                    relay = %allocation.relay_addr(),
+                    %error,
+                    "rstun: TURN Connect failed"
+                );
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    CONNECT_METHOD,
+                    ERROR_CONNECTION_TIMEOUT_OR_FAILURE,
+                    "Connection Timeout or Failure",
+                    identity,
+                ));
+            }
+            Err(_elapsed) => {
+                lock_lock(&self.connections).remove(&id);
+                self.counters
+                    .rejected_tcp_connect
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    %peer,
+                    %peer_address,
+                    "rstun: TURN Connect timed out"
+                );
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    CONNECT_METHOD,
+                    ERROR_CONNECTION_TIMEOUT_OR_FAILURE,
+                    "Connection Timeout or Failure",
+                    identity,
+                ));
+            }
+        };
+
+        // Publish the pending connection and start its task. The task buffers
+        // peer→client bytes until `ConnectionBind` hands it the client halves.
+        let (bind_tx, bind_rx) = oneshot::channel();
+        let installed = {
+            let mut connections = lock_lock(&self.connections);
+            match connections.get_mut(&id) {
+                Some(connection) => {
+                    connection.state = ConnState::Pending;
+                    connection.expires_at = Some(Instant::now() + TCP_BIND_TIMEOUT);
+                    connection.bind = Some(bind_tx);
+                    true
+                }
+                // Swept or its allocation removed while we were dialling.
+                None => false,
+            }
+        };
+        if !installed {
+            self.counters
+                .rejected_tcp_connect
+                .fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECT_METHOD,
+                ERROR_CONNECTION_TIMEOUT_OR_FAILURE,
+                "Connection Timeout or Failure",
+                identity,
+            ));
+        }
+        let (peer_reader, peer_writer) = tokio::io::split(stream);
+        tokio::spawn(run_tcp_connection(
+            id,
+            self.connections.clone(),
+            self.counters.clone(),
+            peer_reader,
+            peer_writer,
+            stop_rx,
+            bind_rx,
+        ));
+
+        tracing::debug!(
+            %peer,
+            %peer_address,
+            relay = %allocation.relay_addr(),
+            connection_id = id,
+            "rstun: TURN Connect established a peer data connection"
+        );
+        Decision::Respond(success_without_software(
+            transaction_id,
+            CONNECT_METHOD,
+            &[(ATTR_CONNECTION_ID, id.to_be_bytes().to_vec())],
+            identity,
+        ))
+    }
+
+    /// `ConnectionBind` (RFC 6062 §5.4): claim a pending peer data connection
+    /// from a **new** connection. The caller turns the stream into a raw-byte
+    /// data connection when this returns [`Decision::Bind`].
+    fn connection_bind(
+        &self,
+        message: &protocol::Message<'_>,
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        identity: &Identity,
+    ) -> Decision {
+        let transaction_id = &message.transaction_id;
+        // §5.4 step 1: only a stream transport can carry a data connection.
+        if !is_stream_transport(transport) {
+            self.counters
+                .rejected_tcp_bind
+                .fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECTION_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        // A control connection that already owns an allocation is not a data
+        // connection (RFC 6062 §3: the client data connection is a *new*
+        // connection). This also leaves room for the ordinary 401 challenge
+        // dance on a fresh connection.
+        let key = Key {
+            client: peer,
+            transport,
+            server: local,
+        };
+        if self.get(&key, Instant::now()).is_some() {
+            self.counters
+                .rejected_tcp_bind
+                .fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECTION_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        // §5.4 step 2: the id must be present, well-formed and pending.
+        let Some(value) = attribute(message.body, ATTR_CONNECTION_ID) else {
+            self.counters
+                .rejected_tcp_bind
+                .fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECTION_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        };
+        let Ok(bytes) = <[u8; 4]>::try_from(value) else {
+            self.counters
+                .rejected_tcp_bind
+                .fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECTION_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        };
+        let id = u32::from_be_bytes(bytes);
+        let now = Instant::now();
+        let bound = {
+            let mut connections = lock_lock(&self.connections);
+            match connections.get_mut(&id) {
+                Some(connection)
+                    if connection.state == ConnState::Pending
+                        && connection.username == identity.username
+                        && connection.expires_at.is_some_and(|deadline| deadline > now)
+                        && self
+                            .get(&connection.allocation, now)
+                            .is_some_and(|allocation| allocation.is_tcp()) =>
+                {
+                    // §5.4 step 3: from now on this connection carries raw
+                    // application bytes; `ConnectionBind` cannot be repeated.
+                    connection.state = ConnState::Bound;
+                    connection.expires_at = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !bound {
+            self.counters
+                .rejected_tcp_bind
+                .fetch_add(1, Ordering::Relaxed);
+            return Decision::Respond(signed_error(
+                transaction_id,
+                CONNECTION_BIND_METHOD,
+                protocol::ERROR_BAD_REQUEST,
+                "Bad Request",
+                identity,
+            ));
+        }
+        tracing::debug!(%id, "rstun: TURN ConnectionBind bound a client data connection");
+        Decision::Bind {
+            response: success(
+                transaction_id,
+                CONNECTION_BIND_METHOD,
+                &[],
+                identity,
+                &self.software,
+            ),
+            id,
+        }
+    }
+
+    /// Hand the client halves of a bound data connection to its peer task.
+    ///
+    /// `None` means the connection vanished (allocation removed) between the
+    /// bind and this call; the caller just closes the connection.
+    pub(crate) fn take_bind(&self, id: u32) -> Option<oneshot::Sender<DataConnection>> {
+        lock_lock(&self.connections)
+            .get_mut(&id)
+            .and_then(|connection| connection.bind.take())
     }
 
     /// Shared peer validation: family, loopback, permission upper bound.
@@ -1911,6 +2682,15 @@ impl Turn {
         let Some(allocation) = self.get(&key, now) else {
             return;
         };
+        // RFC 6062: a TCP allocation relays raw bytes over its bound data
+        // connections; a `Send` indication has no meaning and silently
+        // forwarding it would be a lie. Counted, not answered (§7.3).
+        if allocation.is_tcp() {
+            self.counters
+                .rejected_tcp_send
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(peer_address) = attribute(message.body, ATTR_XOR_PEER_ADDRESS)
             .and_then(|value| protocol::decode_xor_mapped_address(value, &message.transaction_id))
         else {
@@ -1955,7 +2735,10 @@ impl Turn {
             // `ChannelData` stay lock-free (known limitation, documented in
             // `.trellis/spec/backend/turn.md`).
             let _guard = lock_lock(&allocation.df_lock);
-            if let Err(error) = set_dont_fragment(&allocation.relay, true) {
+            let Some(relay) = allocation.relay.udp() else {
+                return;
+            };
+            if let Err(error) = set_dont_fragment(relay, true) {
                 self.counters.rejected_df.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     relay = %allocation.relay_addr,
@@ -1965,7 +2748,7 @@ impl Turn {
                 return;
             }
             self.relay_to_peer(&allocation, data, peer_address);
-            if let Err(error) = set_dont_fragment(&allocation.relay, false) {
+            if let Err(error) = set_dont_fragment(relay, false) {
                 // The bit stays on for this allocation: a later datagram may be
                 // sent with DF it did not ask for, which is harmless, so only
                 // log it.
@@ -1991,6 +2774,14 @@ impl Turn {
         data: &[u8],
         peer_address: SocketAddr,
     ) -> bool {
+        // A TCP allocation has no datagram relay path: the data plane is the
+        // bound connection's raw-byte copy, not `Send`/`ChannelData`.
+        let Some(relay) = allocation.relay.udp() else {
+            self.counters
+                .rejected_tcp_send
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
         let now = Instant::now();
         let allowed = lock_write(&allocation.state)
             .inbound
@@ -2006,7 +2797,7 @@ impl Turn {
             );
             return false;
         }
-        if allocation.relay.try_send_to(data, peer_address).is_ok() {
+        if relay.try_send_to(data, peer_address).is_ok() {
             self.counters
                 .bytes_in
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -2035,6 +2826,14 @@ impl Turn {
         let Some(allocation) = self.get(&key, now) else {
             return;
         };
+        // A TCP allocation has no channels (`ChannelBind` is 400), but a client
+        // could still send a ChannelData frame: discard and count it.
+        if allocation.is_tcp() {
+            self.counters
+                .rejected_tcp_send
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let peer_address = {
             let state = lock_read(&allocation.state);
             let Some(binding) = state.channels.get(&channel) else {
@@ -2075,6 +2874,196 @@ impl Turn {
         }
         (per_user, per_ip)
     }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 6062 data plane
+// ---------------------------------------------------------------------------
+
+/// Dial `peer` with `local` as the source address.
+///
+/// RFC 6062 §5.2: the peer data connection must originate from the relayed
+/// transport address. That means binding a second socket to the port the relay
+/// **listener** already holds, which the kernel only allows when both sockets
+/// set `SO_REUSEPORT` (`crate::tcp_relay_listener` does the same for the
+/// listener). Platforms without it — Windows — fall back to an ephemeral source
+/// port; the connection itself still works, only the peer's view of the source
+/// address differs. Recorded in `docs/book/src/turn.md`.
+async fn dial_from_relay(local: SocketAddr, peer: SocketAddr) -> std::io::Result<TcpStream> {
+    let socket = if peer.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    #[cfg(unix)]
+    {
+        // Both are best effort: the bind below decides whether sharing works.
+        let _ = socket.set_reuseaddr(true);
+        let _ = socket.set_reuseport(true);
+    }
+    if let Err(error) = socket.bind(local) {
+        tracing::debug!(
+            %local,
+            %peer,
+            %error,
+            "rstun: TURN Connect cannot bind the relay address; using an ephemeral source port"
+        );
+    }
+    socket.connect(peer).await
+}
+
+/// One peer data connection's task: buffer until bound, then copy both ways.
+///
+/// Lifecycle (RFC 6062 §5.5):
+/// * either side finishing its write half (`EOF`) shuts down the other side's
+///   write half, and the copy continues in the other direction;
+/// * an error on either side, the `stop` signal (allocation removed) or the
+///   bind deadline ending closes both;
+/// * the table entry is removed when the task ends.
+#[allow(clippy::too_many_arguments)]
+async fn run_tcp_connection(
+    id: u32,
+    connections: Arc<Mutex<HashMap<u32, TcpConnection>>>,
+    counters: Arc<Counters>,
+    mut peer_reader: tokio::io::ReadHalf<TcpStream>,
+    mut peer_writer: tokio::io::WriteHalf<TcpStream>,
+    mut stop: watch::Receiver<bool>,
+    mut halves: oneshot::Receiver<DataConnection>,
+) {
+    // Phase 1: `Connect` has succeeded but the client has not bound yet. RFC
+    // 6062 §5.2 requires buffering what the peer sends, with a local cap (§7).
+    let mut prebuffer: Vec<u8> = Vec::new();
+    let mut chunk = vec![0_u8; 8192];
+    let data = loop {
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return finish_tcp_connection(&connections, id),
+            received = &mut halves => match received {
+                Ok(data) => break data,
+                Err(_) => return finish_tcp_connection(&connections, id),
+            },
+            read = peer_reader.read(&mut chunk) => match read {
+                Ok(0) => return finish_tcp_connection(&connections, id),
+                Ok(length) => {
+                    if prebuffer.len() + length > TCP_PREBIND_BUFFER {
+                        counters.rejected_tcp_buffer.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(id, "rstun: TURN pre-bind buffer overflow, closing");
+                        return finish_tcp_connection(&connections, id);
+                    }
+                    prebuffer.extend_from_slice(&chunk[..length]);
+                }
+                Err(_) => return finish_tcp_connection(&connections, id),
+            },
+        }
+    };
+    let DataConnection {
+        mut reader,
+        sender,
+        writer_task,
+        _permit: _inflight,
+    } = data;
+
+    // Phase 2: drain the pre-bind buffer through the same queue the client's
+    // write half consumes, so ordering with the bind response is preserved.
+    if !prebuffer.is_empty() {
+        let buffered = prebuffer.len();
+        if sender.send(prebuffer).await.is_err() {
+            return finish_tcp_connection(&connections, id);
+        }
+        counters
+            .bytes_out
+            .fetch_add(buffered as u64, Ordering::Relaxed);
+    }
+
+    // Phase 3: bidirectional copy. Each direction is `Ok(())` on a clean EOF —
+    // a clean EOF only half-closes the connection (RFC 6062 §5.5) — and `Err`
+    // on a socket error, which closes both.
+    let mut client_to_peer = {
+        let counters = counters.clone();
+        Box::pin(async move {
+            let mut chunk = vec![0_u8; 16384];
+            loop {
+                let length = match reader.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(length) => length,
+                    Err(_) => return Err(()),
+                };
+                if peer_writer.write_all(&chunk[..length]).await.is_err() {
+                    return Err(());
+                }
+                counters
+                    .bytes_in
+                    .fetch_add(length as u64, Ordering::Relaxed);
+            }
+            // Client half-closed its write side: pass the EOF on to the peer.
+            let _ = peer_writer.shutdown().await;
+            Ok(())
+        })
+    };
+    let mut peer_to_client = {
+        let counters = counters.clone();
+        Box::pin(async move {
+            let mut chunk = vec![0_u8; 16384];
+            loop {
+                let length = match peer_reader.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(length) => length,
+                    Err(_) => return Err(()),
+                };
+                if sender.send(chunk[..length].to_vec()).await.is_err() {
+                    return Err(());
+                }
+                counters
+                    .bytes_out
+                    .fetch_add(length as u64, Ordering::Relaxed);
+            }
+            // Peer half-closed: dropping the last sender makes the writer task
+            // shut the client's write half down (the half-close the client sees).
+            drop(sender);
+            let _ = writer_task.await;
+            Ok(())
+        })
+    };
+
+    let mut client_to_peer_done = false;
+    let mut peer_to_client_done = false;
+    while !(client_to_peer_done && peer_to_client_done) {
+        tokio::select! {
+            biased;
+            _ = stop.changed() => break,
+            result = &mut client_to_peer, if !client_to_peer_done => {
+                client_to_peer_done = true;
+                if result.is_err() {
+                    break;
+                }
+            }
+            result = &mut peer_to_client, if !peer_to_client_done => {
+                peer_to_client_done = true;
+                if result.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    finish_tcp_connection(&connections, id);
+}
+
+/// Remove a data connection's entry; the caller's task is about to end.
+fn finish_tcp_connection(connections: &Mutex<HashMap<u32, TcpConnection>>, id: u32) {
+    lock_lock(connections).remove(&id);
+}
+
+/// A `CONNECTION-ID` no live connection uses (checked by the caller) and that
+/// is never `0`, which clients treat as "unset".
+fn fresh_connection_id() -> u32 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let id = (nanos ^ sequence.wrapping_mul(0x9E37_79B9_7F4A_7C15)) as u32;
+    if id == 0 { 1 } else { id }
 }
 
 // ---------------------------------------------------------------------------
@@ -2253,6 +3242,33 @@ fn success(
         &body,
     );
     auth::seal(frame, identity)
+}
+
+/// A success response **without** `SOFTWARE`.
+///
+/// Only RFC 6062 `Connect` uses it: coturn's own `Connect ok` is exactly
+/// `CONNECTION-ID + MESSAGE-INTEGRITY` (32 bytes), and matching that keeps the
+/// interop comparison meaningful. Every other response still appends
+/// `SOFTWARE` (§14.10 SHOULD); the deviation is recorded in
+/// `docs/book/src/turn.md`.
+fn success_without_software(
+    transaction_id: &TransactionId,
+    method: u16,
+    attributes: &[(u16, Vec<u8>)],
+    identity: &Identity,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (attr_type, value) in attributes {
+        protocol::push_attribute(&mut body, *attr_type, value);
+    }
+    auth::seal(
+        protocol::encode_message(
+            protocol::message_type(method, MessageClass::SuccessResponse),
+            transaction_id,
+            &body,
+        ),
+        identity,
+    )
 }
 
 fn signed_error(
@@ -2461,6 +3477,10 @@ fn turn_unknown_attributes_with(body: &[u8], dont_fragment_supported: bool) -> V
                     | ATTR_EVEN_PORT
                     | ATTR_RESERVATION_TOKEN
                     | ATTR_REQUESTED_ADDRESS_FAMILY
+                    // RFC 6062 §6.2.1: understood by this server (the `Connect`
+                    // / `ConnectionBind` paths), so a request carrying it must
+                    // not be answered `420` before those methods run.
+                    | ATTR_CONNECTION_ID
             )
         {
             continue;

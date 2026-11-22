@@ -19,8 +19,9 @@
 RFC 8489 §9.2 的 SHA256/USERHASH，**默认关闭**）+ **可选的 RFC 8656 中继**
 （`--turn`，**默认关闭、缺长期凭据拒绝启动**）：UDP / TCP 客户端传输、`turns:`（TLS）、
 DTLS 1.2、TURN REST 临时凭据（coturn `use-auth-secret`）、每 allocation 带宽配额。
-**不做**：TCP allocation（RFC 6062）、ACME/OCSP、租户/数据库/配置文件。
-需要这些时请用 coturn。
+RFC 6062 的**出站** TCP allocation（`--turn-tcp-relay`，默认关）也支持：`Allocate` +
+`Connect` + `ConnectionBind`，中继数据是裸 TCP 字节。**不做**：RFC 6062 的被动模式
+（`ConnectionAttempt`）、ACME/OCSP、租户/数据库/配置文件。需要这些时请用 coturn。
 
 **命名**：crate 与二进制都叫 `rstun`。**绝对不能改叫 `stun`** —— Debian 的 `stun-client`
 包已经占用 `/usr/bin/stun`，同名会直接撞包/覆盖。
@@ -185,7 +186,8 @@ curl -s http://127.0.0.1:9100/metrics | grep -E '^# TYPE|^rstun_requests_total'
 | `rstun_turn_allocations` | gauge | —（仅 `--turn`；活动 allocation 数）|
 | `rstun_turn_bytes_total` | counter | `direction=in`（client→peer）/ `out`（peer→client）；仅 `--turn` |
 | `rstun_turn_allocations_total` | counter | `result=created/expired`；仅 `--turn` |
-| `rstun_turn_rejected_total` | counter | `reason=quota/ports/family/loopback`；仅 `--turn` |
+| `rstun_turn_rejected_total` | counter | `reason=quota/ports/family/loopback/df/tcp_connect/tcp_bind/tcp_send/tcp_buffer/tcp_quota`；仅 `--turn` |
+| `rstun_turn_tcp_connections` | gauge | RFC 6062 数据连接数，`state=pending/bound`；仅 `--turn` |
 | `rstun_ops_rejected_total` | counter | —（运维端点因 `--health-max-connections` 拒绝的连接）|
 | `rstun_build_info` | gauge = 1 | `version`（编译期常量）|
 | `rstun_start_time_seconds` / `rstun_uptime_seconds` | gauge | — |

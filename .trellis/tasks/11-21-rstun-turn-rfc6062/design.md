@@ -138,7 +138,9 @@ Connect 成功 ──► Pending(buffered bytes) ──ConnectionBind ok──�
 5. 半开：client 关写 → peer 读到 EOF；peer 关写 → client 读到 EOF；双向关完即摘表；
 6. 开关关闭时 `uclient -T` 仍 `442`（回归）；
 7. 默认路径冻结、interop/abuse/turn/audit/deny 全绿；
-8. 与 coturn 对跑：`-T` 结果一致，差异（`400` vs RST、控制连接是否关闭）显式记录。
+8. 与 coturn 对跑：探针 `tcp-relay` 在两侧结果一致（`Allocate` 无 `CONNECTION-ID`、`Connect` 无
+   `SOFTWARE`、源端口=relay、双向字节）；差异（错 ID 时我方 `400` vs coturn RST、控制连接是否关闭）
+   显式记录。（`uclient -T` 不在本期，见 §8.1。）
 
 ## 8.1 为什么不用 `turnutils_uclient -T` 验收（2026-11-21 复核确认）
 

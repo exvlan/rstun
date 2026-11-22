@@ -13,6 +13,14 @@ coturn and the two outputs diffed:
     python3 script/lab/rstun-turn-probe.py relay     --server '[::1]:34980' --family inet6
     python3 script/lab/rstun-turn-probe.py auth      --server 127.0.0.1:34980 \
         --nonce-lifetime 1
+    python3 script/lab/rstun-turn-probe.py tcp-relay --server 127.0.0.1:34980
+
+`tcp-relay` is the RFC 6062 **outbound** flow over a TCP control connection:
+`Allocate(REQUESTED-TRANSPORT=6)` → `Connect` → `ConnectionBind` → raw bytes.
+It runs identically against coturn (same `--server`/credentials). The passive
+mode (`ConnectionAttempt`) is not probed: it is out of the current scope, which
+is also why `turnutils_uclient -T` is not used (it implies `-y`, i.e. it needs
+the passive side on the peer's allocation).
 
 `--family inet6` moves the client and the peer to `::1` and asserts that
 `XOR-RELAYED-ADDRESS` names an IPv6 address (the IPv6 relay path that used to
@@ -47,6 +55,8 @@ METHOD_SEND = 0x006
 METHOD_DATA = 0x007
 METHOD_CREATE_PERMISSION = 0x008
 METHOD_CHANNEL_BIND = 0x009
+METHOD_CONNECT = 0x00A
+METHOD_CONNECTION_BIND = 0x00B
 
 CLASS_REQUEST = 0
 CLASS_INDICATION = 1
@@ -67,9 +77,11 @@ ATTR_ERROR_CODE = 0x0009
 ATTR_REALM = 0x0014
 ATTR_NONCE = 0x0015
 ATTR_XOR_MAPPED_ADDRESS = 0x0020
+ATTR_CONNECTION_ID = 0x002A
 ATTR_SOFTWARE = 0x8022
 
 TRANSPORT_UDP = 17
+TRANSPORT_TCP = 6
 CHANNEL = 0x4000
 
 
@@ -505,6 +517,240 @@ class Probe:
         self.socket.close()
 
 
+class TcpRelayProbe(Probe):
+    """Same wire/auth code as `Probe`, but over a TCP stream (RFC 6062).
+
+    A TURN-over-TCP connection is framed by the STUN header length, so only the
+    transport (`exchange`) and the challenge (`challenge`) differ. The relay's
+    data connection is *raw bytes* after a successful `ConnectionBind`.
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        super().__init__(args)
+        self.socket.close()
+        self.socket = socket.socket(self.af, socket.SOCK_STREAM)
+        self.socket.settimeout(args.timeout)
+        self.socket.connect(self.server)
+
+    def exchange(self, frame: bytes) -> bytes:
+        self.socket.sendall(frame)
+        return _read_frame(self.socket)
+
+    def reconnect(self) -> None:
+        self.socket.close()
+        self.socket = socket.socket(self.af, socket.SOCK_STREAM)
+        self.socket.settimeout(self.timeout)
+        self.socket.connect(self.server)
+        self.nonce = ""
+
+    def challenge(self) -> None:
+        transaction = self._transaction()
+        frame = self._encode(
+            METHOD_ALLOCATE,
+            CLASS_REQUEST,
+            transaction,
+            [self._attribute(ATTR_REQUESTED_TRANSPORT, bytes([TRANSPORT_TCP, 0, 0, 0]))],
+        )
+        reply = self.exchange(frame)
+        msg_type, attributes, _ = self._parse(reply, transaction)
+        code = self._error_code(attributes)
+        self.nonce = self._nonce(attributes)
+        self.check(
+            "challenge",
+            msg_type & 0x0110 == 0x0110 and code == 401 and bool(self.nonce),
+            f"code={code}",
+        )
+
+
+def _recv_exact(sock: socket.socket, length: int) -> bytes:
+    chunks = []
+    while length:
+        chunk = sock.recv(length)
+        if not chunk:
+            raise ConnectionError("connection closed")
+        chunks.append(chunk)
+        length -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_frame(sock: socket.socket) -> bytes:
+    header = _recv_exact(sock, HEADER_LEN)
+    return header + _recv_exact(sock, struct.unpack("!H", header[2:4])[0])
+
+
+def _connection_id(attributes: list[tuple[int, bytes]]) -> int | None:
+    for attr_type, value in attributes:
+        if attr_type == ATTR_CONNECTION_ID and len(value) == 4:
+            return struct.unpack("!I", value)[0]
+    return None
+
+
+def canonical_tcp_relay(probe: TcpRelayProbe) -> None:
+    """Outbound RFC 6062: Allocate(TCP) → Connect → ConnectionBind → raw bytes.
+
+    This is the implemented half of RFC 6062. `turnutils_uclient -T` is not used
+    because it implies `-y` (client-to-client), whose *peer* side needs a
+    `ConnectionAttempt` indication — the passive mode that this task leaves out.
+    """
+    probe.challenge()
+    transaction = probe._transaction()
+    reply = probe.exchange(
+        probe.build_request(
+            METHOD_ALLOCATE,
+            transaction,
+            [
+                probe._attribute(ATTR_REQUESTED_TRANSPORT, bytes([TRANSPORT_TCP, 0, 0, 0])),
+                probe._attribute(ATTR_LIFETIME, struct.pack("!I", 60)),
+            ],
+            authenticate=True,
+        )
+    )
+    msg_type, attributes, _ = probe._parse(reply, transaction)
+    code = probe._error_code(attributes)
+    relayed = None
+    for attr_type, value in attributes:
+        if attr_type == ATTR_XOR_RELAYED_ADDRESS:
+            relayed = probe._decode_xor_address(value, transaction)
+    probe.check(
+        "tcp-allocate",
+        msg_type & 0x0110 == 0x0100 and code is None and relayed is not None,
+        f"code={code} software={probe._software(attributes)}",
+    )
+    probe.check(
+        "tcp-allocate-has-no-connection-id",
+        _connection_id(attributes) is None,
+        "",
+    )
+    if relayed is None:
+        return
+
+    # Peer side: a plain TCP listener. The server dials it from the relay
+    # address (§5.2), which is asserted below on the accepted socket.
+    peer = socket.socket(probe.af, socket.SOCK_STREAM)
+    peer.bind(probe.bind)
+    peer.listen(1)
+    peer.settimeout(probe.timeout)
+    peer_address = peer.getsockname()
+
+    transaction = probe._transaction()
+    reply = probe.exchange(
+        probe.build_request(
+            METHOD_CONNECT,
+            transaction,
+            [
+                probe._attribute(
+                    ATTR_XOR_PEER_ADDRESS, probe._xor_address(peer_address, transaction)
+                )
+            ],
+            authenticate=True,
+        )
+    )
+    msg_type, attributes, _ = probe._parse(reply, transaction)
+    code = probe._error_code(attributes)
+    connection_id = _connection_id(attributes)
+    probe.check(
+        "connect",
+        msg_type & 0x0110 == 0x0100 and code is None and connection_id is not None,
+        f"code={code} connection-id={'yes' if connection_id is not None else 'no'}",
+    )
+    probe.check(
+        "connect-has-no-software",
+        not probe._software(attributes),
+        "coturn alignment: Connect ok is CONNECTION-ID + MESSAGE-INTEGRITY",
+    )
+    if connection_id is None:
+        peer.close()
+        return
+    connection, seen = peer.accept()
+    connection.settimeout(probe.timeout)
+    probe.check(
+        "connect-source-is-the-relay-address",
+        seen[1] == relayed[1],
+        f"source-port-matches-relay-port={seen[1] == relayed[1]}",
+    )
+
+    # Client data connection: a **second** TCP connection while the control
+    # connection stays open (closing it would release the allocation).
+    data = socket.socket(probe.af, socket.SOCK_STREAM)
+    data.settimeout(probe.timeout)
+    data.connect(probe.server)
+    bind_attributes = [probe._attribute(ATTR_CONNECTION_ID, struct.pack("!I", connection_id))]
+    # Sign with the control connection's nonce first, like coturn's own
+    # `turnutils_uclient` does; only an explicit 401 triggers a fresh challenge.
+    # (coturn answers an unsigned bind with a RST, so a blind challenge dance is
+    # not interoperable.)
+    for attempt in (0, 1):
+        transaction = probe._transaction()
+        data.sendall(
+            probe.build_request(
+                METHOD_CONNECTION_BIND,
+                transaction,
+                bind_attributes,
+                authenticate=bool(probe.nonce),
+            )
+        )
+        reply = _read_frame(data)
+        msg_type, attributes, _ = probe._parse(reply, transaction)
+        code = probe._error_code(attributes)
+        if code == 401 and attempt == 0:
+            probe.nonce = probe._nonce(attributes)
+            continue
+        break
+    probe.check(
+        "connection-bind",
+        msg_type & 0x0110 == 0x0100 and code is None,
+        f"code={code} software={probe._software(attributes)}",
+    )
+
+    # Raw bytes both ways (no STUN framing any more, RFC 6062 §3).
+    data.sendall(b"client->peer")
+    try:
+        received = connection.recv(12)
+    except socket.timeout:
+        received = None
+    probe.check(
+        "client-to-peer-bytes",
+        received == b"client->peer",
+        f"bytes={len(received) if received else 0}",
+    )
+
+    connection.sendall(b"peer->client")
+    try:
+        received = _recv_exact(data, 12)
+    except (socket.timeout, ConnectionError):
+        received = None
+    probe.check(
+        "peer-to-client-bytes",
+        received == b"peer->client",
+        f"bytes={len(received) if received else 0}",
+    )
+
+    # LIFETIME=0 closes every data connection (RFC 6062 §5.5), control stays.
+    transaction = probe._transaction()
+    reply = probe.exchange(
+        probe.build_request(
+            METHOD_REFRESH,
+            transaction,
+            [probe._attribute(ATTR_LIFETIME, struct.pack("!I", 0))],
+            authenticate=True,
+        )
+    )
+    _, attributes, _ = probe._parse(reply, transaction)
+    probe.check("refresh-0", probe._error_code(attributes) is None, "")
+    try:
+        tail = connection.recv(1)
+        closed = tail == b""
+    except ConnectionError:
+        # A RST is just as final as a FIN here.
+        closed = True
+    except socket.timeout:
+        closed = False
+    probe.check("lifetime-zero-closes-the-peer-data-connection", closed, "")
+    connection.close()
+    data.close()
+    peer.close()
+
+
 def canonical_lifecycle(probe: Probe) -> None:
     probe.challenge()
     transaction = probe._transaction()
@@ -863,6 +1109,7 @@ def main() -> int:
             "loopback",
             "permission-limit",
             "rest",
+            "tcp-relay",
         ),
     )
     parser.add_argument("--server", required=True, help="host:port of the TURN server")
@@ -911,7 +1158,7 @@ def main() -> int:
     args.host = host
     args.port = int(port)
 
-    probe = Probe(args)
+    probe = TcpRelayProbe(args) if args.mode == "tcp-relay" else Probe(args)
     try:
         if args.mode == "lifecycle":
             canonical_lifecycle(probe)
@@ -930,6 +1177,8 @@ def main() -> int:
                 print("FAIL: rest mode needs --rest-secret")
                 return 1
             canonical_rest(probe, args.rest_secret, args.rest_label)
+        elif args.mode == "tcp-relay":
+            canonical_tcp_relay(probe)
         else:
             probe.challenge()
             probe.key = b"definitely-not-the-password"

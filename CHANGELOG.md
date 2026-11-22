@@ -3,6 +3,34 @@
 版本线**独立于任何宿主项目**：`YY.QMM.Mmpp`（年.季度月.月日+序号），首发 `26.410.100`。
 `rstun-v*` 的 Release tag / 镜像 tag / 资产名都用这里给出的版本号。
 
+## Unreleased
+
+### TURN：RFC 6062 出站 TCP allocation（`--turn-tcp-relay`）
+
+- **新开关 `--turn-tcp-relay`（默认关）**：打开后 `Allocate` 的 `REQUESTED-TRANSPORT=6`
+  从 `442` 变为真正的 TCP allocation —— 返回一个 TCP relay 地址（无 `CONNECTION-ID`），
+  `Connect` 从该地址出站连 `XOR-PEER-ADDRESS`（超时 ≥30s、失败 `447`、重复 `446`、禁用地址
+  `403`、每 allocation 上限 16 条 → `508`），`ConnectionBind` 在**新连接**上绑定后该连接变成
+  **裸字节**数据面（不再解析 STUN）。**开关关闭时行为逐字节不变**（`Allocate(TCP)` 仍 `442`）。
+- **被动模式不做**：`ConnectionAttempt`（peer 主动连入 relay）不在本版范围，因此
+  `turnutils_uclient -T`（隐含 `-y`）不能作为验收判据；lab 用自带探针的 `tcp-relay`
+  模式跑标准客户端流程（与 coturn 同输出）。
+- **语义细节**：UDP/DTLS 控制连接上申请 TCP allocation → `400`；带
+  `DONT-FRAGMENT`/`EVEN-PORT`/`RESERVATION-TOKEN` → `400`；`CreatePermission` 正常 `200`
+  （`turnutils_uclient -T` 会先发它）；`ChannelBind` → `400`；`Send`/`ChannelData` 丢弃并计
+  `tcp_send`；预绑定缓冲上限 64 KiB（超限关连接 + `tcp_buffer`）、pending 30s 未 bind 关闭；
+  `LIFETIME=0`/过期关闭全部数据连接而**保留控制连接**（与 coturn 的差异已记录）。
+- **`Connect` 成功响应不带 `SOFTWARE`**（coturn 同为 32 字节响应），其余响应照旧。
+- **指标**：新增 `rstun_turn_tcp_connections{state=pending|bound}` 与
+  `rstun_turn_rejected_total{reason=tcp_connect|tcp_bind|tcp_send|tcp_buffer|tcp_quota}`；
+  `--turn` 关闭时仍整体省略。
+- **资源口径**：TCP 中继端口用独立端口池（与 UDP 同段但不共享槽位）；数据连接是 accepted
+  TCP 连接，占一个 `--max-inflight` 名额；`Connect` 从 relay 地址出站依赖 `SO_REUSEPORT`
+  （Windows 回退为临时源端口）。
+- `--turn-bandwidth` 不作用于 TCP allocation 的裸字节流（逐包丢弃会破坏流），只统计
+  `rstun_turn_bytes_total`；UDP 中继的带宽语义不变。
+- lab 新增 `tcprelay` 项；`cleanup` 的残留断言同时检查 UDP（`ss -lun`）与 TCP（`ss -ltn`）。
+
 ## 26.410.103
 
 ### TURN：`DONT-FRAGMENT`（0x001A）真实现 + IPv6 relay 回归

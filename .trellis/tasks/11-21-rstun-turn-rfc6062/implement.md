@@ -33,7 +33,7 @@
 
 | # | 事项 | 验证 |
 | --- | --- | --- |
-| 3.1 | 数据连接首帧 `ConnectionBind` → 绑定；之后裸字节 | `uclient -T` 端到端 |
+| 3.1 | 数据连接首帧 `ConnectionBind` → 绑定；之后裸字节 | 探针 `tcp-relay` 端到端（`uclient -T` 见 design §8.1，不在本期）|
 | 3.2 | 错 ID/重复 bind/过期 → `400` + 关连接 | 单测 + 记录「本仓 400 vs coturn RST」 |
 | 3.3 | 双向 copy + 半关闭联动；绑定时先刷预缓冲 | 单测（client 关写 → peer EOF）|
 | 3.4 | `ChannelBind` → 400；`Send`/`ChannelData` → 丢弃 + 计数 | 单测 |
@@ -76,7 +76,8 @@ cargo deny check
 ## 验收断言（必须）
 
 - [ ] 开关关：`-T` → `442`（回归）；默认路径冻结与 `cad4fa2` 一致
-- [ ] 开关开：`-T` 全通（`lost packets 0`）；`-P` **不在本期**（不测、不承诺）
+- [ ] 开关开：探针 `tcp-relay` 11 条断言全绿（`Allocate(TCP)`/`Connect` 无 `SOFTWARE`/源端口=relay/双向字节/`LIFETIME=0` 关连接）；
+      `turnutils_uclient -T` 隐含 `-y`、需要被动模式，**不在本期验收**（design §8.1，实测 exit=124）；`-P` 同样不在本期
 - [ ] 446/447/400/437/403 各有单测；`Connect` 无 permission 也 200
 - [ ] `ConnectionBind` 错 ID/重复/过期 → 400 且连接关闭
 - [ ] `LIFETIME=0` → 数据连接关闭、`ss -ltnH` 无残留
@@ -87,3 +88,37 @@ cargo deny check
 
 - 阶段内：开关默认关，可随时退回旧行为；
 - 整体：revert 本任务提交。
+
+## 执行记录（2026-11-21/22）
+
+| 项 | 结果 |
+| --- | --- |
+| 实现 | `--turn-tcp-relay`（默认关）+ Allocate(TCP) + Connect + ConnectionBind；被动模式未实现 |
+| 门禁 | `cargo test` 260 / `--all-features` 261；clippy/fmt 干净；lab 19 passed；`--tls --dtls` 2 passed；interop/abuse/audit/deny 全绿；windows/macos/android target check 通过 |
+| 冻结 | 开关关：3 配置 × 17 请求与 `cad4fa2` 逐字节一致；`-T` 关时 442、开时 exit=124（见 design §8.1）|
+| coturn 对照 | 探针 `tcp-relay` 两侧输出 `identical`（lab 的 `coturn` 项已加跑）|
+| 复核 | 「可提交（无阻塞）」；6 项发现全部修复并各有通过/失败证据 |
+
+### 复核发现并修复的真实缺陷
+
+1. **`Turn::insert` 替换过期表项时释放错端口**（`src/turn.rs:830` 区）：释放的是新分配端口而非被替换的旧端口 →
+   旧端口永久泄漏、新端口被标空闲（TCP 下 `SO_REUSEPORT` 会真的重复绑定）。
+   修：`previous.relay_addr.port()` / `previous.is_tcp()`，并补回归测试
+   `reallocating_over_an_expired_entry_releases_the_old_port`（变异可复现 FAIL）。**该缺陷也影响 UDP 路径**。
+2. `StreamOutcome::Bound` 的 `try_send` 失败未处置 bind oneshot → 表项卡 `Bound`、gauge 泄漏；已改 `drop(take_bind(id))`。
+3. `Connect` 的 `441` 缺断言 → 补 `connect_from_another_user_on_the_same_tuple_is_441`。
+4. lab `tcprelay` 只信退出码 → 补「断言数 ≥ 11」；`coturn` 项补 `tcp-relay` 对跑。
+5. 任务工件里仍写「`-T` 全通」→ 已按 §8.1 修正。
+
+### 已知偶发（记录，未改代码）
+
+- `turn::tests::tcp_allocation_needs_the_switch_and_a_stream_control_connection` 在**一次**
+  `cargo test --all-features turn::` 中失败（44/45），随后 15 次 `turn::` + 20 次全量 + 单独 12 次均通过。
+  当时紧邻 lab 重跑（系统负载/端口压力高）。`take_port` 已有「bind 失败跳过」加固，未定位到确定性原因；
+  下次复现时优先抓 panic 原文（测试名已知）。不阻塞提交。
+
+### 未做的观察（非阻塞）
+
+- `connect` 在 30s dial 期间持有 `Arc<Allocation>`（TTL 到期后 listener 仍存活到 dial 结束）；
+- 探针 `connect-source-is-the-relay-address` 只比端口（单测比了 IP+端口）；
+- 数据连接交接后 `--max-inflight` permit 仍持有（优雅退出不等 bound 连接，视为有意）。

@@ -369,6 +369,13 @@ struct Args {
     /// (default 1 MiB/s; 0 = unlimited). Over the cap packets are dropped
     #[arg(long, value_name = "BYTES/S")]
     turn_bandwidth: Option<u64>,
+
+    /// TURN: also serve RFC 6062 **TCP allocations** (`REQUESTED-TRANSPORT=6`,
+    /// outbound `Connect` + `ConnectionBind`). Off by default: without it a TCP
+    /// Allocate is still `442` and the byte-frozen path is untouched. The
+    /// passive mode (`ConnectionAttempt`, `uclient -P`) is not implemented yet
+    #[arg(long)]
+    turn_tcp_relay: bool,
 }
 
 /// What an invalid `FINGERPRINT` gets (`--fingerprint-action`).
@@ -591,6 +598,11 @@ enum Decision {
     },
     /// Well-formed STUN that a Binding-only server must stay silent about.
     Ignore(&'static str),
+    /// RFC 6062 §5.4: a `ConnectionBind` succeeded. Write `response` on this
+    /// stream, then stop parsing STUN frames: the connection is now the raw-byte
+    /// **client data connection** identified by `id`. Only reachable on a
+    /// TCP/TLS TURN connection with `--turn-tcp-relay`.
+    Bind { response: Vec<u8>, id: u32 },
 }
 
 /// Which transport a message arrived on; RFC 5780 `CHANGE-REQUEST` is UDP-only.
@@ -1031,6 +1043,7 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
         || args.permission_limit.is_some()
         || args.allocation_lifetime.is_some()
         || args.turn_bandwidth.is_some()
+        || args.turn_tcp_relay
         || !args.turn_tls_listen.is_empty()
         || !args.turn_dtls_listen.is_empty()
         || args.tls_cert.is_some()
@@ -1039,8 +1052,9 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
         if any_turn_flag {
             return Err(
                 "--relay-ports / --max-allocations-* / --permission-limit / \
-                 --allocation-lifetime / --turn-bandwidth / --turn-tls-listen / \
-                 --turn-dtls-listen / --tls-cert / --tls-key need --turn"
+                 --allocation-lifetime / --turn-bandwidth / --turn-tcp-relay / \
+                 --turn-tls-listen / --turn-dtls-listen / --tls-cert / --tls-key \
+                 need --turn"
                     .to_string(),
             );
         }
@@ -1123,6 +1137,7 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
     if let Some(bandwidth) = args.turn_bandwidth {
         config.bandwidth = bandwidth;
     }
+    config.tcp_relay = args.turn_tcp_relay;
     config.validate()?;
     Ok(Some(config))
 }
@@ -2334,6 +2349,21 @@ fn response_is_encodable(response: &[u8]) -> bool {
             == response.len()
 }
 
+/// The `ERROR-CODE` value of a STUN error response, if it has one.
+///
+/// Used by the RFC 6062 data-connection path to tell "retry with credentials"
+/// (`401` / `438`, which must not close the connection) from a final refusal.
+fn response_error_code(response: &[u8]) -> Option<u16> {
+    let message = protocol::parse(response).ok()?;
+    let value = protocol::attributes(message.body)
+        .find(|attribute| attribute.attr_type == protocol::ATTR_ERROR_CODE)?
+        .value;
+    if value.len() < 4 {
+        return None;
+    }
+    Some(u16::from(value[2]) * 100 + u16::from(value[3]))
+}
+
 /// The fixed `500 Server Error` for `frame`, or `None` when the frame cannot be
 /// parsed (no transaction id to answer to).
 ///
@@ -2394,16 +2424,21 @@ async fn respond_to_datagram(
 ) {
     // TURN 先于 STUN：`--turn` 关闭时 `handle` 不会被调用（`None`），字节与
     // 26.410.100 一致。开启后 ChannelData / TURN method 在此分流，Binding 仍走原路。
-    let decision = match stats.turn().and_then(|turn| {
-        turn.handle(
-            datagram,
-            peer,
-            local,
-            turn::ClientTransport::Udp,
-            context,
-            None,
-        )
-    }) {
+    let turn_decision = match stats.turn() {
+        Some(turn) => {
+            turn.handle(
+                datagram,
+                peer,
+                local,
+                turn::ClientTransport::Udp,
+                context,
+                None,
+            )
+            .await
+        }
+        None => None,
+    };
+    let decision = match turn_decision {
         Some(decision) => decision,
         None => decide_guarded(
             datagram,
@@ -2501,6 +2536,12 @@ async fn respond_to_datagram(
         Ok(Decision::Ignore(reason)) => {
             stats.count_ignored(Transport::Udp);
             tracing::debug!(%local, %peer, reason, "rstun: ignored message")
+        }
+        // A data connection only exists on a TCP/TLS TURN connection; a
+        // datagram never reaches `ConnectionBind`.
+        Ok(Decision::Bind { .. }) => {
+            stats.count_error(Transport::Udp);
+            tracing::error!(%local, %peer, "rstun: ConnectionBind on a datagram transport");
         }
         Err(error) => {
             stats.count_error(Transport::Udp);
@@ -2699,6 +2740,11 @@ async fn serve_tcp_connection(
                 stats.count_ignored(Transport::Tcp);
                 tracing::debug!(%peer, reason, "rstun: ignored message")
             }
+            // Not reachable without `--turn` (this is the pre-TURN loop).
+            Ok(Decision::Bind { .. }) => {
+                stats.count_error(Transport::Tcp);
+                tracing::error!(%peer, "rstun: ConnectionBind without TURN");
+            }
             Err(error) => {
                 stats.count_error(Transport::Tcp);
                 tracing::debug!(%peer, %error, "rstun: malformed TCP STUN message");
@@ -2756,6 +2802,20 @@ async fn serve_tcp_turn(
     .await
 }
 
+/// How a TURN-over-stream loop ended.
+enum StreamOutcome {
+    /// Control connection finished (EOF, drain, malformed frame, error): the
+    /// caller releases the allocation and aborts the writer.
+    ControlClosed,
+    /// `ConnectionBind` succeeded: answer first, then hand the stream over as
+    /// the client data connection `id` (RFC 6062 §5.4).
+    Bound { response: Vec<u8>, id: u32 },
+    /// A `ConnectionBind` was refused: flush the error response, then close
+    /// (coturn closes so hard the client only sees a RST; answering the `400`
+    /// is strictly better and is an explicit, documented difference).
+    RejectAfterResponse,
+}
+
 /// One TURN-capable connection over **any byte stream**: plain TCP or TLS
 /// (`turns:`, design §3.2/§4). The framing is identical, so the only thing the
 /// caller chooses is the 5-tuple's client transport.
@@ -2769,7 +2829,7 @@ async fn serve_turn_stream<S>(
     turn: Arc<turn::Turn>,
     software: &str,
     stats: &ServerStats,
-    _inflight: Option<limit::Permit>,
+    inflight: Option<limit::Permit>,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
@@ -2790,7 +2850,7 @@ where
         }
         let _ = writer.shutdown().await;
     });
-    let result = stream_turn_loop(
+    let outcome = match stream_turn_loop(
         &mut reader,
         peer,
         local,
@@ -2802,11 +2862,66 @@ where
         &sender,
         &mut drain,
     )
-    .await;
-    turn.release_connection(peer, local, transport);
-    drop(sender);
-    writer_task.abort();
-    result
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Same cleanup as a closed control connection: without the writer
+            // task the allocation could only leak its relay socket until TTL.
+            turn.release_connection(peer, local, transport);
+            drop(sender);
+            writer_task.abort();
+            return Err(error);
+        }
+    };
+    match outcome {
+        StreamOutcome::ControlClosed => {
+            turn.release_connection(peer, local, transport);
+            drop(sender);
+            writer_task.abort();
+            Ok(())
+        }
+        StreamOutcome::RejectAfterResponse => {
+            // Flush the queued 400 before closing: dropping the last sender
+            // ends the writer task after it has written everything.
+            turn.release_connection(peer, local, transport);
+            drop(sender);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer_task).await;
+            Ok(())
+        }
+        StreamOutcome::Bound { response, id } => {
+            // The bind response is queued first, so it precedes any buffered
+            // peer bytes in the same FIFO writer queue.
+            if sender.try_send(response).is_err() {
+                // The queue is unusable (it cannot be full on a fresh data
+                // connection). Drop the pending hand-over so the peer task
+                // tears both halves down instead of staying "bound" with a
+                // client half nobody will ever write to.
+                drop(turn.take_bind(id));
+                return Ok(());
+            }
+            stats.count_answered(Transport::Tcp);
+            let data = turn::DataConnection {
+                reader: Box::new(reader),
+                sender,
+                writer_task,
+                // A data connection is an accepted TCP connection: it keeps
+                // holding its `--max-inflight` slot for its whole life.
+                _permit: inflight,
+            };
+            match turn.take_bind(id) {
+                Some(bind) => {
+                    // If the peer task is already gone the send fails and both
+                    // halves are dropped, which closes the connection.
+                    let _ = bind.send(data);
+                }
+                None => {
+                    tracing::debug!(id, "rstun: TURN data connection vanished before bind");
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2821,7 +2936,7 @@ async fn stream_turn_loop<R>(
     stats: &ServerStats,
     sender: &tokio::sync::mpsc::Sender<Vec<u8>>,
     drain: &mut tokio::sync::watch::Receiver<bool>,
-) -> std::io::Result<()>
+) -> std::io::Result<StreamOutcome>
 where
     R: tokio::io::AsyncRead + Unpin + ?Sized,
 {
@@ -2829,11 +2944,11 @@ where
         let mut prefix = [0_u8; 4];
         let read = tokio::select! {
             biased;
-            _ = drain.changed() => return Ok(()),
+            _ = drain.changed() => return Ok(StreamOutcome::ControlClosed),
             read = read_exact_with_timeout(reader, &mut prefix) => read,
         };
         if !read? {
-            return Ok(());
+            return Ok(StreamOutcome::ControlClosed);
         }
         stats.count_received(Transport::Tcp);
 
@@ -2844,14 +2959,14 @@ where
             let mut data = vec![0_u8; length];
             if !read_exact_with_timeout(reader, &mut data).await? {
                 stats.count_error(Transport::Tcp);
-                return Ok(());
+                return Ok(StreamOutcome::ControlClosed);
             }
             let padding = (4 - length % 4) % 4;
             if padding > 0 {
                 let mut skip = [0_u8; 3];
                 if !read_exact_with_timeout(reader, &mut skip[..padding]).await? {
                     stats.count_error(Transport::Tcp);
-                    return Ok(());
+                    return Ok(StreamOutcome::ControlClosed);
                 }
             }
             turn.handle_channel_data(channel, &data, peer, local, transport, context);
@@ -2863,14 +2978,14 @@ where
         header[..4].copy_from_slice(&prefix);
         if !read_exact_with_timeout(reader, &mut header[4..]).await? {
             stats.count_error(Transport::Tcp);
-            return Ok(());
+            return Ok(StreamOutcome::ControlClosed);
         }
         let frame_len = match protocol::peek_frame_len(&header) {
             Ok(frame_len) => frame_len,
             Err(error) => {
                 stats.count_error(Transport::Tcp);
                 tracing::debug!(%peer, %error, "rstun: malformed TCP STUN header");
-                return Ok(());
+                return Ok(StreamOutcome::ControlClosed);
             }
         };
         let mut frame = vec![0_u8; frame_len];
@@ -2878,7 +2993,7 @@ where
         if !read_exact_with_timeout(reader, &mut frame[protocol::HEADER_LEN..]).await? {
             stats.count_error(Transport::Tcp);
             tracing::debug!(%peer, "rstun: truncated TCP STUN message");
-            return Ok(());
+            return Ok(StreamOutcome::ControlClosed);
         }
         if let Some(Err(refusal)) = context.check_rates(peer) {
             stats.count_dropped(Transport::Tcp);
@@ -2888,11 +3003,21 @@ where
                 counter = refusal.counter(),
                 "rstun: TCP request refused by abuse guard, closing connection"
             );
-            return Ok(());
+            return Ok(StreamOutcome::ControlClosed);
         }
+        // Only with `--turn-tcp-relay` is a refused `ConnectionBind` a reason to
+        // close; with the switch off the frame keeps the old "400, stay open"
+        // behaviour of a server that does not implement the method.
+        let connection_bind = turn.config().tcp_relay
+            && protocol::parse(&frame).is_ok_and(|message| {
+                protocol::message_method(message.msg_type) == turn::CONNECTION_BIND_METHOD
+            });
 
         let in_flight = stats.enter();
-        let decision = match turn.handle(&frame, peer, local, transport, context, Some(sender)) {
+        let decision = match turn
+            .handle(&frame, peer, local, transport, context, Some(sender))
+            .await
+        {
             Some(decision) => decision,
             None => decide_guarded(
                 &frame,
@@ -2905,7 +3030,21 @@ where
             ),
         };
         match decision {
+            Ok(Decision::Bind { response, id }) => {
+                if !response_is_encodable(&response) {
+                    stats.count_error(Transport::Tcp);
+                    tracing::error!(%peer, "rstun: response violates STUN wire invariants");
+                    return Ok(StreamOutcome::ControlClosed);
+                }
+                return Ok(StreamOutcome::Bound { response, id });
+            }
             Ok(Decision::Respond(response)) => {
+                // Keep the ordinary long-term challenge dance alive: an
+                // unsigned first attempt gets 401/438 and is retried with
+                // credentials. Any other refusal ends the connection (coturn
+                // closes it too, just without letting the client read the 400).
+                let retryable =
+                    connection_bind && matches!(response_error_code(&response), Some(401 | 438));
                 if !response_is_encodable(&response) {
                     stats.count_error(Transport::Tcp);
                     tracing::error!(%peer, "rstun: response violates STUN wire invariants");
@@ -2916,16 +3055,19 @@ where
                 } else if sender.try_send(response).is_err() {
                     // Queue full or writer gone: the connection is backed up
                     // beyond recovery, close it instead of buffering forever.
-                    return Ok(());
+                    return Ok(StreamOutcome::ControlClosed);
                 } else {
                     stats.count_answered(Transport::Tcp);
+                }
+                if connection_bind && !retryable {
+                    return Ok(StreamOutcome::RejectAfterResponse);
                 }
             }
             Ok(Decision::RespondFrom { bytes, .. }) => {
                 // Not produced for TURN; the STUN path cannot reach here over
                 // TCP either (CHANGE-REQUEST/RESPONSE-PORT are UDP-only).
                 if sender.try_send(bytes).is_err() {
-                    return Ok(());
+                    return Ok(StreamOutcome::ControlClosed);
                 }
                 stats.count_answered(Transport::Tcp);
             }
@@ -2936,7 +3078,7 @@ where
             Err(error) => {
                 stats.count_error(Transport::Tcp);
                 tracing::debug!(%peer, %error, "rstun: malformed TCP STUN message");
-                return Ok(());
+                return Ok(StreamOutcome::ControlClosed);
             }
         }
         drop(in_flight);
@@ -3378,14 +3520,17 @@ async fn serve_turn_dtls_connection(
         }
         stats.count_received(Transport::Udp);
         let datagram = &buffer[..length];
-        let decision = match turn.handle(
-            datagram,
-            peer,
-            local,
-            turn::ClientTransport::Dtls,
-            &context,
-            Some(&sender),
-        ) {
+        let decision = match turn
+            .handle(
+                datagram,
+                peer,
+                local,
+                turn::ClientTransport::Dtls,
+                &context,
+                Some(&sender),
+            )
+            .await
+        {
             Some(decision) => decision,
             None => decide_guarded(
                 datagram,
@@ -3420,6 +3565,12 @@ async fn serve_turn_dtls_connection(
             Ok(Decision::Ignore(reason)) => {
                 stats.count_ignored(Transport::Udp);
                 tracing::debug!(%peer, reason, "rstun: ignored message")
+            }
+            Ok(Decision::Bind { .. }) => {
+                // A DTLS session is not a stream: `ConnectionBind` is refused
+                // with 400 before it could ever get here.
+                stats.count_error(Transport::Udp);
+                tracing::error!(%peer, "rstun: ConnectionBind on DTLS");
             }
             Err(error) => {
                 stats.count_error(Transport::Udp);
@@ -3476,13 +3627,35 @@ fn udp_socket(address: SocketAddr) -> std::io::Result<UdpSocket> {
 
 /// TCP listener bound to `address`, v6-only when it is an IPv6 address.
 fn tcp_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+    tcp_listener_with(address, false)
+}
+
+/// TCP listener for an RFC 6062 relay port.
+///
+/// `SO_REUSEPORT` is what lets `Connect` bind a **second** socket to the same
+/// address and dial the peer from it (RFC 6062 §5.2: the peer data connection
+/// must come from the relayed transport address). On Windows that option does
+/// not exist; the dial then uses an ephemeral source port (documented).
+pub(crate) fn tcp_relay_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+    tcp_listener_with(address, true)
+}
+
+fn tcp_listener_with(address: SocketAddr, reuse_port: bool) -> std::io::Result<TcpListener> {
     let socket = Socket::new(domain_of(address), Type::STREAM, Some(Protocol::TCP))?;
     if address.is_ipv6() {
         socket.set_only_v6(true)?;
     }
     // Windows maps SO_REUSEADDR to "steal the port"; a server does not want that.
     #[cfg(unix)]
-    socket.set_reuse_address(true)?;
+    {
+        socket.set_reuse_address(true)?;
+        if reuse_port {
+            // Unix only: Windows has no SO_REUSEPORT at all.
+            socket.set_reuse_port(true)?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = reuse_port;
     socket.set_nonblocking(true)?;
     socket.bind(&SockAddr::from(address))?;
     socket.listen(TCP_LISTEN_BACKLOG)?;
@@ -3861,6 +4034,7 @@ mod tests {
             }
             Decision::Ignore(reason) => panic!("expected an error response, got ignore: {reason}"),
             Decision::RespondFrom { .. } => panic!("error responses never change socket"),
+            Decision::Bind { .. } => panic!("plain Binding never binds a data connection"),
         }
     }
 
@@ -6524,6 +6698,21 @@ mod tests {
             ..Args::default()
         };
         assert!(build_turn(&args, Some(&long)).is_err());
+
+        // RFC 6062's switch is a TURN flag too.
+        let args = Args {
+            turn_tcp_relay: true,
+            ..Args::default()
+        };
+        assert!(build_turn(&args, Some(&long)).is_err());
+
+        let args = Args {
+            turn: true,
+            turn_tcp_relay: true,
+            ..Args::default()
+        };
+        let config = build_turn(&args, Some(&long)).unwrap().expect("enabled");
+        assert!(config.tcp_relay);
 
         let args = Args {
             turn: true,

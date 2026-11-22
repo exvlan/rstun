@@ -47,7 +47,9 @@
 
 - 与退出统计**共用同一组 Counters**（不双份计数）；
 - TURN 指标只在 `--turn` 时输出（`rstun_turn_allocations`、`rstun_turn_bytes_total{direction}`、
-  `rstun_turn_allocations_total{result}`、`rstun_turn_rejected_total{reason}`、
+  `rstun_turn_allocations_total{result}`、
+  `rstun_turn_rejected_total{reason=quota|ports|family|loopback|df|tcp_connect|tcp_bind|tcp_send|tcp_buffer|tcp_quota}`、
+  `rstun_turn_tcp_connections{state=pending|bound}`（RFC 6062）、
   `rstun_turn_bytes_dropped_total{direction}` —— 最后一项是 T2 带宽配额丢包）；未开启时
   **省略**（不输出恒 0，避免误读「开着但空闲」）。
 - T2 的 TLS/DTLS 握手失败**只进退出日志**（`handshake_failed`），不新增指标：`/metrics` 的
