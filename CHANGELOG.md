@@ -30,6 +30,10 @@
 - `--turn-bandwidth` 不作用于 TCP allocation 的裸字节流（逐包丢弃会破坏流），只统计
   `rstun_turn_bytes_total`；UDP 中继的带宽语义不变。
 - lab 新增 `tcprelay` 项；`cleanup` 的残留断言同时检查 UDP（`ss -lun`）与 TCP（`ss -ltn`）。
+- **Windows 修正（CI 抓到的两处平台假设）**：TCP Allocate 带 `DONT-FRAGMENT` 不再被 420 gate
+  拦成 `420`（RFC 6062 §5.1 步骤 3 要求 `400`，UDP Allocate + DF 的 Windows `420` 不变）；
+  「出站源端口 = relay 端口」的断言改由 `RELAY_SOURCE_PORT_BOUND` 控制（Windows 无
+  `SO_REUSEPORT`，回退临时源端口），其余双向字节/预绑定/端口归属断言照旧。
 
 ### 修复：过期 allocation 被替换时的端口记账错误
 

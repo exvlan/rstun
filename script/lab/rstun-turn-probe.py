@@ -663,6 +663,10 @@ def canonical_tcp_relay(probe: TcpRelayProbe) -> None:
         return
     connection, seen = peer.accept()
     connection.settimeout(probe.timeout)
+    # §5.2: the peer data connection must originate from the relayed address.
+    # This holds where the server has SO_REUSEPORT (Linux/macOS, where this lab
+    # runs). A Windows server falls back to an ephemeral source port; if this
+    # probe is ever run there, assert `seen[0] == relayed[0]` only.
     probe.check(
         "connect-source-is-the-relay-address",
         seen[1] == relayed[1],

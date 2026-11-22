@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/turn.md", "reason": "TURN TLS/DTLS 契约与验收项"}
+{"file": ".trellis/spec/backend/ops.md", "reason": "指标固定标签集与 /metrics gate"}
+{"file": ".trellis/spec/backend/auth.md", "reason": "证书/私钥材料校验规则（PKCS#8、算法约束）"}
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "门禁与冻结对照"}

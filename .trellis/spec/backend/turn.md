@@ -121,8 +121,8 @@
 | 项 | 契约 |
 | --- | --- |
 | 范围 | **只做出站**：`Allocate(TCP)` + `Connect` + `ConnectionBind`。被动模式（`ConnectionAttempt` / `uclient -P`）不在范围，`turnutils_uclient -T`（隐含 `-y`）因此不能作为验收判据 |
-| `Allocate` TCP | 控制面必须 TCP/TLS（UDP/DTLS → `400`）；带 `DONT-FRAGMENT`/`EVEN-PORT`/`RESERVATION-TOKEN` → `400`；成功 `200` + TCP `XOR-RELAYED-ADDRESS` + `XOR-MAPPED-ADDRESS` + `LIFETIME` + `SOFTWARE`，**无 `CONNECTION-ID`**；`Refresh`/`LIFETIME` 语义同 UDP |
-| 端口池 | `used_tcp_ports` 独立于 UDP 池；listener 以 `SO_REUSEPORT` 绑定（`Connect` 从该地址出站）|
+| `Allocate` TCP | 控制面必须 TCP/TLS（UDP/DTLS → `400`）；带 `DONT-FRAGMENT`/`EVEN-PORT`/`RESERVATION-TOKEN` → `400`（**与平台无关**：420 gate 对「`Allocate` + `REQUESTED-TRANSPORT=6`」把 `0x001A` 视为已知，Windows 也不得回 420；UDP Allocate + DF 在 Windows 仍按 §7.2 步骤 4 回 420）；成功 `200` + TCP `XOR-RELAYED-ADDRESS` + `XOR-MAPPED-ADDRESS` + `LIFETIME` + `SOFTWARE`，**无 `CONNECTION-ID`**；`Refresh`/`LIFETIME` 语义同 UDP |
+| 端口池 | `used_tcp_ports` 独立于 UDP 池；listener 以 `SO_REUSEPORT` 绑定（`Connect` 从该地址出站）；「出站源端口 = relay 端口」只在 `RELAY_SOURCE_PORT_BOUND`（`cfg!(unix)`）成立，Windows 回退临时源端口 —— 实现与测试共用该常量，不得另写平台判断 |
 | `Connect` | 无 allocation / 非 TCP allocation → `437`；他人 allocation → `441`；缺/非法 `XOR-PEER-ADDRESS` → `400`；禁用地址 → `403`（含 family `443`）；重复 peer（connecting/pending/bound）→ `446`；出站失败/超时（`TCP_CONNECT_TIMEOUT = 30s`）→ `447`；每 allocation 数据连接上限 16 → `508` + `tcp_quota`；成功 `200` + `CONNECTION-ID`，**不带 `SOFTWARE`**（对齐 coturn）|
 | `ConnectionBind` | 必须 stream 传输、新连接（该 5 元组无 allocation）、`CONNECTION_ID` 4 字节且指向 pending、同用户名、未过期；否则 `400` 且**发完响应再关连接**（401/438 挑战保留，不关）；成功后该连接裸字节，不再解析 STUN |
 | 生命周期 | pending 30s 未 bind → 关闭（`sweep`）；`LIFETIME=0`/allocation 过期 → 关闭全部数据连接（**控制连接保留**，与 coturn 的差异）；任一方向干净 EOF 只半关闭，错误/stop 信号关双向 |

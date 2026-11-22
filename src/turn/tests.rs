@@ -1805,12 +1805,12 @@ fn dont_fragment_support_matches_the_platforms_that_can_set_the_bit() {
     // exactly the Windows/FreeBSD answer (unknown → 420), `true` the
     // Linux/macOS one (known → 200/400/500).
     assert_eq!(
-        turn_unknown_attributes_with(&body, false),
+        turn_unknown_attributes_with(&body, false, false),
         vec![ATTR_DONT_FRAGMENT],
         "without a setsockopt path 0x001A must stay unknown"
     );
     assert!(
-        turn_unknown_attributes_with(&body, true).is_empty(),
+        turn_unknown_attributes_with(&body, true, false).is_empty(),
         "with a setsockopt path 0x001A is understood"
     );
 
@@ -1820,6 +1820,98 @@ fn dont_fragment_support_matches_the_platforms_that_can_set_the_bit() {
         DONT_FRAGMENT_SUPPORTED,
         "the known-attribute set must follow the capability flag"
     );
+}
+
+/// RFC 6062 §5.1 step 3: a **TCP** `Allocate` carrying `DONT-FRAGMENT` is
+/// `400 Bad Request` on every platform. On Windows/macOS-without-DF the 420 gate
+/// used to fire first (`0x001A` unknown → `420`), which the Windows CI job
+/// caught; the gate must let this shape through to the `400` branch, while a
+/// **UDP** `Allocate` keeps the RFC 8656 §7.2 step 4 answer (`420`).
+#[test]
+fn tcp_allocate_dont_fragment_is_400_even_where_df_is_unsupported() {
+    let mut body = Vec::new();
+    protocol::push_attribute(
+        &mut body,
+        ATTR_REQUESTED_TRANSPORT,
+        &[TRANSPORT_TCP, 0, 0, 0],
+    );
+    protocol::push_attribute(&mut body, ATTR_DONT_FRAGMENT, &[]);
+
+    // The Windows column: DF cannot be set, but this is a TCP allocation, so
+    // the gate must not produce a 420 (the allocation path answers 400).
+    assert!(
+        turn_unknown_attributes_with(&body, false, true).is_empty(),
+        "TCP Allocate + DONT-FRAGMENT must reach the 400 branch on Windows"
+    );
+    assert!(
+        turn_unknown_attributes_with(&body, true, true).is_empty(),
+        "the same body is understood on the platform that can set DF"
+    );
+    // The wrapper derives the TCP shape from the body, so production follows the
+    // same decision as the two columns above.
+    assert!(turn_unknown_attributes(&body).is_empty());
+
+    // A UDP Allocate with DF keeps the platform rule: unknown → 420 where the
+    // bit cannot be set (RFC 8656 §7.2 step 4 explicitly allows it).
+    let mut udp = Vec::new();
+    protocol::push_attribute(
+        &mut udp,
+        ATTR_REQUESTED_TRANSPORT,
+        &[TRANSPORT_UDP, 0, 0, 0],
+    );
+    protocol::push_attribute(&mut udp, ATTR_DONT_FRAGMENT, &[]);
+    assert_eq!(
+        turn_unknown_attributes_with(&udp, false, is_tcp_allocate(&udp)),
+        vec![ATTR_DONT_FRAGMENT],
+        "UDP Allocate + DF must stay 420 where DF is unsupported"
+    );
+
+    // End to end through the allocation path (no auth/network needed): the
+    // attribute-presence check runs before ports and platforms, so this is the
+    // same `400` on every host.
+    let turn = Turn::new(
+        Config {
+            tcp_relay: true,
+            ..Config::default()
+        },
+        "rstun/test",
+    );
+    let frame = request(
+        ALLOCATE_METHOD,
+        &transaction_id(77),
+        &[
+            (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_TCP, 0, 0, 0]),
+            (ATTR_DONT_FRAGMENT, Vec::new()),
+        ],
+    );
+    let message = protocol::parse(&frame).expect("parse");
+    let identity = Identity {
+        username: USER.to_string(),
+        keys: vec![(
+            KeyAlgorithm::Md5,
+            auth::long_term_key(KeyAlgorithm::Md5, USER, REALM, PASS),
+        )],
+    };
+    let context = ServerContext::default();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    match turn.allocate(
+        &message,
+        "127.0.0.1:5000".parse().unwrap(),
+        "127.0.0.1:3478".parse().unwrap(),
+        ClientTransport::Tcp,
+        &context,
+        Some(&sender),
+        &identity,
+    ) {
+        Decision::Respond(response) => {
+            assert_eq!(
+                error_code(&response),
+                Some(400),
+                "TCP Allocate must answer 400 for DONT-FRAGMENT"
+            );
+        }
+        other => panic!("expected a 400 response, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2340,9 +2432,14 @@ async fn connection_bind_relays_raw_bytes_both_ways() {
     let mut control = TcpClient::connect(harness.server).await;
     let (relay, id) = allocate_and_connect(&mut control, peer_addr).await;
     let (mut peer, seen) = accept.await.expect("peer accepted");
-    // §5.2: the peer data connection originates from the relayed address.
-    assert_eq!(seen.port(), relay.port(), "source must be the relay port");
-    assert_eq!(seen.ip(), relay.ip());
+    // §5.2: the peer data connection originates from the relayed transport
+    // address. Windows has no `SO_REUSEPORT`, so `dial_from_relay` falls back to
+    // an ephemeral source port there (`RELAY_SOURCE_PORT_BOUND == false`): the
+    // source IP is still the relay IP, only the port assertion is platform-bound.
+    assert_eq!(seen.ip(), relay.ip(), "source IP must be the relay IP");
+    if RELAY_SOURCE_PORT_BOUND {
+        assert_eq!(seen.port(), relay.port(), "source must be the relay port");
+    }
 
     // Peer speaks before the client binds: RFC 6062 §5.2 requires buffering.
     peer.write_all(b"early").await.unwrap();

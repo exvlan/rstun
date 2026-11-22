@@ -246,6 +246,23 @@ pub const TCP_PREBIND_BUFFER: usize = 64 * 1024;
 /// (same shape as the relay-port and permission limits).
 pub const TCP_MAX_CONNECTIONS_PER_ALLOCATION: usize = 16;
 
+/// Can an outbound `Connect` dial **from the relayed transport address** (RFC
+/// 6062 §5.2)?
+///
+/// Yes where the platform has `SO_REUSEPORT` — both the relay listener and the
+/// dialling socket are bound to the same port. Windows has no such option, so
+/// [`dial_from_relay`] falls back to an ephemeral source port there; the peer
+/// data connection still works, only the peer's view of the source port differs.
+///
+/// The implementation gates the option with `#[cfg(unix)]`; this constant is the
+/// same predicate for tests (so a Windows run knows not to assert the source
+/// port) and is guarded by the compile-time check below.
+pub(crate) const RELAY_SOURCE_PORT_BOUND: bool = cfg!(unix);
+
+// The dial only sets `SO_REUSEPORT` under `cfg(unix)`; the predicate tests read
+// must never drift from that gate.
+const _: () = assert!(RELAY_SOURCE_PORT_BOUND == cfg!(unix));
+
 /// Parsed `--turn` configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
@@ -2895,10 +2912,13 @@ async fn dial_from_relay(local: SocketAddr, peer: SocketAddr) -> std::io::Result
     } else {
         TcpSocket::new_v6()?
     };
-    #[cfg(unix)]
-    {
-        // Both are best effort: the bind below decides whether sharing works.
+    // Share the relay listener's port so the peer sees the relayed transport
+    // address as the source (RFC 6062 §5.2). `RELAY_SOURCE_PORT_BOUND` is the
+    // predicate tests read; on Windows it is false (no `SO_REUSEPORT`) and the
+    // dial below keeps an ephemeral source port.
+    if RELAY_SOURCE_PORT_BOUND {
         let _ = socket.set_reuseaddr(true);
+        #[cfg(unix)]
         let _ = socket.set_reuseport(true);
     }
     if let Err(error) = socket.bind(local) {
@@ -3345,7 +3365,7 @@ fn set_dont_fragment(socket: &UdpSocket, on: bool) -> std::io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
     {
         let _ = (socket, on);
-        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
@@ -3449,13 +3469,39 @@ fn family_matches(family: u8, relay: IpAddr) -> bool {
 
 /// Unknown comprehension-required attributes *in the TURN dialect*.
 fn turn_unknown_attributes(body: &[u8]) -> Vec<u16> {
-    turn_unknown_attributes_with(body, DONT_FRAGMENT_SUPPORTED)
+    turn_unknown_attributes_with(body, DONT_FRAGMENT_SUPPORTED, is_tcp_allocate(body))
+}
+
+/// Is this body a `TCP` `Allocate` (`REQUESTED-TRANSPORT = 6`, RFC 6062)?
+///
+/// Used by the `420` gate only: RFC 6062 §5.1 step 3 makes `DONT-FRAGMENT` on a
+/// TCP `Allocate` a `400 Bad Request` **on every platform**, so the gate must
+/// not turn it into a `420` first — even where the platform cannot set the DF
+/// bit (Windows, FreeBSD & co.). The `400` itself comes from [`Turn::allocate`],
+/// which rejects the attribute before any port or platform logic runs. With the
+/// `--turn-tcp-relay` switch off the same shape reaches the old `442` answer on
+/// every platform (Windows used to say `420` only because of the gate).
+/// A malformed `REQUESTED-TRANSPORT` is deliberately *not* treated as TCP here:
+/// it is answered `400` by the allocation path anyway, and the classic UDP
+/// column must stay byte-identical.
+fn is_tcp_allocate(body: &[u8]) -> bool {
+    attribute(body, ATTR_REQUESTED_TRANSPORT)
+        .is_some_and(|value| value.len() == 4 && value[0] == TRANSPORT_TCP)
 }
 
 /// The same decision table with the platform capability **injected**, so both
 /// columns are reachable from a test on any host: the `false` column is exactly
 /// what a Windows or FreeBSD build does (there DF stays unknown → `420`).
-fn turn_unknown_attributes_with(body: &[u8], dont_fragment_supported: bool) -> Vec<u16> {
+///
+/// `tcp_allocate` says the request is `Allocate` with `REQUESTED-TRANSPORT = 6`;
+/// on that shape `DONT-FRAGMENT` is **understood** even when
+/// `dont_fragment_supported` is false, because RFC 6062 §5.1 step 3 answers it
+/// `400` (attribute not allowed on a TCP allocation) instead of `420`.
+fn turn_unknown_attributes_with(
+    body: &[u8],
+    dont_fragment_supported: bool,
+    tcp_allocate: bool,
+) -> Vec<u16> {
     let mut unknown: Vec<u16> = Vec::new();
     for attribute in protocol::attributes(body) {
         let attr_type = attribute.attr_type;
@@ -3466,6 +3512,10 @@ fn turn_unknown_attributes_with(body: &[u8], dont_fragment_supported: bool) -> V
             // `DONT-FRAGMENT` is understood only where the DF bit can actually
             // be set (§7.2 step 4): elsewhere it must stay unknown → 420.
             || (dont_fragment_supported && attr_type == ATTR_DONT_FRAGMENT)
+            // RFC 6062 §5.1 step 3: a TCP `Allocate` carrying it is `400` on
+            // every platform, so it must not become `420` on the platforms that
+            // cannot set the bit (Windows).
+            || (tcp_allocate && attr_type == ATTR_DONT_FRAGMENT)
             || matches!(
                 attr_type,
                 ATTR_CHANNEL_NUMBER
