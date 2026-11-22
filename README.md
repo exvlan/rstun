@@ -18,7 +18,8 @@
 （+ 可选的 RFC 5780 NAT 行为发现）+ **可选的**鉴权（RFC 5389 §10 短期/长期凭据 +
 RFC 8489 §9.2 的 SHA256/USERHASH，**默认关闭**）+ **可选的 RFC 8656 中继**
 （`--turn`，**默认关闭、缺长期凭据拒绝启动**）：UDP / TCP 客户端传输、`turns:`（TLS）、
-DTLS 1.2、TURN REST 临时凭据（coturn `use-auth-secret`）、每 allocation 带宽配额。
+DTLS 1.2、TURN REST 临时凭据（coturn `use-auth-secret`）、每 allocation 带宽配额、
+**证书热加载**（`SIGHUP` 或 30s 文件轮询，不重启、不中断监听）。
 RFC 6062 的**出站** TCP allocation（`--turn-tcp-relay`，默认关）也支持：`Allocate` +
 `Connect` + `ConnectionBind`，中继数据是裸 TCP 字节。**不做**：RFC 6062 的被动模式
 （`ConnectionAttempt`）、ACME/OCSP、租户/数据库/配置文件。需要这些时请用 coturn。
@@ -85,8 +86,12 @@ ERROR rstun: invalid TURN configuration --turn-tls-listen / --tls-cert / --tls-k
 with the `tls` feature (cargo build --features tls,dtls)
 ```
 
-安装（`cargo install` 装的是 **lean**；要 `turns:`/DTLS 请 `--features full`）：
+证书轮换**不用重启**：把 `--tls-cert`/`--tls-key` 原地覆盖成新文件，然后
+`kill -HUP <pid>`（Linux/macOS，新连接立即生效）。Windows 或不想发信号时，30 秒轮询会
+自动发现 `(mtime,len)` 变化（最坏 30s 生效）。坏材料（不配对/RSA 非 DTLS/非 PKCS#8/截断）
+会被拒绝并保留旧证书，计数见 `rstun_turn_tls_reload_total{result="failed"}`。
 
+安装（`cargo install` 装的是 **lean**；要 `turns:`/DTLS 请 `--features full`）：
 ```bash
 cargo install --path .                    # lean，从源码树
 cargo install --path . --features full    # 完整版
@@ -123,7 +128,7 @@ cargo install rstun --features full       # crates.io（完整版）
   `openssl s_client` 握手 + 另一实例的明文 Binding）。
 - `sbom` 作业（与平台无关，只跑一次）用 `script/ci/gen-sbom.sh` 生成 lean / full 两份 SBOM；
   `release` 作业断言 **8 个 zip + 2 份 SBOM + 1 份 formula + 2 个 deb = 13 个资产**，少一个就拒绝发版
-  （SBOM 的组件数还额外断言直接依赖 10 / 14）。
+  （SBOM 的组件数还额外断言直接依赖 10 / 15）。
 
 ## 运维面（readiness / metrics / env / 优雅退出 / 部署清单）
 
@@ -188,6 +193,8 @@ curl -s http://127.0.0.1:9100/metrics | grep -E '^# TYPE|^rstun_requests_total'
 | `rstun_turn_allocations_total` | counter | `result=created/expired`；仅 `--turn` |
 | `rstun_turn_rejected_total` | counter | `reason=quota/ports/family/loopback/df/tcp_connect/tcp_bind/tcp_send/tcp_buffer/tcp_quota`；仅 `--turn` |
 | `rstun_turn_tcp_connections` | gauge | RFC 6062 数据连接数，`state=pending/bound`；仅 `--turn` |
+| `rstun_turn_tls_reload_total` | counter | `result=ok/failed`；仅配了 `turns:`/DTLS 监听 |
+| `rstun_turn_tls_cert_expires_seconds` | gauge | 当前 leaf 的 `notAfter − now`（秒；负=已过期，`-1`=不可解析）；仅配了 `turns:`/DTLS |
 | `rstun_ops_rejected_total` | counter | —（运维端点因 `--health-max-connections` 拒绝的连接）|
 | `rstun_build_info` | gauge = 1 | `version`（编译期常量）|
 | `rstun_start_time_seconds` / `rstun_uptime_seconds` | gauge | — |
@@ -343,21 +350,21 @@ Rust 1.95）：
 
 | 指标 | lean（默认） | full（`--features full`） | 命令 |
 | --- | --- | --- | --- |
-| 直接依赖 | **10** | **14** | `cargo tree -e normal --depth 1 [--all-features] \| tail -n +2 \| wc -l` |
-| 依赖树行数（含重复的 feature 合并） | 90 | 360 | `cargo tree -e normal [--all-features] \| wc -l` |
-| 唯一 crate 数 | 66 | 212 | `cargo tree -e normal [--all-features] --format '{p}' \| sed 's/^[│├└─ \t]*//' \| sort -u \| wc -l` |
-| release 二进制（未 strip） | **3.77 MB** | **7.95 MB** | `cargo build --release [--features full] && ls -l target/release/rstun` |
-| 镜像/发布用的二进制（LTO + strip） | **2.34 MB** | **4.82 MB** | 见 Dockerfile 的 `CARGO_PROFILE_RELEASE_{LTO,CODEGEN_UNITS,STRIP}` |
+| 直接依赖 | **10** | **15** | `cargo tree -e normal --depth 1 [--all-features] \| tail -n +2 \| wc -l` |
+| 依赖树行数（含重复的 feature 合并） | 90 | 361 | `cargo tree -e normal [--all-features] \| wc -l` |
+| 唯一 crate 数 | 66 | 213 | `cargo tree -e normal [--all-features] --format '{p}' \| sed 's/^[│├└─ \t]*//' \| sort -u \| wc -l` |
+| release 二进制（未 strip） | **3.92 MB** | **8.15 MB** | `cargo build --release [--features full] && ls -l target/release/rstun` |
+| 镜像/发布用的二进制（LTO + strip） | **2.44 MB** | **4.95 MB** | 见 Dockerfile 的 `CARGO_PROFILE_RELEASE_{LTO,CODEGEN_UNITS,STRIP}` |
 
 > 直接依赖是 **unix 口径**：`libc` 在 `[target.'cfg(unix)'.dependencies]` 里（DF 位的
-> `setsockopt`），Windows 构建没有它，lean/full 分别是 9/13 个。`cargo tree --depth 1`
-> 按当前目标平台（本机 Linux）计数，所以表里是 10/14。
+> `setsockopt`），Windows 构建没有它，lean/full 分别是 9/14 个。`cargo tree --depth 1`
+> 按当前目标平台（本机 Linux）计数，所以表里是 10/15。
 
 > `cargo metadata --format-version 1 | jq '.packages\|length'` 也能跑（本仓 77），但它数的是
 > **Cargo.lock 里的全部包**——含 dev-dependencies 与未启用的 optional 依赖，不区 feature，
 > 所以不适合回答「这份二进制带了多少依赖」。上表按 feature 分别计。
 >
-> full 比 lean 多出的 270 行（360 − 90）里，有一大块是 **两代 `digest` 各一份**：本仓的鉴权栈在
+> full 比 lean 多出的 271 行（361 − 90）里，有一大块是 **两代 `digest` 各一份**：本仓的鉴权栈在
 > `digest 0.11`，而 `webrtc-dtls 0.12`（上游最新版）仍钉 `digest 0.10`，两代都留在树里
 > （`webrtc-dtls` 跟进后自动消失，届时删掉这段说明）。
 
@@ -367,9 +374,10 @@ clap  socket2  tokio  tracing  tracing-subscriber
 hmac  sha1  sha2  md-5              ← 鉴权（RFC 5389 §10 / RFC 8489 §9.2）
 libc (仅 unix)                      ← DONT-FRAGMENT 的 setsockopt（Windows 上没有）
 
-full（= lean + 这 4 个）：
+full（= lean + 这 5 个）：
 tokio-rustls  rustls-pemfile        ← turns:（TLS 监听；rustls 的 ring provider）
 webrtc-dtls  webrtc-util            ← DTLS 1.2（纯 Rust；util 只用来调它的 Conn/Listener）
+x509-parser                         ← 证书到期指标（只读 notAfter；已在 webrtc-dtls 的树里）
 （dev-only: stun-types 2.0.5 —— 只用做编解码的参考实现 oracle，不进二进制）
 ```
 
@@ -377,12 +385,12 @@ feature 定义（`Cargo.toml`）：
 
 ```toml
 default = []
-tls  = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+tls  = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:x509-parser"]
 dtls = ["tls", "dep:webrtc-dtls", "dep:webrtc-util"]   # DTLS 与 TLS 共用证书解析
 full = ["tls", "dtls"]
 ```
 
-- **lean 构建里没有 TLS/DTLS 代码**（`#[cfg(feature = ...)]`），也不链接那 4 个 crate 与
+- **lean 构建里没有 TLS/DTLS 代码**（`#[cfg(feature = ...)]`），也不链接那 5 个 crate 与
   它们带来的 ~136 个传递 crate（65 → 201）。`--turn-tls-listen` / `--turn-dtls-listen` /
   `--tls-cert` / `--tls-key` **仍然出现在 `--help`**（帮助文本不随构建变化），但给了就
   **拒绝启动**并说明缺哪个 feature。
@@ -431,7 +439,7 @@ OpenSSL/libssl-dev）。引入它们的原因：鉴权要 HMAC-SHA1、HMAC-SHA25
 - Dependabot（`.github/dependabot.yml`）：cargo **每周**、GitHub Actions **每月**，**只开 PR 不自动合并**。
 - Release 附 **CycloneDX 1.5 SBOM**：`rstun-<version>-lean.cdx.json` / `rstun-<version>-full.cdx.json`
   （`script/ci/gen-sbom.sh` 用 `cargo metadata` 生成，按 feature 分别算依赖闭包，并断言直接依赖数
-  10 / 14）；另附 Homebrew formula `rstun.rb`。**发布产物未签名**（cosign/sigstore 后置）。
+  10 / 15）；另附 Homebrew formula `rstun.rb`。**发布产物未签名**（cosign/sigstore 后置）。
 
 ## 测试
 

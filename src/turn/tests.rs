@@ -2104,6 +2104,11 @@ async fn turn_metrics_appear_only_when_enabled() {
         );
     }
 
+    assert!(
+        !text.contains("rstun_turn_tls_"),
+        "certificate reload metrics need a secure listener"
+    );
+
     let plain = Arc::new(ServerStats::default());
     let context = Arc::new(ServerContext {
         plan: None,

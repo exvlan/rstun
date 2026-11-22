@@ -2,7 +2,7 @@
 #
 # 镜像是 **full** 构建（`--features full`）：TURN over `turns:`(TLS) 与 DTLS 是容器
 # 部署的常见用途，不该要求用户自己重编镜像。镜像里的二进制经下面的 LTO + strip 后约
-# **4.8 MB**（lean 同参数约 2.35 MB；未 strip 的本地 release 是 7.9 MB，不是镜像体积）。
+# **4.95 MB**（lean 同参数约 2.44 MB；未 strip 的本地 release 是 8.15 MB，不是镜像体积）。
 # 只要 lean 时：`cargo build --release`（不带 feature），或直接用 Release 里的
 # `rstun-<platform>-<version>.zip`。
 #

@@ -11,13 +11,13 @@
 #   bash script/lab/rstun-turn.sh --tls --dtls     # 只跑 TLS/DTLS 项（自动 --features full 构建）
 #   bash script/lab/rstun-turn.sh --only relay     # 只跑一项
 #     （startup|relay|tcprelay|auth|lifecycle|wrong-user|raf|df|ipv6relay|wildcard|
-#       permission-limit|quota|ports|tls|dtls|rest|bandwidth|cleanup|frozen|coturn）
+#       permission-limit|quota|ports|tls|dtls|cert-reload|rest|bandwidth|cleanup|frozen|coturn）
 #   bash script/lab/rstun-turn.sh --keep           # 保留日志（默认只清进程）
 #   FROZEN_BASE=<sha> bash script/lab/rstun-turn.sh --only frozen
 #                                                  # 字节冻结对照的基线提交（默认 cad4fa2）
 #
 # 构建：默认 lean（`cargo build`，无 tls/dtls feature）。`--tls` / `--dtls` /
-# `--only tls|dtls|coturn` 会自动用 `cargo build --features full` 构建；`--no-build`
+# `--only tls|dtls|cert-reload|coturn` 会自动用 `cargo build --features full` 构建；`--no-build`
 # 时探测现有二进制是否带 feature。lean 下 tls/dtls 项记 SKIP（不是失败），
 # coturn 项的 TLS/DTLS 对照行同样跳过。
 #
@@ -67,7 +67,7 @@ FAILED=()
 SKIPPED=()
 PASSED=()
 
-ALL_ITEMS=(startup relay tcprelay auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls rest bandwidth cleanup frozen coturn)
+ALL_ITEMS=(startup relay tcprelay auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls cert-reload rest bandwidth cleanup frozen coturn)
 
 usage() {
   sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
@@ -103,7 +103,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [[ -n "$ONLY" ]]; then
   case "$ONLY" in
-    startup | relay | tcprelay | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | rest | bandwidth | cleanup | frozen | coturn) : ;;
+    startup | relay | tcprelay | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | cert-reload | rest | bandwidth | cleanup | frozen | coturn) : ;;
     *) echo "--only 未知项: $ONLY（可用：${ALL_ITEMS[*]}）" >&2; exit 2 ;;
   esac
 fi
@@ -261,7 +261,7 @@ probe_secure_support() {
 # 这些项需要 secure 传输 → BUILD=true 时自动加 `--features full`。
 needs_secure_build() {
   [[ ${#T2_ONLY[@]} -gt 0 ]] && return 0
-  case "$ONLY" in tls | dtls | coturn) return 0 ;; esac
+  case "$ONLY" in tls | dtls | cert-reload | coturn) return 0 ;; esac
   return 1
 }
 
@@ -906,7 +906,188 @@ run_dtls() {
   stop_server "$name"
 }
 
-# ---------- 6d. REST credentials: valid / expired / wrong secret (T2) ----------
+# ---------- 6d. certificate hot reload: SIGHUP + polling (T2) ----------
+
+RELOAD_DIR="$WORK/reload"
+
+# 三套自签 ECDSA P-256 + PKCS#8（DTLS 的硬限制），写到独立目录：tls/dtls 项用的
+# $CERT_DIR 保持不变，避免互相覆盖。
+make_reload_certs() {
+  mkdir -p "$RELOAD_DIR"
+  command -v openssl >/dev/null 2>&1 || return 1
+  local n
+  for n in a b c; do
+    [[ -f "$RELOAD_DIR/$n-cert.pem" && -f "$RELOAD_DIR/$n-key.pem" ]] && continue
+    openssl ecparam -name prime256v1 -genkey -noout -out "$RELOAD_DIR/$n-sec1.pem" 2>/dev/null &&
+      openssl pkcs8 -topk8 -nocrypt -in "$RELOAD_DIR/$n-sec1.pem" -out "$RELOAD_DIR/$n-key.pem" 2>/dev/null &&
+      openssl req -new -x509 -key "$RELOAD_DIR/$n-key.pem" -out "$RELOAD_DIR/$n-cert.pem" -days 2 \
+        -subj "/CN=reload-$n.example" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null || return 1
+  done
+}
+
+# The peer certificate's SHA-256 fingerprint, as `SHA256 Fingerprint=…`.
+s_client_fingerprint() { # port [--dtls]
+  local port="$1"
+  shift
+  timeout 10 openssl s_client "$@" -connect "127.0.0.1:$port" -servername localhost </dev/null 2>/dev/null |
+    openssl x509 -noout -fingerprint -sha256 2>/dev/null
+}
+
+# One TLS session held open across the reload: Binding request → response
+# before the SIGHUP, wait for the reload, then the **same** connection sends a
+# second Binding request. Both must be the same STUN error response (0x0111:
+# this server is started with --auth-user, so an unauthenticated Binding gets
+# 401) and the same wire length — proving the established session survives.
+write_session_probe() {
+  cat >"$RELOAD_DIR/tls_session_probe.py" <<'PY'
+import os, socket, ssl, sys, time
+
+host, port = sys.argv[1], int(sys.argv[2])
+first, go, second = sys.argv[3], sys.argv[4], sys.argv[5]
+context = ssl.create_default_context()
+context.check_hostname = False
+context.verify_mode = ssl.CERT_NONE
+sock = context.wrap_socket(
+    socket.create_connection((host, port), timeout=5), server_hostname="localhost"
+)
+
+def exact(n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise SystemExit("connection closed")
+        data += chunk
+    return data
+
+def binding():
+    # 20-byte Binding request (RFC 5389): type 0x0001, length 0, magic cookie,
+    # fixed transaction id. No MESSAGE-INTEGRITY: the expected answer is 401.
+    sock.sendall(b"\x00\x01\x00\x00\x21\x12\xa4\x42" + b"\xAA" * 12)
+    head = exact(20)
+    kind = int.from_bytes(head[0:2], "big")
+    length = int.from_bytes(head[2:4], "big")
+    exact(length)
+    return kind, 20 + length
+
+kind1, size1 = binding()
+open(first, "w").write(f"{kind1} {size1}\n")
+deadline = time.time() + 20
+while not os.path.exists(go):
+    time.sleep(0.1)
+    if time.time() > deadline:
+        raise SystemExit("timed out waiting for the reload")
+kind2, size2 = binding()
+open(second, "w").write(f"{kind2} {size2}\n")
+sock.close()
+PY
+}
+
+run_cert_reload() {
+  local name=cert-reload
+  if [[ "$HAVE_SECURE" != true ]]; then
+    skip "$name" "lean 构建没有 tls/dtls feature（用 --tls --dtls，或 cargo build --features full）"
+    return
+  fi
+  make_reload_certs || { skip "$name" "openssl unavailable"; return; }
+  cp "$RELOAD_DIR/a-cert.pem" "$RELOAD_DIR/current-cert.pem"
+  cp "$RELOAD_DIR/a-key.pem" "$RELOAD_DIR/current-key.pem"
+  start_server "$name" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --health-listen "127.0.0.1:$HEALTH_PORT" \
+    --turn-tls-listen "127.0.0.1:$TLS_PORT" \
+    --turn-dtls-listen "127.0.0.1:$DTLS_PORT" \
+    --tls-cert "$RELOAD_DIR/current-cert.pem" --tls-key "$RELOAD_DIR/current-key.pem"
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy (see $LOG_DIR/$name.log)"
+    stop_server "$name"
+    return
+  fi
+  local pid tls_a dtls_a expires ssl_left drift i
+  pid="$(tail -n 1 "$WORK/pids")"
+  tls_a="$(s_client_fingerprint "$TLS_PORT")"
+  dtls_a="$(s_client_fingerprint "$DTLS_PORT" -dtls1_2)"
+  expires="$(metric 'rstun_turn_tls_cert_expires_seconds')"
+  ssl_left=$(( $(date -d "$(openssl x509 -in "$RELOAD_DIR/current-cert.pem" -noout -enddate | cut -d= -f2)" +%s) - $(date +%s) ))
+  drift=$(( expires - ssl_left ))
+  drift=${drift#-}
+
+  # PRD acceptance: an **established** TLS session must not be disturbed by the
+  # reload. It sends a Binding request now and another after the SIGHUP below,
+  # over the same socket.
+  write_session_probe
+  rm -f "$RELOAD_DIR/session-1.txt" "$RELOAD_DIR/session-2.txt" "$RELOAD_DIR/session-go"
+  python3 "$RELOAD_DIR/tls_session_probe.py" 127.0.0.1 "$TLS_PORT" \
+    "$RELOAD_DIR/session-1.txt" "$RELOAD_DIR/session-go" "$RELOAD_DIR/session-2.txt" \
+    >"$LOG_DIR/$name-session.log" 2>&1 &
+  local session_pid=$!
+
+  # 1) SIGHUP: both files replaced, new TLS **and** DTLS sessions see B.
+  cp "$RELOAD_DIR/b-cert.pem" "$RELOAD_DIR/current-cert.pem"
+  cp "$RELOAD_DIR/b-key.pem" "$RELOAD_DIR/current-key.pem"
+  kill -HUP "$pid"
+  local tls_b=""
+  for i in $(seq 1 20); do
+    sleep 0.2
+    tls_b="$(s_client_fingerprint "$TLS_PORT")"
+    [[ -n "$tls_b" && "$tls_b" != "$tls_a" ]] && break
+  done
+  local dtls_b
+  dtls_b="$(s_client_fingerprint "$DTLS_PORT" -dtls1_2)"
+
+  touch "$RELOAD_DIR/session-go"
+  wait "$session_pid" 2>/dev/null
+  local session1="" session2="" session_ok=failed
+  if [[ -f "$RELOAD_DIR/session-1.txt" && -f "$RELOAD_DIR/session-2.txt" ]]; then
+    session1="$(cat "$RELOAD_DIR/session-1.txt")"
+    session2="$(cat "$RELOAD_DIR/session-2.txt")"
+    # 273 == 0x0111 (Binding error: authentication required), same length both
+    # times, and a body beyond the 20-byte header.
+    [[ "$session1" == "273 "* && "$session1" == "$session2" ]] && session_ok=ok
+  fi
+
+  # 2) Polling: replace with C and send **no** signal; the 30 s poll must pick
+  #    it up (worst case ~30 s + one handshake).
+  cp "$RELOAD_DIR/c-cert.pem" "$RELOAD_DIR/current-cert.pem"
+  cp "$RELOAD_DIR/c-key.pem" "$RELOAD_DIR/current-key.pem"
+  local tls_c=""
+  for i in $(seq 1 80); do
+    sleep 0.5
+    tls_c="$(s_client_fingerprint "$TLS_PORT")"
+    [[ -n "$tls_c" && "$tls_c" != "$tls_b" ]] && break
+  done
+
+  # 3) Bad material (C cert + A key): rejected, C keeps serving, failure counted.
+  local failed_before failed_after tls_bad
+  failed_before="$(metric 'rstun_turn_tls_reload_total{result="failed"}')"
+  cp "$RELOAD_DIR/a-key.pem" "$RELOAD_DIR/current-key.pem"
+  kill -HUP "$pid"
+  for i in $(seq 1 20); do
+    sleep 0.5
+    failed_after="$(metric 'rstun_turn_tls_reload_total{result="failed"}')"
+    [[ -n "$failed_after" && "$failed_after" != "$failed_before" ]] && break
+  done
+  tls_bad="$(s_client_fingerprint "$TLS_PORT")"
+  local alive=ok
+  kill -0 "$pid" 2>/dev/null || alive=dead
+  local ok_count
+  ok_count="$(metric 'rstun_turn_tls_reload_total{result="ok"}')"
+  stop_server "$name"
+
+  if [[ -n "$tls_a" && -n "$tls_b" && "$tls_a" != "$tls_b" && "$tls_b" == "$dtls_b" &&
+    "$session_ok" == ok &&
+    -n "$tls_c" && "$tls_c" != "$tls_b" && "$tls_bad" == "$tls_c" &&
+    -n "$failed_before" && -n "$failed_after" && "$failed_after" -gt "$failed_before" &&
+    "$alive" == ok && -n "$expires" && "$expires" -gt 0 && -n "$drift" && "$drift" -le 60 ]]; then
+    ok "$name" "SIGHUP → new cert (TLS+DTLS identical), established session still answers after reload ($session1), poll → third cert, bad pair kept the live one (failed ${failed_before}→${failed_after}, ok=$ok_count), expires=${expires}s (openssl drift ${drift}s)"
+  else
+    fail "$name" "sighup a=[$tls_a] b=[$tls_b] dtls-b=[$dtls_b]; session=[$session_ok $session1 / $session2] (see $LOG_DIR/$name-session.log); poll c=[$tls_c]; bad kept=[$tls_bad]; failed ${failed_before:-?}→${failed_after:-?}; alive=$alive; expires=${expires:-?} drift=${drift:-?}"
+  fi
+}
+
+# ---------- 6e. REST credentials: valid / expired / wrong secret (T2) ----------
 
 run_rest() {
   local name=rest
@@ -1384,6 +1565,7 @@ run_item() {
     ports) run_ports ;;
     tls) run_tls ;;
     dtls) run_dtls ;;
+    cert-reload) run_cert_reload ;;
     rest) run_rest ;;
     bandwidth) run_bandwidth ;;
     cleanup) run_cleanup ;;

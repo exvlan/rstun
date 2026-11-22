@@ -52,6 +52,10 @@
   `rstun_turn_tcp_connections{state=pending|bound}`（RFC 6062）、
   `rstun_turn_bytes_dropped_total{direction}` —— 最后一项是 T2 带宽配额丢包）；未开启时
   **省略**（不输出恒 0，避免误读「开着但空闲」）。
+- 证书热载指标**只在真的配了 `turns:`/DTLS 监听时**输出：
+  `rstun_turn_tls_reload_total{result=ok|failed}`（counter）、
+  `rstun_turn_tls_cert_expires_seconds`（gauge，当前 leaf 的 `notAfter − now`；负值=已过期，
+  `-1`=不可解析）。`--turn` 开但没有 secure 监听时这两个族同样省略。
 - T2 的 TLS/DTLS 握手失败**只进退出日志**（`handshake_failed`），不新增指标：`/metrics` 的
   标签集合保持固定。TLS/DTLS 连接的请求计数沿用 `transport="tcp"`/`"udp"`。
 

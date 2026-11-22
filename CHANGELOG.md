@@ -5,6 +5,36 @@
 
 ## Unreleased
 
+### TURN：`turns:` / DTLS 证书热加载（`SIGHUP` + 30s 轮询，免重启）
+
+- **不再重启轮换证书**：把 `--tls-cert`/`--tls-key` 指向的**同一路径**原地覆盖后，
+  `kill -HUP <pid>`（Linux/macOS）立即重读；Windows 或不愿发信号时靠 **30s 文件轮询**
+  （比对两条路径的 `(mtime,len)`，最坏 30s 生效）。两条触发路径共用同一个
+  `load_secure_material`，热载规则与启动规则**逐字相同**。
+- **整体原子替换**：一次成功重载重建并替换整个 `rustls::ServerConfig` + `webrtc_dtls::Config`，
+  TLS 与 DTLS **同时**生效，不存在「一半新一半旧」。新连接/新 DTLS 会话用新证书；**已建立
+  会话保持旧证书**（TLS 1.2/1.3 与 DTLS 均无重协商）。
+- **会话恢复**：本实现**从未启用** TLS 会话恢复（`ServerConfig::builder()` 的 rustls 默认是
+  `NoServerSessionStorage` + `NeverProducesTickets`），所以重载不影响恢复行为，也不存在
+  「首批连接 vs 之后」的差异 —— 每条连接本来就是完整握手。若将来开启恢复，整体替换
+  `ServerConfig` 才会清空 TLS 1.2 缓存与 TLS 1.3 ticket key。
+- **失败保留旧材料**：不配对、RSA（DTLS 监听下）、非 PKCS#8、截断、空文件等一律拒绝本次重载
+  并继续服务旧证书 —— **绝不降级明文、不关闭监听**。失败后 1s 重试一次以跨过「先写证书再写
+  私钥」的半写窗口，两次都失败才计一次失败。
+- **新指标（固定标签集，仅配了 `turns:`/DTLS 监听时出现）**：
+  `rstun_turn_tls_reload_total{result=ok|failed}`、
+  `rstun_turn_tls_cert_expires_seconds`（当前 leaf 的 `notAfter − now`，与
+  `openssl x509 -enddate` 一致；负值=已过期，`-1`=无法解析）。退出日志同时打印
+  `reload_ok`/`reload_failed`/`cert_expires_seconds`。
+- **依赖**：新增直接依赖 `x509-parser 0.16`（**optional，仅 `tls` feature**）读证书有效期。
+  它本来就在 `Cargo.lock`（`webrtc-dtls` 的传递依赖），**不新增 crate**；lean 构建不受影响。
+  unix full 直接依赖 14 → **15**（Windows 13 → 14），`script/ci/gen-sbom.sh` 与 README 同步。
+- lab 新增 `cert-reload` 项：SIGHUP 后 TLS/DTLS 新连接指纹同时变化、**已建立的 TLS 会话
+  跨重载仍能应答**、轮询路径换第三张证书、坏密钥对保留当前证书且
+  `reload_total{result="failed"}` 增长、到期 gauge 与 `openssl` 差 ≤60s。
+- **默认路径不变**：全部代码在 `tls` feature 内；不带 `--turn-tls-listen`/`--turn-dtls-listen`
+  时没有重载任务、没有新指标，字节冻结（3 配置 × 17 请求）照旧。
+
 ### TURN：RFC 6062 出站 TCP allocation（`--turn-tcp-relay`）
 
 - **新开关 `--turn-tcp-relay`（默认关）**：打开后 `Allocate` 的 `REQUESTED-TRANSPORT=6`

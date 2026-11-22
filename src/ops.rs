@@ -246,10 +246,11 @@ impl OpsState {
     /// the enums `transport × result`, `scope` and `direction`, which is the
     /// design's mitigation for metric blow-up.
     ///
-    /// TURN is only reported once `--turn` is on. Without it the four
-    /// `rstun_turn_*` families are **omitted** rather than reported as a
-    /// permanent zero (a zero would look like "TURN is on and idle"); README's
-    /// ops section says so explicitly.
+    /// TURN is only reported once `--turn` is on. Without it the whole
+    /// `rstun_turn_*` family is **omitted** rather than reported as a
+    /// permanent zero (a zero would look like "TURN is on and idle"); the
+    /// certificate families additionally need a `turns:`/DTLS listener.
+    /// README's ops section says so explicitly.
     pub fn metrics(&self) -> String {
         let mut out = String::with_capacity(2048);
         let admission = self.context.admission.as_ref();
@@ -526,6 +527,43 @@ impl OpsState {
             }
         }
 
+        // `turns:` / DTLS certificate reload (`--turn-tls-listen` /
+        // `--turn-dtls-listen`). Gated on the secure slot, not just `--turn`:
+        // without a secure listener these families must not appear at all.
+        #[cfg(feature = "tls")]
+        if let Some(secure) = self.stats.secure() {
+            let counts = secure.snapshot();
+            header(
+                &mut out,
+                "rstun_turn_tls_reload_total",
+                "TURN TLS/DTLS certificate reloads, by result \
+                 (ok = new material is live, failed = previous material kept).",
+                "counter",
+            );
+            for (result, value) in [("ok", counts.reload_ok), ("failed", counts.reload_failed)] {
+                sample(
+                    &mut out,
+                    "rstun_turn_tls_reload_total",
+                    &[("result", result)],
+                    value,
+                );
+            }
+
+            header(
+                &mut out,
+                "rstun_turn_tls_cert_expires_seconds",
+                "Seconds until the current leaf certificate expires \
+                 (negative = expired, -1 = validity unreadable).",
+                "gauge",
+            );
+            sample_i64(
+                &mut out,
+                "rstun_turn_tls_cert_expires_seconds",
+                &[],
+                counts.cert_expires_seconds,
+            );
+        }
+
         header(
             &mut out,
             "rstun_build_info",
@@ -599,6 +637,18 @@ fn header(out: &mut String, name: &str, help: &str, kind: &str) {
 
 /// One sample line; labels are emitted in the given order.
 fn sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+    write_sample(out, name, labels, &value.to_string());
+}
+
+/// One sample line with a signed (gauge) value: certificate expiry can be
+/// negative once the leaf has passed `notAfter`. Only the `tls` build has a
+/// signed gauge.
+#[cfg(feature = "tls")]
+fn sample_i64(out: &mut String, name: &str, labels: &[(&str, &str)], value: i64) {
+    write_sample(out, name, labels, &value.to_string());
+}
+
+fn write_sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: &str) {
     out.push_str(name);
     if !labels.is_empty() {
         out.push('{');
@@ -614,7 +664,7 @@ fn sample(out: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
         out.push('}');
     }
     out.push(' ');
-    out.push_str(&value.to_string());
+    out.push_str(value);
     out.push('\n');
 }
 
@@ -1555,6 +1605,44 @@ mod tests {
         let text = state.metrics();
         assert!(text.contains("rstun_requests_total{transport=\"udp\",result=\"ok\"} 1"));
         assert!(text.contains("rstun_requests_total{transport=\"tcp\",result=\"dropped\"} 1"));
+    }
+
+    /// The two certificate families exist only when secure material was really
+    /// loaded — a `--turn` server without `turns:`/DTLS keeps the T1 label set,
+    /// and a lean build never compiles them.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_reload_metrics_appear_only_with_secure_material() {
+        let stats = Arc::new(ServerStats::default());
+        let context = Arc::new(ServerContext::default());
+        let state = OpsState::new(Vec::new(), stats.clone(), context);
+        assert!(
+            !state.metrics().contains("rstun_turn_tls_"),
+            "no secure listener → no certificate metrics"
+        );
+
+        let secure = Arc::new(crate::SecureStats::default());
+        secure.count_reload_ok();
+        secure.count_reload_failure();
+        secure.set_not_after(Some(crate::unix_seconds_now() + 600));
+        stats.set_secure(secure);
+
+        let text = state.metrics();
+        assert!(text.contains("# TYPE rstun_turn_tls_reload_total counter"));
+        assert!(text.contains("rstun_turn_tls_reload_total{result=\"ok\"} 1"));
+        assert!(text.contains("rstun_turn_tls_reload_total{result=\"failed\"} 1"));
+        assert!(text.contains("# TYPE rstun_turn_tls_cert_expires_seconds gauge"));
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("rstun_turn_tls_cert_expires_seconds "))
+            .expect("expiry gauge line");
+        let value: i64 = line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .expect("numeric gauge");
+        assert!((595..=600).contains(&value), "expected ~600, got {value}");
     }
 
     // -- HTTP --------------------------------------------------------------

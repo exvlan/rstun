@@ -27,14 +27,14 @@ path = "src/main.rs"
 
 # 两种发布构建（**默认 lean**）：
 #   lean  `cargo build`                     STUN + TURN(UDP/TCP) + REST + 带宽，10 个直接依赖、~3.5 MB
-#   full  `cargo build --features full`     再加 `turns:`(TLS) 与 DTLS，14 个直接依赖、~7.9 MB
+#   full  `cargo build --features full`     再加 `turns:`(TLS) 与 DTLS，15 个直接依赖、~8.0 MB
 # 数字是 unix 口径：`libc` 只在 unix 上是直接依赖（DONT-FRAGMENT 的 setsockopt），
-# Windows 上没有它，lean/full 分别是 9/13。
+# Windows 上没有它，lean/full 分别是 9/14。
 # `dtls` 依赖 `tls`：两者共用同一份证书材料解析（`SecureMaterial`），DTLS 单独存在没有意义。
 # 任何 feature 都不改变默认关闭路径的字节（`frozen` 项：3 配置 × 17 请求）。
 [features]
 default = []
-tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:x509-parser"]
 dtls = ["tls", "dep:webrtc-dtls", "dep:webrtc-util"]
 full = ["tls", "dtls"]
 
@@ -83,6 +83,12 @@ tokio-rustls = { version = "0.26.6", optional = true, default-features = false, 
   "tls12",
 ] }
 rustls-pemfile = { version = "2.2", optional = true }
+# 证书到期指标（`rstun_turn_tls_cert_expires_seconds`）需要读 X.509 validity，
+# 而 rustls 的 `ServerConfig` 不回读 `notAfter`。`x509-parser 0.16` 本来就在
+# 依赖树里（`webrtc-dtls` 的传递依赖），提升为直接依赖**不新增 crate**；仅
+# `tls` feature 启用，lean 构建完全不受影响。只解析 DER（不做链验签），
+# `default-features = false` 已无额外特性可关，显式写出来只为表明这一意图。
+x509-parser = { version = "0.16", optional = true, default-features = false }
 # `rustls` 不支持 DTLS；`webrtc-dtls` 是纯 Rust 实现（内置 rcgen/ring 的传递依赖）。
 # `pem` 只用于把 PEM 证书/私钥读成 `Certificate`。
 webrtc-dtls = { version = "0.12", optional = true, features = ["pem"] }

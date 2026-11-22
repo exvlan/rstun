@@ -19,7 +19,7 @@ docker stop rstun           # SIGTERM → 打印 received/answered/dropped 后�
 镜像细节：多阶段（`rust:1-slim` 构建 → `debian:stable-slim` 运行），`ENTRYPOINT ["rstun"]`，
 `EXPOSE 3478/udp 3478/tcp 5349/tcp 5349/udp`，`STOPSIGNAL SIGTERM`。
 镜像里的二进制经 LTO + strip 后约 **4.8 MB**（lean 同参数约 2.35 MB；未 strip 的本地
-`cargo build --release --features full` 是 7.9 MB，别拿它对比镜像）。只要 lean 时用 Release 里的
+`cargo build --release --features full` 是 8.15 MB，别拿它对比镜像）。只要 lean 时用 Release 里的
 `rstun-<platform>-<version>.zip`。
 
 ## 版本串注入

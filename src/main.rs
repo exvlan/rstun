@@ -56,6 +56,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(feature = "tls")]
+use std::sync::atomic::AtomicI64;
+#[cfg(feature = "tls")]
+use std::time::UNIX_EPOCH;
+
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::{
@@ -414,6 +419,12 @@ pub struct ServerStats {
     /// default) means the whole TURN path is skipped: no parse, no table, no
     /// `/metrics` lines — the pre-TURN bytes stay frozen.
     turn: std::sync::OnceLock<Arc<turn::Turn>>,
+    /// TLS/DTLS certificate material bookkeeping, set once at startup when a
+    /// secure listener is configured. Absent in a lean build, and `None` for a
+    /// `--turn` server without `turns:`/DTLS, so the non-TLS label set keeps
+    /// exactly the T1 rows.
+    #[cfg(feature = "tls")]
+    secure: std::sync::OnceLock<Arc<SecureStats>>,
 }
 
 /// Per-transport outcome buckets for `rstun_requests_total`.
@@ -580,6 +591,86 @@ impl ServerStats {
     pub(crate) fn set_turn(&self, turn: Arc<turn::Turn>) {
         let _ = self.turn.set(turn);
     }
+
+    /// Certificate reload bookkeeping, when a secure listener is configured.
+    #[cfg(feature = "tls")]
+    pub(crate) fn secure(&self) -> Option<&Arc<SecureStats>> {
+        self.secure.get()
+    }
+
+    /// Install the certificate bookkeeping once, at startup.
+    #[cfg(feature = "tls")]
+    pub(crate) fn set_secure(&self, secure: Arc<SecureStats>) {
+        let _ = self.secure.set(secure);
+    }
+}
+
+/// Certificate reload bookkeeping for `turns:` / DTLS.
+///
+/// Deliberately separate from [`turn::Counters`]: a `--turn` server without a
+/// secure listener must not grow these two metric families, and a lean build
+/// does not compile this type at all.
+#[cfg(feature = "tls")]
+#[derive(Debug, Default)]
+pub struct SecureStats {
+    reload_ok: AtomicU64,
+    reload_failed: AtomicU64,
+    /// Unix seconds of the current leaf certificate's `notAfter`; `0` means
+    /// "could not parse", which the gauge reports as `-1` (design §3.1).
+    not_after: AtomicI64,
+}
+
+/// One consistent read of [`SecureStats`] (`/metrics` and the exit log).
+#[cfg(feature = "tls")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecureSnapshot {
+    pub reload_ok: u64,
+    pub reload_failed: u64,
+    /// `notAfter - now` in seconds; negative means already expired, `-1` means
+    /// the validity could not be parsed.
+    pub cert_expires_seconds: i64,
+}
+
+#[cfg(feature = "tls")]
+impl SecureStats {
+    /// A reload parsed and swapped in a complete new material set.
+    pub fn count_reload_ok(&self) {
+        self.reload_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A reload was rejected after its retry: old material stays in service.
+    pub fn count_reload_failure(&self) {
+        self.reload_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the current leaf's `notAfter`; `None` marks it unparseable.
+    pub fn set_not_after(&self, not_after: Option<i64>) {
+        self.not_after
+            .store(not_after.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> SecureSnapshot {
+        let not_after = self.not_after.load(Ordering::Relaxed);
+        let cert_expires_seconds = if not_after == 0 {
+            -1
+        } else {
+            not_after - unix_seconds_now()
+        };
+        SecureSnapshot {
+            reload_ok: self.reload_ok.load(Ordering::Relaxed),
+            reload_failed: self.reload_failed.load(Ordering::Relaxed),
+            cert_expires_seconds,
+        }
+    }
+}
+
+/// Current Unix time in whole seconds (saturating on a pre-1970 clock).
+#[cfg(feature = "tls")]
+fn unix_seconds_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// What to do with one inbound message.
@@ -1269,8 +1360,20 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
             );
             return ExitCode::FAILURE;
         };
-        match load_secure_material(cert, key, !args.turn_dtls_listen.is_empty()) {
-            Ok(material) => Some(material),
+        let needs_dtls = !args.turn_dtls_listen.is_empty();
+        match load_secure_material(cert, key, needs_dtls) {
+            Ok(loaded) => {
+                let secure_stats = Arc::new(SecureStats::default());
+                secure_stats.set_not_after(loaded.not_after);
+                stats.set_secure(secure_stats.clone());
+                Some(SecureSetup {
+                    slot: Arc::new(std::sync::RwLock::new(loaded.material)),
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    needs_dtls,
+                    stats: secure_stats,
+                })
+            }
             Err(message) => {
                 tracing::error!(%message, "rstun: invalid TLS configuration");
                 return ExitCode::FAILURE;
@@ -1313,7 +1416,7 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
     if let Some(material) = &secure {
         for address in &args.turn_tls_listen {
             match tcp_listener(*address) {
-                Ok(listener) => tls_listeners.push((*address, listener, material.acceptor.clone())),
+                Ok(listener) => tls_listeners.push((*address, listener, material.slot.clone())),
                 Err(error) => {
                     tracing::error!(%address, %error, "rstun: failed to bind --turn-tls-listen");
                     return ExitCode::FAILURE;
@@ -1322,12 +1425,12 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
         }
     }
     #[cfg(feature = "tls")]
-    for (local, listener, acceptor) in tls_listeners {
+    for (local, listener, material) in tls_listeners {
         let (task, health) = spawn_listener(
             format!("tls {local}"),
             serve_turn_tls(
                 listener,
-                acceptor,
+                material,
                 context.clone(),
                 software.clone(),
                 stats.clone(),
@@ -1346,10 +1449,10 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
         // `load_secure_material(…, needs_dtls = !turn_dtls_listen.is_empty())`
         // guarantees this; failing loudly beats serving a listener every client
         // would fail to handshake with.
-        let Some(dtls_config) = material.dtls.clone() else {
+        if current_material(&material.slot).dtls.is_none() {
             tracing::error!("rstun: DTLS listener without DTLS material (internal bug)");
             return ExitCode::FAILURE;
-        };
+        }
         for address in &args.turn_dtls_listen {
             let mut config = webrtc_util::conn::conn_udp_listener::ListenConfig {
                 accept_filter: Some(Box::new(|packet: &[u8]| {
@@ -1371,7 +1474,7 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
                 format!("dtls {address}"),
                 serve_turn_dtls(
                     listener,
-                    dtls_config.clone(),
+                    material.slot.clone(),
                     context.clone(),
                     software.clone(),
                     stats.clone(),
@@ -1404,8 +1507,14 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
     let sweeper = admission.as_ref().and_then(limit::start_sweeper);
     // TURN 的 1s 扫描任务同样常驻、不参与 drain（与限速 sweeper 同一条规则）。
     let turn_sweeper = turn.as_ref().map(turn::Turn::start_sweeper);
+    // Certificate rotation: SIGHUP (Unix) + a fixed 30 s poll, both driving the
+    // same `reload_secure_material`. Only exists when a secure listener does,
+    // and it leaves on drain (it is not tracked as in-flight work).
+    #[cfg(feature = "tls")]
+    let cert_reloader = secure
+        .as_ref()
+        .map(|setup| spawn_cert_reloader(setup.clone(), stats.clone()));
     let listener_count = listeners.len();
-
     let ops_task = ops_listener.map(|listener| {
         let state = Arc::new(ops::OpsState::new(
             listeners.clone(),
@@ -1550,6 +1659,10 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
     if let Some(task) = turn_sweeper {
         task.abort();
     }
+    #[cfg(feature = "tls")]
+    if let Some(task) = cert_reloader {
+        task.abort();
+    }
     if let Some(task) = ops_task {
         // 健康端点留到最后一刻：drain 期间仍可抓取最终指标。
         task.abort();
@@ -1603,6 +1716,18 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
             bytes_dropped_out = counts.bytes_dropped_out,
             handshake_failed = counts.handshake_failed,
             "rstun: TURN counters"
+        );
+    }
+    // Same precedent as `handshake_failed`: the reload outcome is an exit-log
+    // line as well as the two `/metrics` families.
+    #[cfg(feature = "tls")]
+    if let Some(secure) = stats.secure() {
+        let counts = secure.snapshot();
+        tracing::info!(
+            reload_ok = counts.reload_ok,
+            reload_failed = counts.reload_failed,
+            cert_expires_seconds = counts.cert_expires_seconds,
+            "rstun: TURN TLS certificate counters"
         );
     }
     exit_code
@@ -3102,9 +3227,12 @@ where
 #[cfg(feature = "tls")]
 const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Server-side TLS + DTLS material, parsed **once** at startup so a bad path or
-/// an unusable key pair is a refused start rather than a silent plaintext
-/// fallback (design §3.2 / §9).
+/// One complete set of server-side TLS + DTLS material.
+///
+/// Replaced **whole** on a reload (design §2 / D2): a single `Arc` swap means a
+/// new `turns:` connection and a new DTLS session can never observe a mix of two
+/// certificate generations. Established sessions keep the copy they handshook
+/// with — neither TLS 1.3/1.2 nor `webrtc-dtls` renegotiates certificates.
 ///
 /// `dtls` is `Some` only when the `dtls` feature is on **and** a
 /// `--turn-dtls-listen` address was given. The DTLS side has stricter rules
@@ -3112,10 +3240,47 @@ const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// would refuse a perfectly good `turns:`-only deployment that happens to use an
 /// RSA certificate — which is the normal Let's Encrypt shape.
 #[cfg(feature = "tls")]
-struct SecureMaterial {
-    acceptor: tokio_rustls::TlsAcceptor,
+struct SharedMaterial {
+    tls: Arc<tokio_rustls::rustls::ServerConfig>,
     #[cfg(feature = "dtls")]
     dtls: Option<webrtc_dtls::config::Config>,
+}
+
+/// The live material every secure listener reads from.
+///
+/// Read-locked once per accepted connection for a cheap `Arc` clone; written
+/// once per successful reload. The write never holds the lock across file I/O:
+/// the new material is parsed and validated first, then swapped in.
+#[cfg(feature = "tls")]
+type MaterialSlot = Arc<std::sync::RwLock<Arc<SharedMaterial>>>;
+
+/// What a successful [`load_secure_material`] produced.
+#[cfg(feature = "tls")]
+struct LoadedMaterial {
+    material: Arc<SharedMaterial>,
+    /// The leaf certificate's `notAfter` (present unless X.509 parsing, which
+    /// the same DER already survived through rustls, somehow fails).
+    not_after: Option<i64>,
+}
+
+/// Everything a running secure deployment needs to reload its own material:
+/// the live slot, the (unchangeable) source paths, whether DTLS material is
+/// required, and where to count.
+#[cfg(feature = "tls")]
+#[derive(Clone)]
+struct SecureSetup {
+    slot: MaterialSlot,
+    cert: PathBuf,
+    key: PathBuf,
+    needs_dtls: bool,
+    stats: Arc<SecureStats>,
+}
+
+/// One cheap, poison-tolerant read of the live material.
+#[cfg(feature = "tls")]
+fn current_material(slot: &MaterialSlot) -> Arc<SharedMaterial> {
+    let guard = slot.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.clone()
 }
 
 /// Load `--tls-cert` / `--tls-key` into the stacks this start actually serves.
@@ -3130,7 +3295,7 @@ fn load_secure_material(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
     needs_dtls: bool,
-) -> Result<SecureMaterial, String> {
+) -> Result<LoadedMaterial, String> {
     // A `tls`-only build has no DTLS path at all; `build_turn` already refused
     // `--turn-dtls-listen` there, so the flag is simply not consulted.
     #[cfg(not(feature = "dtls"))]
@@ -3226,10 +3391,231 @@ fn load_secure_material(
         })
     };
 
-    Ok(SecureMaterial {
-        acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)),
-        #[cfg(feature = "dtls")]
-        dtls,
+    // The leaf's validity, for `rstun_turn_tls_cert_expires_seconds`. rustls
+    // does not expose it, and re-parsing here is the only way to keep the
+    // gauge without a second validation path: this is read-only, the DER has
+    // already passed `with_single_cert` above.
+    let not_after = certificate_not_after(certs[0].as_ref());
+
+    Ok(LoadedMaterial {
+        material: Arc::new(SharedMaterial {
+            tls: Arc::new(tls_config),
+            #[cfg(feature = "dtls")]
+            dtls,
+        }),
+        not_after,
+    })
+}
+
+/// The leaf certificate's `notAfter` as Unix seconds.
+///
+/// Only the validity is read: no chain building, no signature check — the same
+/// DER was just accepted by `with_single_cert`, so this can only fail on a
+/// parser/rustls disagreement (reported as `None` → gauge `-1`).
+#[cfg(feature = "tls")]
+fn certificate_not_after(der: &[u8]) -> Option<i64> {
+    use x509_parser::prelude::FromDer as _;
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+    Some(certificate.validity().not_after.timestamp())
+}
+
+/// How often the two material files are stat'ed for a change (design §5).
+///
+/// SIGHUP is the immediate path; polling is what makes rotation work on
+/// Windows (no `SIGHUP`) and in deployments that would rather not signal.
+#[cfg(feature = "tls")]
+const CERT_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// One retry after this delay, to step over the "cert already written, key
+/// still being written" window (design §5 / D3).
+#[cfg(feature = "tls")]
+const CERT_RELOAD_RETRY: Duration = Duration::from_secs(1);
+
+/// `(mtime, len)` for one file. `mtime` can be unavailable on exotic
+/// filesystems; the length alone still detects most rewrites, and the parse
+/// result is the real gate either way.
+#[cfg(feature = "tls")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+#[cfg(feature = "tls")]
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
+}
+
+/// Both paths' stamps, or `None` while a `rename` has one of them missing.
+#[cfg(feature = "tls")]
+fn material_stamp(setup: &SecureSetup) -> Option<(FileStamp, FileStamp)> {
+    Some((file_stamp(&setup.cert)?, file_stamp(&setup.key)?))
+}
+
+/// Parse + validate the material at the configured paths and swap it in.
+///
+/// The validation is literally [`load_secure_material`] — the startup rules
+/// (pairing, PKCS#8, DTLS algorithms) are the reload rules, so a rotation
+/// cannot be accepted here and refused on the next restart.
+///
+/// Any failure keeps the previous material in service (D3): a rotation that
+/// lands in a half-written window must not take down every established
+/// session. Returns whether the live material changed.
+#[cfg(feature = "tls")]
+async fn reload_secure_material(setup: &SecureSetup) -> bool {
+    match load_secure_material(&setup.cert, &setup.key, setup.needs_dtls) {
+        Ok(loaded) => {
+            swap_material(setup, loaded);
+            true
+        }
+        Err(first_error) => {
+            // The usual cause is an in-progress rotation: cert and key are two
+            // files, so one of them is momentarily new and the other old.
+            tokio::time::sleep(CERT_RELOAD_RETRY).await;
+            match load_secure_material(&setup.cert, &setup.key, setup.needs_dtls) {
+                Ok(loaded) => {
+                    swap_material(setup, loaded);
+                    true
+                }
+                Err(second_error) => {
+                    setup.stats.count_reload_failure();
+                    // Both messages are our own `format!` strings (paths and
+                    // parser text only) — never the private key.
+                    tracing::warn!(
+                        cert = %setup.cert.display(),
+                        key = %setup.key.display(),
+                        error = %second_error,
+                        first_error = %first_error,
+                        "rstun: TURN TLS certificate reload rejected, keeping the previous material"
+                    );
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// One complete swap: the slot write is the only mutation, and it happens
+/// after all parsing/validation succeeded.
+#[cfg(feature = "tls")]
+fn swap_material(setup: &SecureSetup, loaded: LoadedMaterial) {
+    {
+        let mut slot = setup
+            .slot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = loaded.material;
+    }
+    setup.stats.count_reload_ok();
+    setup.stats.set_not_after(loaded.not_after);
+
+    // Once-only warning if the (already rustls-validated) DER somehow does not
+    // parse for the validity meter: the gauge then reports `-1`.
+    if loaded.not_after.is_none() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                cert = %setup.cert.display(),
+                "rstun: cannot read the certificate validity; \
+                 rstun_turn_tls_cert_expires_seconds will report -1"
+            );
+        });
+    }
+    let cert_modified = file_stamp(&setup.cert)
+        .and_then(|stamp| stamp.modified)
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs());
+    let days_left = loaded
+        .not_after
+        .map(|not_after| (not_after - unix_seconds_now()) as f64 / SECONDS_PER_DAY as f64);
+    tracing::info!(
+        cert = %setup.cert.display(),
+        key = %setup.key.display(),
+        cert_mtime_unix = cert_modified,
+        not_after_unix = loaded.not_after,
+        days_left,
+        "rstun: TURN TLS certificate reloaded"
+    );
+}
+
+#[cfg(feature = "tls")]
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Reload on `SIGHUP` (Unix) and whenever either file's `(mtime, len)` changes
+/// on the 30 s poll (every platform). Both paths share
+/// [`reload_secure_material`], so they cannot diverge.
+#[cfg(feature = "tls")]
+fn spawn_cert_reloader(setup: SecureSetup, stats: Arc<ServerStats>) -> tokio::task::JoinHandle<()> {
+    // Register SIGHUP **before** spawning: between `spawn` and the task's first
+    // poll the signal would still have its default disposition (terminate the
+    // process), leaving a window where `kill -HUP` kills the server.
+    #[cfg(unix)]
+    let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(signal) => Some(signal),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "rstun: cannot listen for SIGHUP; certificate reload falls back to polling"
+            );
+            None
+        }
+    };
+    tokio::spawn(async move {
+        let mut drain = stats.subscribe_drain();
+        #[cfg(unix)]
+        let mut hangup = hangup;
+        let mut poll = tokio::time::interval(CERT_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval` fires once immediately; that would be a redundant parse of
+        // material that was loaded seconds ago at startup.
+        poll.tick().await;
+        let mut last_attempt = material_stamp(&setup);
+        loop {
+            // `true` = an operator asked explicitly (SIGHUP), `false` = poll.
+            #[cfg(unix)]
+            let signalled = tokio::select! {
+                biased;
+                _ = drain.changed() => break,
+                _ = async {
+                    match hangup.as_mut() {
+                        Some(signal) => {
+                            // `None` means the signal stream ended (never in
+                            // practice). Park instead of spinning this select.
+                            if signal.recv().await.is_none() {
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => true,
+                _ = poll.tick() => false,
+            };
+            #[cfg(not(unix))]
+            let signalled = tokio::select! {
+                biased;
+                _ = drain.changed() => break,
+                _ = poll.tick() => false,
+            };
+
+            let stamp = material_stamp(&setup);
+            if !signalled {
+                // Poll: nothing changed means nothing to parse (and no log).
+                // `None` means a file is momentarily missing (a `rename` in
+                // progress) — try again on the next tick.
+                match (stamp, last_attempt) {
+                    (Some(current), Some(previous)) if current == previous => continue,
+                    (None, _) => continue,
+                    _ => {}
+                }
+            }
+            last_attempt = stamp;
+            let _ = reload_secure_material(&setup).await;
+        }
+        tracing::debug!("rstun: TURN TLS certificate reloader stopped (draining)");
     })
 }
 
@@ -3269,7 +3655,7 @@ fn dtls_pem(
 #[cfg(feature = "tls")]
 async fn serve_turn_tls(
     listener: TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
+    material: MaterialSlot,
     context: Arc<ServerContext>,
     software: Arc<str>,
     stats: Arc<ServerStats>,
@@ -3314,7 +3700,10 @@ async fn serve_turn_tls(
                 continue;
             }
         };
-        let acceptor = acceptor.clone();
+        // Read the live material **after** accepting: this is where a reload
+        // takes effect. Established connections keep the `Arc<ServerConfig>`
+        // their handshake cloned, so they are unaffected.
+        let acceptor = tokio_rustls::TlsAcceptor::from(current_material(&material).tls.clone());
         let context = context.clone();
         let software = software.clone();
         let stats = stats.clone();
@@ -3370,7 +3759,7 @@ async fn serve_turn_tls(
 #[cfg(feature = "dtls")]
 async fn serve_turn_dtls<L>(
     listener: L,
-    config: webrtc_dtls::config::Config,
+    material: MaterialSlot,
     context: Arc<ServerContext>,
     software: Arc<str>,
     stats: Arc<ServerStats>,
@@ -3420,7 +3809,14 @@ where
                 continue;
             }
         };
-        let config = config.clone();
+        // A reload swaps the whole config; cloning it here is what makes the
+        // new certificate apply to this client while older sessions keep the
+        // copy `DTLSConn` took at their own handshake.
+        let Some(config) = current_material(&material).dtls.clone() else {
+            tracing::error!(%local, %peer, "rstun: TURN DTLS listener without material");
+            let _ = conn.close().await;
+            continue;
+        };
         let context = context.clone();
         let software = software.clone();
         let stats = stats.clone();
@@ -6956,13 +7352,13 @@ mod tests {
     /// so the B1 regression (an RSA certificate is valid for `turns:` but not for
     /// DTLS) is covered without shelling out to `openssl`, which the Windows and
     /// macOS CI runners do not have.
-    #[cfg(feature = "dtls")]
+    #[cfg(feature = "tls")]
     const TEST_RSA_CERT_PEM: &str = include_str!("../tests/fixtures/rsa-test-only.crt.pem");
-    #[cfg(feature = "dtls")]
+    #[cfg(feature = "tls")]
     const TEST_RSA_KEY_PEM: &str = include_str!("../tests/fixtures/rsa-test-only.key.pem");
 
     /// Write the embedded PEM pair to a private temp dir; returns `(dir, cert, key)`.
-    #[cfg(feature = "dtls")]
+    #[cfg(feature = "tls")]
     fn rsa_test_pair() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "rstun-rsa-pair-{}-{}",
@@ -6991,7 +7387,7 @@ mod tests {
         let material = load_secure_material(&cert, &key, false)
             .expect("an RSA pair is fine for turns: when DTLS is not requested");
         assert!(
-            material.dtls.is_none(),
+            material.material.dtls.is_none(),
             "no DTLS listener → no DTLS material to build"
         );
 
@@ -7001,6 +7397,225 @@ mod tests {
         assert!(
             error.contains("ECDSA P-256") && error.contains("DTLS"),
             "the error must name the DTLS restriction: {error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fresh, unique temp directory for the reload tests.
+    #[cfg(feature = "tls")]
+    fn material_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rstun-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A [`SecureSetup`] plus its two live paths, seeded with the RSA fixture.
+    /// RSA is fine here because these tests never request DTLS material.
+    #[cfg(feature = "tls")]
+    fn seeded_setup(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        SecureSetup,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let dir = material_dir(tag);
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, TEST_RSA_CERT_PEM).unwrap();
+        std::fs::write(&key, TEST_RSA_KEY_PEM).unwrap();
+        let loaded = load_secure_material(&cert, &key, false).expect("seed material");
+        let stats = Arc::new(SecureStats::default());
+        stats.set_not_after(loaded.not_after);
+        (
+            dir.clone(),
+            SecureSetup {
+                slot: Arc::new(std::sync::RwLock::new(loaded.material)),
+                cert: cert.clone(),
+                key: key.clone(),
+                needs_dtls: false,
+                stats,
+            },
+            cert,
+            key,
+        )
+    }
+
+    /// D2 + D3: a successful reload swaps the whole `SharedMaterial`; a rejected
+    /// one leaves the old `Arc` live (established sessions and new handshakes
+    /// keep the same config) and counts exactly one failure after its retry.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn reload_swaps_atomically_and_keeps_the_old_material_on_failure() {
+        let (dir, setup, cert, key) = seeded_setup("reload");
+        let original = current_material(&setup.slot);
+
+        assert!(
+            reload_secure_material(&setup).await,
+            "same bytes still parse"
+        );
+        let after_ok = current_material(&setup.slot);
+        assert!(
+            !Arc::ptr_eq(&original, &after_ok),
+            "a reload rebuilds the whole ServerConfig on purpose"
+        );
+        assert_eq!(setup.stats.snapshot().reload_ok, 1);
+        assert_eq!(setup.stats.snapshot().reload_failed, 0);
+
+        // A key that is not a key: rejected after the 1 s retry.
+        std::fs::write(
+            &key,
+            "-----BEGIN PRIVATE KEY-----\nnot base64 at all\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        assert!(!reload_secure_material(&setup).await);
+        let after_failure = current_material(&setup.slot);
+        assert!(
+            Arc::ptr_eq(&after_ok, &after_failure),
+            "a rejected reload must not touch the live material"
+        );
+        let counts = setup.stats.snapshot();
+        assert_eq!(counts.reload_failed, 1, "one failure, not one per attempt");
+        assert_eq!(counts.reload_ok, 1);
+
+        // A truncated certificate is the same class of rejection, with the
+        // startup text (the reload rules *are* the startup rules).
+        std::fs::write(&key, TEST_RSA_KEY_PEM).unwrap();
+        std::fs::write(&cert, &TEST_RSA_CERT_PEM.as_bytes()[..200]).unwrap();
+        assert!(!reload_secure_material(&setup).await);
+        assert!(Arc::ptr_eq(&after_ok, &current_material(&setup.slot)));
+        assert_eq!(setup.stats.snapshot().reload_failed, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// D3 / implement.md 1.3: cert and key are two files, so the first parse
+    /// can legitimately fail while the key is still the old one. The 1 s retry
+    /// must then succeed **without counting a failure**.
+    ///
+    /// Real time, not `tokio::time::pause`: the helper has to actually write the
+    /// file, and 300 ms sits well inside the 1 s retry window. Pausing would
+    /// need tokio's `test-util` feature and would make the helper's file write
+    /// race the manual `advance`.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn reload_retries_once_across_the_half_written_window() {
+        let (dir, setup, _cert, key) = seeded_setup("half-write");
+        let before = current_material(&setup.slot);
+
+        // "cert written, key not yet": the pair does not match.
+        std::fs::write(
+            &key,
+            "-----BEGIN PRIVATE KEY-----\nnot base64 at all\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let key_path = key.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            std::fs::write(&key_path, TEST_RSA_KEY_PEM).unwrap();
+        });
+
+        assert!(
+            reload_secure_material(&setup).await,
+            "the retry must pick up the completed pair"
+        );
+        writer.await.unwrap();
+        let counts = setup.stats.snapshot();
+        assert_eq!(counts.reload_ok, 1);
+        assert_eq!(
+            counts.reload_failed, 0,
+            "a recovered retry is not a failure"
+        );
+        assert!(
+            !Arc::ptr_eq(&before, &current_material(&setup.slot)),
+            "the successful retry must swap the slot"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The reload must use the **same** `needs_dtls` as startup: a pair that is
+    /// fine for `turns:` is refused when the deployment also has a DTLS
+    /// listener. Same files, same entry point — only the flag differs.
+    #[cfg(all(feature = "tls", feature = "dtls"))]
+    #[tokio::test]
+    async fn reload_threads_needs_dtls_into_the_startup_rules() {
+        let (dir, mut setup, _cert, _key) = seeded_setup("needs-dtls");
+        let before = current_material(&setup.slot);
+
+        // RSA is accepted for TLS and refused for DTLS (webrtc-dtls signs with
+        // ECDSA P-256 / Ed25519 only); `seeded_setup` loads needs_dtls = false.
+        setup.needs_dtls = true;
+        assert!(
+            !reload_secure_material(&setup).await,
+            "an RSA pair must be rejected for a DTLS deployment"
+        );
+        assert!(Arc::ptr_eq(&before, &current_material(&setup.slot)));
+        assert_eq!(setup.stats.snapshot().reload_failed, 1);
+
+        // Same bytes with the DTLS rules off → accepted. If the reload dropped
+        // the flag (always `false`), the assert above would fail instead.
+        setup.needs_dtls = false;
+        assert!(reload_secure_material(&setup).await);
+        assert_eq!(setup.stats.snapshot().reload_ok, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The `(mtime, len)` gate: unchanged files compare equal, a rewrite is
+    /// detected, and a file that is momentarily missing (a `rename` in
+    /// progress) reports `None` instead of a false "changed".
+    #[cfg(feature = "tls")]
+    #[test]
+    fn material_stamp_tracks_rewrites_and_missing_files() {
+        let (dir, setup, cert, key) = seeded_setup("stamp");
+        let first = material_stamp(&setup).expect("both files exist");
+        assert_eq!(material_stamp(&setup), Some(first));
+
+        std::fs::write(&cert, format!("{TEST_RSA_CERT_PEM}\n")).unwrap();
+        let rewritten = material_stamp(&setup).expect("still both files");
+        assert_ne!(first, rewritten, "(mtime, len) must notice the rewrite");
+
+        std::fs::remove_file(&key).unwrap();
+        assert_eq!(material_stamp(&setup), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The expiry gauge is computed against the wall clock when scraped, so a
+    /// long-lived process does not report a stale "time left".
+    #[cfg(feature = "tls")]
+    #[test]
+    fn secure_stats_expiry_follows_the_clock_and_marks_unknown_as_minus_one() {
+        let stats = SecureStats::default();
+        assert_eq!(stats.snapshot().cert_expires_seconds, -1);
+
+        stats.set_not_after(Some(unix_seconds_now() + 600));
+        let left = stats.snapshot().cert_expires_seconds;
+        assert!((595..=600).contains(&left), "expected ~600, got {left}");
+
+        stats.set_not_after(Some(unix_seconds_now() - 60));
+        assert!(stats.snapshot().cert_expires_seconds < 0);
+
+        stats.set_not_after(None);
+        assert_eq!(stats.snapshot().cert_expires_seconds, -1);
+    }
+
+    /// `x509-parser` reads the leaf's validity (the only reason it is a direct
+    /// dependency); the fixture expires in 2126.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn load_reads_the_leaf_not_after() {
+        let (dir, cert, key) = rsa_test_pair();
+        let loaded = load_secure_material(&cert, &key, false).expect("RSA is fine for TLS");
+        let not_after = loaded.not_after.expect("the fixture DER must parse");
+        assert!(
+            not_after > 1_700_000_000,
+            "sanity: post-2023, got {not_after}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

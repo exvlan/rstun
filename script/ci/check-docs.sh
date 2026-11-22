@@ -9,7 +9,8 @@
 #   2. 参数名：文档里出现的 `--flag` 必须在 `--help` 里有定义（cargo/docker/lab 脚本的 flag
 #      走 `ALLOW_NON_RSTUN` 白名单，新增白名单必须写明理由）；
 #   3. 指标名：文档里出现的 `rstun_*` 必须由真实 `/metrics` 输出（启动实例时带 `--turn`，
-#      否则 TURN 指标族不出现）；
+#      否则 TURN 指标族不出现）；只在 `turns:`/DTLS 部署里出现的证书指标走
+#      `CONDITIONAL_METRICS`（本检查器的实例不带 secure 监听，门禁由单测覆盖）；
 #   4. 链接：文档之间的相对链接与 `#锚点` 必须可达（README → docs 的摘要是由它守住的）。
 #
 # 用法：
@@ -214,6 +215,15 @@ for line in METRICS.splitlines():
 if not metric_names:
     fail("没有从 /metrics 读到任何指标名（服务没起来？）")
 
+# 只在一部分部署里出现的指标：本检查器起的实例是 `--turn` 但不带 `turns:`/DTLS，
+# 所以证书相关指标永远读不到。它们是**条件输出**（`--turn` + secure 监听），
+# 由单测 `tls_reload_metrics_appear_only_with_secure_material` 与
+# `turn_metrics_appear_only_when_enabled` 覆盖门禁；这里只登记名字，不做真实抓取。
+CONDITIONAL_METRICS = {
+    "rstun_turn_tls_reload_total",
+    "rstun_turn_tls_cert_expires_seconds",
+}
+
 # ---- 文档文件清单 ----------------------------------------------------------
 # 扫描范围：文档站 + 仓库根的用户可见 markdown（README / SECURITY / CONTRIBUTING）。
 # 仓库根的 `SECURITY.md` 里写着 `--check-fingerprint` 这类 flag，漂移了同样会骗用户。
@@ -294,7 +304,7 @@ for path in md_files:
             "（若是 cargo/docker/脚本的参数，请加进 check-docs.sh 的 ALLOW_NON_RSTUN 并写理由）"
         )
     for name in sorted(set(re.findall(r"\brstun_[a-z][a-z0-9_]*[a-z0-9]\b", text))):
-        if name in metric_names:
+        if name in metric_names or name in CONDITIONAL_METRICS:
             continue
         fail(f"{rel(path)}: 提到了指标 `{name}`，但 `--turn` 实例的 /metrics 里没有")
 

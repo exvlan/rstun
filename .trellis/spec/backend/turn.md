@@ -20,7 +20,7 @@
 | `Refresh` 生命周期 | 缺 `LIFETIME` → 服务端默认（600s，§8.2）；`LIFETIME=0` → 立即释放；未知 allocation → `437` |
 | `REQUESTED-ADDRESS-FAMILY` (0x0017) | 4 字节 `family | reserved`；**reserved 24 位必须忽略**；`Allocate`：族与 `relay_ip` 一致 → `200`；不一致或族值非 `0x01`/`0x02` → **`440`**（计 `rejected_family`）；长度 ≠ 4 → **`400`**；`Refresh`：族与该 allocation 的 relay 族**不匹配 → `443`**（§8.2 MUST，计 `rejected_family`）、匹配 → 正常续期、长度 ≠ 4 → `400`；`RESERVATION-TOKEN` 与 `EVEN-PORT` **或 RAF** 互斥 → **`400`**，且**步骤 5 先于步骤 7**（异族 token 也是 400，coturn 同）；`ADDITIONAL-ADDRESS-FAMILY` (0x8000) 未实现（comprehension-optional，忽略）⇒ §7.2 **步骤 6**（RAF+AAF → 400）**不生效**，记账于 `docs/book/src/turn.md` |
 | `DONT-FRAGMENT` (0x001A) | **平台**：`DONT_FRAGMENT_SUPPORTED = cfg!(any(target_os="linux","macos","ios"))` —— 只有 `set_dont_fragment` 真实现的三个平台为真；Windows 与其它 unix（FreeBSD 等）为假 ⇒ `0x001A` 保持未知 comprehension-required → **`420`** + `UNKNOWN-ATTRIBUTES=[0x001A]`（§7.2 步骤 4 允许）；编译期断言禁止该常量为真而实现缺失。**支持平台的行为**（§18.9）：`Allocate` 带它 → relay socket 置 DF（Linux `IPPROTO_IP/IP_MTU_DISCOVER`=`IP_PMTUDISC_DO`，IPv6 socket 用 `IPV6_MTU_DISCOVER`；macOS/iOS `IP_DONTFRAG`/`IPV6_DONTFRAG`），**整个 allocation 生命周期有效**；长度 ≠ 0 → **`400`**；`setsockopt` 失败 → **`500 Server Error`** + 计 `rejected_df` + 端口归还池。`Send` indication 带它 → **仅该报文**置位，发送后恢复 `IP_PMTUDISC_WANT`（Linux）/`0`（macOS），切换在同一 allocation 的互斥锁内（并发**带 DF 的** `Send` 不得看到彼此的临时状态；不带 DF 的 `Send`/`ChannelData` 不取锁，见下方「已知限制」）；**置位失败 → 丢弃该 indication**（§11.2 原文：视为未知 comprehension-required 属性，「and thus the Send indication is discarded」）+ 计 `rejected_df`，**不得**降级为「不置位但照常转发」；属性长度 ≠ 0 → 同样丢弃 + 计 `rejected_df`（indication 无错误响应）。`ChannelData` 无属性位 ⇒ 沿用 allocation 级设置。`cfg(unix)` 之外不得引用 `libc`。**已知限制（并发窗口）**：`df_lock` 只被**带 DF 的 `Send`** 持有 —— 不带 DF 的 `Send` 与 `ChannelData` 不取锁（数据面零锁开销），因此同一 allocation 上「DF-Send 置位窗口」与普通发包并发时，普通报文可能被短暂带上 DF；后果仅限「该报文超过路径 MTU 时被丢」，不跨 allocation、不改变协议语义。取锁范围**不得**说成「所有外包发互斥」 |
-| 依赖 | `[target.'cfg(unix)'.dependencies] libc = "0.2"` 是 DF 的**唯一**新增直接依赖（不得引 `nix`/`rustix`）；直接依赖计数 unix 口径 **10（lean）/ 14（full）**，Windows 9/13；`script/ci/gen-sbom.sh` 的 `EXPECTED_DIRECT` 必须同步 |
+| 依赖 | `[target.'cfg(unix)'.dependencies] libc = "0.2"` 是 DF 的**唯一**新增直接依赖（不得引 `nix`/`rustix`）；直接依赖计数 unix 口径 **10（lean）/ 15（full）**，Windows 9/14；`script/ci/gen-sbom.sh` 的 `EXPECTED_DIRECT` 必须同步。`x509-parser 0.16`（optional，仅 `tls`）是证书到期 gauge 的唯一新增直接依赖（已在 lock，不得引 `notify`/`inotify`）|
 | 他人 allocation | `Refresh` / `CreatePermission` / `ChannelBind` 命中他人 allocation → **`441`**；他人 `LIFETIME=0` 不删除 |
 | permission 容量 | `--permission-limit`（默认 10）；一条请求里多个 `XOR-PEER-ADDRESS` **先全量校验再写入**，超限 → **`508`** 且零生效 |
 | channel 容量 | `ChannelBind` 的隐式 permission 占用同一上限，超限 → **`508`** |
@@ -137,11 +137,12 @@
 | TLS | `--turn-tls-listen` + `--tls-cert`/`--tls-key`；材料在**启动时**解析，缺失/不可读/不配对 → exit 1（**不降级明文**）；TLS 与明文**不共用端口**；握手 **5s** 超时，失败计数（退出日志 `handshake_failed`），日志不含证书内容 |
 | DTLS | `--turn-dtls-listen` + 同材料；DTLS **1.2**（`webrtc-dtls`）；**一个 datagram = 一个 STUN/TURN 消息或一个 `ChannelData`**（无 4 字节对齐）；5 元组 client transport = `ClientTransport::Dtls`；握手在每客户端任务里（5s），不阻塞 accept |
 | DTLS 私钥 | 必须 PKCS#8 + **ECDSA P-256 / Ed25519**（`webrtc-dtls` 的硬限制）；启动时明确报错，不得静默跳过 DTLS |
-| **材料校验范围** | DTLS 的密钥规则**只在该次启动真的配了 `--turn-dtls-listen` 时**才应用。只开 `--turn-tls-listen` 时 RSA 证书必须被接受（Let's Encrypt 的默认形态）；`--features tls`（无 dtls）单独构建同理。反例：同时配 DTLS 监听 + RSA → 启动失败 |
+| **证书热加载** | `SIGHUP`（`cfg(unix)`，独立任务，不塞进 `wait_for_shutdown`）+ **30s 轮询**（`(mtime,len)` 去重，Windows 唯一路径）共用同一个 `reload`，该 reload **必须**调用 `load_secure_material`（不得另写校验）；成功后**一次** `Arc` swap 整个 `SharedMaterial`（TLS `Arc<ServerConfig>` + DTLS `Config`），TLS/DTLS 同时生效；失败后 1s 重试一次，两次都失败才计 failed 并保留旧材料；SIGHUP 立即重试，轮询只在 `(mtime,len)` 变化时解析。**生效范围**：新连接/新 DTLS 会话用新材料，已建立会话持旧材料（无重协商）；路径不可运行期修改。日志含路径与 mtime/notAfter，不含私钥 |
+| **材料校验范围** | DTLS 的密钥规则**只在该次启动真的配了 `--turn-dtls-listen` 时**才应用。只开 `--turn-tls-listen` 时 RSA 证书必须被接受（Let's Encrypt 的默认形态）；`--features tls`（无 dtls）单独构建同理。反例：同时配 DTLS 监听 + RSA → 启动失败（热载沿用同一 `needs_dtls`）|
 | TLS 5 元组 | 与明文 TCP 相同（`ClientTransport::Tcp`）；区分靠监听端口 |
 | REST | `--rest-secret`；`username=<expiry>:<label>`（按**第一个** `:` 切分，label 可含 `:`）、`password=base64(HMAC-SHA1(secret, username))`（**标准 base64，带 padding**）；过期 → **401**（不是 438）；错 secret → 401；**REST 优先于用户表**（能解出时间戳即不查表）；`--rest-secret` 需要 `--realm` + `--auth-secret`，可以没有静态用户 |
 | 带宽 | `--turn-bandwidth` 字节/秒，**每方向**一个令牌桶，容量 = 1 秒，默认 1 MiB/s，`0` = 不限；超限**丢该包 + 计数**，allocation 不销毁；与端口/分配配额独立 |
-| 指标 | T2 只新增 `rstun_turn_bytes_dropped_total{direction}`；握手失败**不进 `/metrics`**（保持标签集合），只进退出日志 |
+| 指标 | T2 新增 `rstun_turn_bytes_dropped_total{direction}`、`rstun_turn_tls_reload_total{result=ok\|failed}`、`rstun_turn_tls_cert_expires_seconds`（gauge，`notAfter − now`，`-1` = 不可解析；仅配了 TLS/DTLS 监听时出现）；握手失败**不进 `/metrics`**（保持标签集合），只进退出日志 |
 | 默认关闭 | 不配任何 T2 开关时与 T1 逐字节一致（`frozen` 项 3 配置 × 17 请求）|
 | **构建 feature** | `default = []`（lean）／`tls`／`dtls`（含 `tls`）／`full`。TLS/DTLS 的监听、材料解析、连接处理与单测全部 `#[cfg(feature = …)]`；**四个 flag 始终定义**（`--help` 不随构建变化），lean 下给出 → 启动失败且错误含 `` `tls` ``／`` `dtls` `` feature 名与 `--features tls,dtls`。`--rest-secret` / `--turn-bandwidth` **不 gate** |
 
@@ -156,15 +157,26 @@
    allocation 存活（随后的小流量仍能中继），`/healthz` 仍 200。
 6. `TokenBucket` 单测：满桶、恰好耗尽、空桶丢弃、连续补充、容量上限。
 7. **两种构建**：`cargo test`（lean）与 `cargo test --all-features` 都必须全绿；
-   `cargo tree -e normal --depth 1` 在 lean 下是 9、`--all-features` 下是 13。
+   `cargo tree -e normal --depth 1` 在 lean 下是 10、`--all-features` 下是 15（Windows 9/14）。
 8. **RSA 证书 + 仅 TLS**：full 构建下 `--turn-tls-listen` + RSA 私钥必须能启动并完成 TLS 中继
    （lab `tls` 项第 4 步；单测 `full_build_accepts_an_rsa_certificate_when_dtls_is_off`）；
    同一份 RSA 材料再开 `--turn-dtls-listen` → 启动失败。
 9. **lean 构建拒绝 secure flag**：`--turn-tls-listen` → 错误含 `` `tls` feature ``；
    `--turn-dtls-listen` → 错误含 `` `dtls` feature ``（`#[cfg(not(feature = …))]` 单测）。
-10. **脚本**：`rstun-turn.sh` 默认用 lean 构建，`tls`/`dtls` 项记 SKIP 并说明；
-   `--tls`/`--dtls`（或 `--only tls|dtls|coturn`）自动 `--features full` 构建；
+10. **脚本**：`rstun-turn.sh` 默认用 lean 构建，`tls`/`dtls`/`cert-reload` 项记 SKIP 并说明；
+   `--tls`/`--dtls`（或 `--only tls|dtls|cert-reload|coturn`）自动 `--features full` 构建；
    `--no-build` 时探测二进制是否带 feature（读启动错误里的 feature 名，不猜）。
+11. **热载成功**：`reload_swaps_atomically_and_keeps_the_old_material_on_failure`
+   （成功换 `Arc`、失败保持同一 `Arc` 且只计一次 failed）；
+   `material_stamp_tracks_rewrites_and_missing_files`（`(mtime,len)` 去重、缺文件返回 None）；
+   lab `cert-reload` 项：SIGHUP 后 TLS 与 DTLS 新连接指纹同时变化、轮询路径换第三张证书。
+12. **坏材料**：不配对 / 截断 / 非 PKCS#8 / RSA（DTLS 监听下）→ 旧证书继续服务、
+   `reload_total{result="failed"}` 增长、进程存活（单测两条 + lab 的坏密钥对一段）。
+13. **到期 gauge**：`load_reads_the_leaf_not_after`、`secure_stats_expiry_follows_the_clock_and_marks_unknown_as_minus_one`；
+   lab 断言 `rstun_turn_tls_cert_expires_seconds` 与 `openssl x509 -enddate` 差 ≤ 60s。
+14. **门禁**：未配 `turns:`/DTLS 时两个证书指标**不出现**
+   （`tls_reload_metrics_appear_only_with_secure_material`、`turn_metrics_appear_only_when_enabled`）；
+   `cargo check --target x86_64-pc-windows-msvc`（`cfg(unix)` 隔离 SIGHUP）。
 
 ## 6. Wrong vs Correct
 

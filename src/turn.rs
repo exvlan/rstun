@@ -51,6 +51,18 @@
 //! comprehension-required → `420`, which §7.2 step 4 explicitly allows for a
 //! server that does not set the bit.
 //!
+//! ## Certificate reload
+//!
+//! The TLS/DTLS material itself is owned by `main.rs` (it is the same
+//! `SharedMaterial` slot both listeners read), but the observability contract
+//! lives here: `rstun_turn_tls_reload_total{result}` and
+//! `rstun_turn_tls_cert_expires_seconds` are part of the TURN metric block and
+//! are gated exactly like `handshake_failed`-adjacent counters — absent unless
+//! the relay **and** a secure listener are configured. A reload swaps the whole
+//! `ServerConfig`/DTLS `Config` atomically; new connections use it, established
+//! sessions keep the material they handshook with, and a rejected reload leaves
+//! the old material serving. See `.trellis/spec/backend/turn.md` §5b.
+//!
 //! ## Accounting model
 //!
 //! Everything short-lived is time-stamped with a monotonic [`Instant`] and
