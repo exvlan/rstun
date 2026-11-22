@@ -126,3 +126,23 @@ cargo deny check
 - crates.io 幂等检查必须带 `User-Agent`（实测无 UA → 403，有 UA → 200/404）；
 - `publish-crates` 拆成**可复用 workflow + dispatch 包装**，演练不触发 Release/镜像；
 - `release-prep` 增加 `dry_run`（只输出 diff 预演）。
+
+### P0-4 首次 Actions 真跑（2026-11-22）
+
+`gh workflow run post-release-verify.yml -f version=26.410.104` → run
+[45019486454](https://github.com/exvlan/rstun/actions/runs/45019486454) **completed/success**，逐步：
+
+```
+Normalize version                       success
+Assert release assets (13)              success
+Download assets                         success
+Verify binary architectures (4 lean zips) success
+Verify --version and tag commit         success
+Verify Debian packages                  success
+Verify tap formula (class body + sha256) success
+Verify container image (multi-arch)     success
+Summary                                 success
+```
+
+即 P0 的「发布后验收」不再依赖人肉核对：13 资产、四平台架构、`--version` 与 tag sha6 对齐、两个 deb、
+tap formula 类体与 3 个 sha256、镜像 amd64+arm64 全部由 workflow 断言。
