@@ -103,21 +103,33 @@ cargo install rstun --features full       # crates.io（完整版）
 `--version` 由 `RSTUN_BUILD_VERSION` 注入。完整说明（镜像细节、多架构、host 网络要求）见
 [`docs/book/src/docker.md`](docs/book/src/docker.md)。
 
-### 发版：`.github/workflows/release.yml` 手动 dispatch
+### 发版：preflight → release-prep → release → post-release-verify
 
 发版前先跑一次**只读预检**（Actions → **Release preflight** → Run workflow，`version` 填同一个号）：
 版本钉死点 → 单测 + clippy + fmt（lean/full）→ 42 项互操作 → TURN lean + full（含 `frozen` 字节冻结）
-→ SBOM → deb → brew 渲染 → `cargo publish --dry-run`；任何一段没绿就先修，别发。发布后再跑
-**Post-release verify**（只读）：逐项核对 13 个资产、四平台 zip 架构、`--version` 与 tag 指向的 `sha6`、
-两个 deb、tap formula 的三个 sha256、镜像双架构 manifest，结果写进 run summary。
+→ SBOM → deb → brew 渲染 → `cargo publish --dry-run`；任何一段没绿就先修，别发。
 
-传 `version`（**不带 `v`**，如 `26.410.100`）即可，一次 dispatch 交付两样：
+预检全绿后用 **Release prep**（Actions → Release prep）一次性做完机械动作：bump `Cargo.toml` + 刷新
+`Cargo.lock` → `## Unreleased` 收口 → 6 处版本钉死点 → 自检 → commit + push → tag `rstun-v<version>` →
+dispatch `release.yml`（固定从该 tag 的树构建，保证资产里的 `+sha6` 与 tag 一致）。`dry_run` **默认 true**：
+先只打印要改的 diff 与计划，确认后把它设为 `false` 重跑。新版本必须**严格大于**当前版本，tag 已存在
+直接失败（**不 force**）。前提是 `CHANGELOG.md` 顶部已有 `## Unreleased` 段（本版条目写在里面）——
+缺了、或该版本已在 CHANGELOG 出现，prep 会 fail-fast（不发没有 changelog 的版本）；发版后记得
+把它补回来，供下一版使用。
+
+发布完成后跑 **Post-release verify**（只读）：逐项核对 13 个资产、四平台 zip 架构、`--version` 与 tag 指向的
+`sha6`、两个 deb、tap formula 的三个 sha256、镜像双架构 manifest，结果写进 run summary。
+
+手工 `bump` + `gh workflow run release.yml -f version=…` 仍可用（逃生口）。
+
+传 `version`（**不带 `v`**，如 `26.410.100`）即可，一次 dispatch 交付三样：
 
 | 产出          | 内容                                                                                                                                 |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | Release       | tag **`rstun-v<version>`** + **八**个 zip：四个平台（Linux x86_64/aarch64 musl、macOS x86_64、Windows x86_64）× 两种构建 —— lean `rstun-<platform>-<version>.zip`、full `rstun-full-<platform>-<version>.zip` |
-| SBOM + formula | **两份** CycloneDX（`rstun-<version>-lean.cdx.json` / `-full.cdx.json`）+ Homebrew formula `rstun.rb`（lean，tap 同步是人工步骤） |
+| SBOM + formula | **两份** CycloneDX（`rstun-<version>-lean.cdx.json` / `-full.cdx.json`）+ Homebrew formula `rstun.rb`（lean；tap 仓 `exvlan/homebrew-rstun` 的 `sync.yml` 每 05:30 UTC 反向拉取，无需人工同步） |
 | 镜像          | **`ghcr.io/<owner>/rstun:<version>`**（双架构 amd64+arm64，**full** 构建；版本不含 `-` 的稳定版追加 `latest`）                        |
+| crates.io     | **`rstun <version>`**（`publish-crates` 作业，与 `release` 并行；**幂等**：已发布即跳过，重跑不红）                                    |
 
 - `prepare` 作业先校验 `version` 形如 `^\d+\.\d+\.\d+(-[...])?$`，且**必须等于 `Cargo.toml` 的
   `version`** —— 不一致直接失败，避免「tag 说 A、二进制说 B」。
@@ -139,6 +151,12 @@ cargo install rstun --features full       # crates.io（完整版）
 - `sbom` 作业（与平台无关，只跑一次）用 `script/ci/gen-sbom.sh` 生成 lean / full 两份 SBOM；
   `release` 作业断言 **8 个 zip + 2 份 SBOM + 1 份 formula + 2 个 deb = 13 个资产**，少一个就拒绝发版
   （SBOM 的组件数还额外断言直接依赖 10 / 15）。
+- `publish-crates` 作业与 `release` **并行**（crate 发布失败不拦资产）：先查
+  `https://crates.io/api/v1/crates/rstun/<version>`（**必须带 `User-Agent`**，无 UA 是 403）——
+  已存在则跳过、不存在才发布（`cargo publish`，并锁定 `Cargo.lock`），所以**重跑同一版本不红**。crates.io 上的版本
+  不可删除，只能 `cargo yank`；补发/演练请单独 dispatch `publish-crates.yml`（**带 `--ref`**：新版本用 `rstun-v<version>`；`26.410.104` 及更早的 tag 里还没有该 workflow 文件，只能用 `--ref main`；
+  它断言输入 == 检出树的 `Cargo.toml`，默认分支此时已是下一版），
+  不要为此重跑 `release.yml`（那会重建镜像 → 同版本 digest 变化）。
 
 ## 运维面（readiness / metrics / env / 优雅退出 / 部署清单）
 

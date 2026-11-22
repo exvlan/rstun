@@ -1,0 +1,185 @@
+name: Publish to crates.io
+
+# 可复用发布件：把 `<version>` 发布到 crates.io（**幂等**）。
+#
+# 两种入口，同一份逻辑：
+#   * `workflow_call`     —— `release.yml` 的 `publish-crates` 作业调用（自动发版路径）；
+#   * `workflow_dispatch` —— 对历史版本单独演练 / 补发。
+#     为什么必须单独一个入口：重跑 `release.yml` 会重建镜像，同一版本的 manifest digest
+#     就会变（下游按 digest 校验的对端记录失效）。「只想验 publish 的幂等分支」只能走这里。
+#
+# 幂等：先查 `https://crates.io/api/v1/crates/rstun/<version>`，200（已存在）即跳过。
+# crates.io 上已发布的版本**不可删除**（只能 yank），所以重跑同一版本必须不红。
+#
+# 除「发布到 crates.io」外一律只读：不建 tag、不建 Release、不 push。
+# `permissions` 只有 `contents: read` —— 发布凭证是 secret，不是 GITHUB_TOKEN。
+#
+# 失败语义：本 workflow 红只表示「crate 没发出去」，**不撤 Release、不回滚镜像**；
+# 修好后单独 dispatch 补发即可（13 个资产不受影响）。
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "要发布的版本号（不带 v；必须等于 Cargo.toml 的 version）"
+        required: true
+        type: string
+    secrets:
+      # `required: false`：已发布版本的重跑不需要 token（跳过 publish 分支），
+      # 缺 token 时由「Guard token」给出明确报错，而不是让 GitHub 在校验阶段报
+      # 一个看不出原因的「secret not provided」。
+      CARGO_REGISTRY_TOKEN:
+        description: "crates.io API token（仓库 secret；只在 cargo publish 步骤注入）"
+        required: false
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不带 v；必须等于 Cargo.toml 的 version）"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: publish (${{ inputs.version }})
+    runs-on: ubuntu-24.04
+    # 从零编译一遍 package（cargo publish 的 verify build）；缓存命中与否都在几分钟内。
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
+      # 与 release.yml 的 prepare / P0 两个 workflow 同语义：误带 `v` 前缀也接受；
+      # 输入只经 step env 传进来，之后所有步骤统一读 `$GITHUB_ENV` 的 VERSION。
+      - name: Normalize version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$(printf '%s' "${INPUT_VERSION:-}" | tr -d '[:space:]')"
+          version="${version#v}"
+          echo "VERSION=${version}" >>"$GITHUB_ENV"
+          echo "version=${version}（不含 v）"
+
+      # 这道门**不能省**：`cargo publish` 发布的是 **Cargo.toml 里的版本**，不是输入串。
+      # 输入 26.410.105 而清单仍是 26.410.104 时，幂等检查查的是 105（不存在 → 不跳过），
+      # 然后 cargo 会把 **104** 发出去 —— 版本号已经存在则失败，但失败原因极具误导性。
+      - name: Validate version against Cargo.toml
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION:-}"
+          [ -n "$VERSION" ] || { echo "::error::VERSION 为空（Normalize 步骤没跑成功？）"; exit 1; }
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'; then
+            echo "::error::版本串格式不合法：${VERSION}（期望 YY.QMM.Mmpp[-<channel>.<n>]，与 release.yml 同正则）"
+            exit 1
+          fi
+          manifest_version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          if [ "$manifest_version" != "$VERSION" ]; then
+            echo "::error::Cargo.toml 的 version 是 ${manifest_version}，与输入的 ${VERSION} 不一致 —— 先 bump 再发布（否则发出去的是 ${manifest_version}）"
+            exit 1
+          fi
+          echo "Cargo.toml version=${manifest_version}（与输入一致）"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
+        with:
+          toolchain: 1.95
+          cache: false
+          rustflags: ""
+
+      # 幂等检查。crates.io 对**没有 User-Agent** 的请求直接回 403（复核实测），必须显式带上。
+      # 不用 `curl -f` 一把梭：这里要区分三种结果，只有 404 才允许往下走 ——
+      #   200 已发布（跳过 publish，重跑不红）
+      #   404 未发布（继续）
+      #   其它（403/429/5xx/网络）既不能确认已发也不能确认未发 → 停下，不盲发
+      #
+      # 结果只写 `$GITHUB_OUTPUT`，后续步骤用 `steps.check.outputs.skip` 判定：
+      # `steps.*.outputs` 在步骤级 `if:` 里是文档明确可用的上下文（`env.*` 对
+      # `$GITHUB_ENV` 写入的值没有这个保证）。判定写错方向的后果是「已发布的版本
+      # 又去 publish 一次」→ 重跑变红，正是幂等要避免的那一种。
+      - name: Skip if already published
+        id: check
+        run: |
+          set -euo pipefail
+          url="https://crates.io/api/v1/crates/rstun/${VERSION}"
+          ua='rstun-release/1.0 (+https://github.com/exvlan/rstun)'
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -A "$ua" "$url")" || code=000
+          echo "crates.io ${url} -> ${code}"
+          case "$code" in
+            200)
+              echo "skip=1" >>"$GITHUB_OUTPUT"
+              echo "rstun ${VERSION} 已在 crates.io 上 → 跳过 publish（幂等）"
+              ;;
+            404)
+              echo "rstun ${VERSION} 尚未发布 → 继续 publish"
+              ;;
+            *)
+              echo "::error::crates.io API 返回 ${code}（${url}）—— 既不能确认已发布也不能确认未发布，拒绝盲发"
+              exit 1
+              ;;
+          esac
+
+      # 只报「没配 secret」，不打印任何凭证；值只在下一个步骤的 env 里出现。
+      - name: Guard token
+        id: guard
+        if: steps.check.outputs.skip != '1'
+        env:
+          TOKEN_PRESENT: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$TOKEN_PRESENT" != "true" ]; then
+            echo "::error::仓库 secret CARGO_REGISTRY_TOKEN 未设置：gh secret set CARGO_REGISTRY_TOKEN -R <owner>/rstun"
+            exit 1
+          fi
+          echo "token 已注入（值不打印）"
+
+      - name: cargo publish
+        id: publish
+        if: steps.check.outputs.skip != '1'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # `--locked`：发布用的依赖树必须与提交进仓库的 Cargo.lock 逐字一致；
+          # 不带它时 cargo 会在这台 runner 上重新解析，可能打出一个没人验证过的组合。
+          cargo publish --locked
+
+      - name: Summary
+        if: always()
+        env:
+          SKIP: ${{ steps.check.outputs.skip || '0' }}
+          CHECK: ${{ steps.check.outcome || 'skipped' }}
+          GUARD: ${{ steps.guard.outcome || 'skipped' }}
+          PUBLISH: ${{ steps.publish.outcome || 'skipped' }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION:-?}"
+          {
+            echo "## crates.io publish —— \`rstun ${VERSION}\`"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 幂等检查（crates.io API） | ${CHECK} |"
+            echo "| 是否跳过（已存在） | $([ "$SKIP" = 1 ] && echo '是（幂等）' || echo '否') |"
+            echo "| token 守卫 | ${GUARD} |"
+            echo "| cargo publish | ${PUBLISH} |"
+            echo ""
+            if [ "$SKIP" = 1 ]; then
+              echo "本版本此前已发布到 crates.io，本次未重复上传（重跑安全）。"
+            elif [ "$PUBLISH" = success ]; then
+              echo "已发布：<https://crates.io/crates/rstun/${VERSION}>"
+              echo ""
+              echo "注意：crates.io 上的版本**不可删除**（只能 \`cargo yank --version ${VERSION}\`）。"
+            else
+              echo "未发布成功（见上面失败步骤）。release 资产不受影响，修好后单独 dispatch 本 workflow 即可。"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"

@@ -1,15 +1,19 @@
 name: Release
 
-# 手动发版（`workflow_dispatch`，不靠 tag 自动触发）：
+# 手动发版（`workflow_dispatch`，不靠 tag 自动触发）。标准路径是
+# `release-preflight`（只读预检）→ `release-prep`（bump + tag + dispatch 本 workflow）；
+# 本 workflow 也可以手工 dispatch，作为逃生口：
 #   · 只传一个 `version`（**不带 `v`**，如 `26.410.100`），必须与 `Cargo.toml` 的
 #     `version` 一致 —— 不一致直接失败，避免「tag 说 A、二进制说 B」；
-#   · 一次 dispatch 交付两样：
+#   · 一次 dispatch 交付三样：
 #       Release `rstun-v<version>` + **八**个资产：四个平台 × 两种构建
 #         lean  `rstun-<platform>-<version>.zip`       STUN + TURN(UDP/TCP) + REST + 带宽
 #         full  `rstun-full-<platform>-<version>.zip`  再加 `turns:`(TLS) 与 DTLS
 #       镜像 `ghcr.io/<owner>/rstun:<version>`（linux/amd64 + linux/arm64 双架构，**full** 构建）
+#       crates.io `rstun <version>`（`publish-crates` 作业，与 `release` 并行、互不阻塞）
 #   · 幂等：Release 已存在则 `gh release upload --clobber` 只覆盖资产；
-#     镜像 tag 重复推即覆盖，manifest 用 `--amend` 重建。
+#     镜像 tag 重复推即覆盖，manifest 用 `--amend` 重建；
+#     crates.io 上已存在的版本由 `publish-crates.yml` 的 API 检查跳过（重跑不红）。
 #
 # 冒烟不可省（编译通过 ≠ 协议正确）：native 二进制与容器各验一次
 # （`script/ci/rstun-smoke.sh` / `--version`）。
@@ -585,3 +589,23 @@ jobs:
             echo ""
             echo "- Release: \`${TAG}\`"
           } >>"$GITHUB_STEP_SUMMARY"
+
+  # crates.io 自动发布（P1）：与 `release` 作业**并行**，互不阻塞 ——
+  #   * 不 `needs: release`：crate 发布失败不该拦住 13 个资产的发布；
+  #   * 但 `needs: [prepare, build]`：先确认版本合法且四端都编出来了再花掉一次不可撤回的发布；
+  #   * 逻辑全在可复用件里（幂等 API 检查 + token 守卫 + `cargo publish --locked`），
+  #     演练走它的 `workflow_dispatch`，**不要**为了重试 publish 而重跑整个 release
+  #     （那会重建镜像 → 同一版本的 manifest digest 变化）。
+  #
+  # 调用方可复用 workflow 时必须**显式**传 secrets（不会自动继承仓库 secret）；
+  # 作业级 `permissions` 也只能收窄、不能超过 workflow 级默认。
+  publish-crates:
+    name: Publish to crates.io
+    needs: [prepare, build]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-crates.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

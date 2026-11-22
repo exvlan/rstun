@@ -194,6 +194,7 @@ ALLOW_NON_RSTUN = {
     "--network": "docker run --network host",
     "--path": "cargo install --path",
     "--platform": "docker build --platform",
+    "--ref": "gh workflow run --ref <tag>（发布演练/补发 crate、release-prep 从 tag 树构建）",
     "--release": "cargo build --release",
     "--rm": "docker run --rm",
     "--tls": "script/lab/rstun-turn.sh --tls",

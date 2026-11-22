@@ -1,0 +1,361 @@
+name: Release prep
+
+# 一次性做完发版前的**机械动作**，把 9 步手工流程收成一次 dispatch：
+#
+#   bump Cargo.toml → 刷新 Cargo.lock → CHANGELOG `## Unreleased` 收口
+#   → 6 处版本钉死点 → 自检（check-version-pins 必须绿）
+#   → commit + push → tag `rstun-v<version>` + push → dispatch `release.yml`
+#
+# 为什么需要它：这些步骤每一步都「差一点就错」，而错了要等发版之后才被发现
+# （`check-version-pins.sh` 在 CI 上红、`post-release-verify` 在资产里红）。手工发版
+# 每次都要重新核对一遍；这里把它们变成一次 dispatch + 两道自检。
+#
+# 不可回滚的部分：push 出去的 commit / tag，以及已触发的 Release。因此：
+#   * `dry_run` **默认 true**：只改工作树，打印 `git status` / `git diff` 与计划，
+#     **不 commit、不 push、不打 tag、不 dispatch**（写入步骤统一
+#     `if: steps.v.outputs.dry_run == '0'` —— 用步骤输出而不是 `env.*`，因为
+#     `steps.*.outputs` 在步骤级 `if:` 里是文档明确可用的上下文；变量意外缺失时
+#     判定为「不是 0」= 不写，且在脚本里再断言一次）；
+#   * tag 已存在 → 直接失败，**绝不 force**（已发布 tag 一旦移动，消费者锁定的树就变了）；
+#   * 新版本必须**严格大于** Cargo.toml 的当前值（同版本 = 重复发版，更小 = 回退）。
+#
+# CHANGELOG 必须已经有 `## Unreleased` 段（发布前把本版条目写进去）。找不到、或该版本
+# 已在 CHANGELOG 里出现（重复发版）→ 失败并说明原因。
+#
+# 逃生口：全部手工路径仍然可用（bump + `gh workflow run release.yml`）。push 到受保护
+# 分支时会被拒绝 —— 这是有意的 fail-fast（改用 PR 流程或临时放开保护）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "新版本号（不带 v，严格大于 Cargo.toml 当前值，如 26.411.100）"
+        required: true
+        type: string
+      dry_run:
+        description: "只预演（打印将改的 diff 与计划，不写远端）"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # commit + push + 推 tag
+  actions: write  # `gh workflow run release.yml`（dispatch 事件需要 actions: write）
+
+concurrency:
+  group: release-prep-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+  # VERSION / OLD_VERSION / TAG / DRY_RUN 都由「Normalize and validate」步骤写入
+  # `$GITHUB_ENV`，后续步骤只从那里读（单一来源，输入可能带 v）。
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prep:
+    name: prep (${{ inputs.version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # 只需要一个提交（commit + tag 都不依赖历史）；push 与 `git ls-remote` 走网络。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
+      # 必须从**分支** dispatch：要 push 回去。工作树必须干净 —— 否则 `git commit`
+      # 会把人家的改动（或上一个步骤的生成物）一起提交进发版提交。
+      - name: Preconditions (branch + clean tree + git identity)
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" != "branch" ]; then
+            echo "::error::必须从**分支**dispatch（当前 ref_type=${GITHUB_REF_TYPE:-?}）：bump 之后要 push 回该分支"
+            exit 1
+          fi
+          dirty="$(git status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "::error::工作树不干净，拒绝 bump（避免把其它改动混进发版提交）："
+            printf '%s\n' "$dirty"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "branch=${GITHUB_REF_NAME} head=$(git rev-parse --short=7 HEAD)"
+
+      - name: Normalize and validate version
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          version="$(printf '%s' "${INPUT_VERSION:-}" | tr -d '[:space:]')"
+          version="${version#v}"
+          # 比 release.yml 的通用正则**更严**（三段长度按 YY.QMM.Mmpp）：prep 只能产出
+          # release 必然接受的版本号；release 保持通用以兼容历史/例外。预发布段的形状
+          # 与 release.yml 一致（`-<channel>.<n>`，可多段）。
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]{3}\.[0-9]{3}(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'; then
+            echo "::error::版本串格式不合法：${version}（期望 YY.QMM.Mmpp，如 26.411.100；预发布如 26.411.100-rc.1）"
+            exit 1
+          fi
+          old="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          [ -n "$old" ] || { echo "::error::读不到 Cargo.toml 的 version"; exit 1; }
+
+          # 必须**严格大于**当前版本：
+          #   * 相等 → 该版本的 tag / Release / crates.io 版本都已存在（重复发版）；
+          #   * 更小 → 回退，tag 与 Release 都不允许（消费者按版本号做单调假设）。
+          # 同 core 时正式版 > 预发布版（SemVer）；同 core 同通道（dev.1 → dev.2）视为
+          # 「不严格大于」—— 预发布号递增请手工做，release-prep 只管往新版本线上走。
+          python3 - "$old" "$version" <<'PY'
+          import sys
+
+
+          def key(v):
+              core, _, pre = v.partition("-")
+              nums = tuple(int(part) for part in core.split("."))
+              return nums + ((0,) if pre else (1,),)
+
+
+          old, new = sys.argv[1], sys.argv[2]
+          if key(new) <= key(old):
+              raise SystemExit(
+                  f"新版本 {new} 必须严格大于 Cargo.toml 的当前版本 {old}"
+                  "（同版本 = 重复发版；更小 = 回退；两者都拒绝）"
+              )
+          print(f"version: {old} -> {new}")
+          PY
+
+          # dry_run 走「正向白名单」：只有明确的 true/false 才接受，其余直接失败；
+          # 写入步骤用 `if: steps.v.outputs.dry_run == '0'` 正向开启 —— 变量意外缺失时是「不写」而不是「写」。
+          case "$(printf '%s' "${INPUT_DRY_RUN:-true}" | tr '[:upper:]' '[:lower:]')" in
+            true | 1) dry_run=1 ;;
+            false | 0) dry_run=0 ;;
+            *)
+              echo "::error::dry_run 只接受 true/false（收到 ${INPUT_DRY_RUN:-}）"
+              exit 1
+              ;;
+          esac
+          {
+            echo "VERSION=${version}"
+            echo "OLD_VERSION=${old}"
+            echo "TAG=rstun-v${version}"
+            echo "DRY_RUN=${dry_run}"
+          } >>"$GITHUB_ENV"
+          # 同时给步骤输出：写入步骤的 `if:` 用 `steps.v.outputs.dry_run` 判定
+          # （`steps.*.outputs` 是步骤级 `if:` 文档明确支持的上下文；`run` 脚本里
+          # 仍读 `$DRY_RUN`，它由 `$GITHUB_ENV` 传播）。
+          echo "dry_run=${dry_run}" >>"$GITHUB_OUTPUT"
+          echo "version=${old} -> ${version}  tag=rstun-v${version}  dry_run=${dry_run}"
+
+      # 只为 `cargo metadata`（刷新 Cargo.lock）；不编译任何东西。
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
+        with:
+          toolchain: 1.95
+          cache: false
+          rustflags: ""
+
+      - name: Bump Cargo.toml and refresh Cargo.lock
+        run: |
+          set -euo pipefail
+          # 只改 `[package]` 的 version：其它 `version =` 都在依赖表里、行首不是 `version =`
+          # （与 check-version-pins.sh / release.yml 的取法同源：首匹配即根版本）。
+          python3 - "$VERSION" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          want = sys.argv[1]
+          path = pathlib.Path("Cargo.toml")
+          text = path.read_text(encoding="utf-8")
+          new, count = re.subn(r'(?m)^version *= *"[^"]*"', f'version = "{want}"', text, count=1)
+          if count != 1:
+              raise SystemExit("Cargo.toml 里找不到根 version 行（`^version = \"...\"`）")
+          path.write_text(new, encoding="utf-8")
+          print(f"Cargo.toml: version = {want}")
+          PY
+
+          got="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          [ "$got" = "$VERSION" ] || { echo "::error::Cargo.toml 的 version 仍是 ${got}（替换没生效？）"; exit 1; }
+
+          # Cargo.lock 的 `[[package]] name = "rstun"` 版本也要跟着变（否则 CI 的
+          # `cargo metadata --locked` 会红）。`cargo metadata` 会按需重写 lock：不编译、
+          # 不加新依赖（依赖树没变，只是根包版本变了）。
+          cargo metadata --format-version 1 >/dev/null
+          python3 - "$VERSION" <<'PY'
+          import sys
+          import tomllib
+
+          want = sys.argv[1]
+          lock = tomllib.load(open("Cargo.lock", "rb"))
+          found = [
+              pkg["version"]
+              for pkg in lock["package"]
+              if pkg.get("name") == "rstun" and "source" not in pkg
+          ]
+          if found != [want]:
+              raise SystemExit(f"Cargo.lock 里 rstun 的版本是 {found}，期望 [{want}]（cargo metadata 没刷新？）")
+          print(f"Cargo.lock: rstun {want}")
+          PY
+
+      - name: Retitle CHANGELOG
+        run: |
+          set -euo pipefail
+          python3 - "$VERSION" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text(encoding="utf-8")
+          if re.search(rf"^## {re.escape(version)}$", text, re.M):
+              raise SystemExit(f"CHANGELOG 已有 `## {version}` —— 重复发版？")
+          if not re.search(r"^## Unreleased$", text, re.M):
+              raise SystemExit(
+                  "CHANGELOG 里找不到 `## Unreleased`：先把本版条目写进该段，再 dispatch release-prep"
+              )
+          new = re.sub(r"^## Unreleased$", f"## {version}", text, count=1, flags=re.M)
+          path.write_text(new, encoding="utf-8")
+          print(f"CHANGELOG: ## Unreleased -> ## {version}")
+          PY
+          sed -n '1,12p' CHANGELOG.md
+
+      # 6 处钉死点。这里的内联列表是**写**的那一半，`check-version-pins.sh` 是**读**的那一半
+      # （权威断言器）—— 两者一旦漂移，脚本会立刻红，所以不会静默漏改。
+      - name: Bump version pins
+        run: |
+          set -euo pipefail
+          python3 - "$OLD_VERSION" "$VERSION" <<'PY'
+          import pathlib
+          import sys
+
+          old, new = sys.argv[1], sys.argv[2]
+          edits = [
+              ("README.md", f"已发布 `{old}`", f"已发布 `{new}`"),
+              ("docs/book/src/docker.md", f"ghcr.io/exvlan/rstun:{old} server", f"ghcr.io/exvlan/rstun:{new} server"),
+              ("contrib/k8s/deployment.yaml", f"image: ghcr.io/exvlan/rstun:{old}", f"image: ghcr.io/exvlan/rstun:{new}"),
+              ("contrib/docker/compose.yaml", f"image: ghcr.io/exvlan/rstun:{old}", f"image: ghcr.io/exvlan/rstun:{new}"),
+              ("contrib/helm/Chart.yaml", f'appVersion: "{old}"', f'appVersion: "{new}"'),
+              ("contrib/helm/values.yaml", f'tag: "{old}"', f'tag: "{new}"'),
+          ]
+          for name, before, after in edits:
+              path = pathlib.Path(name)
+              text = path.read_text(encoding="utf-8")
+              count = text.count(before)
+              if count != 1:
+                  raise SystemExit(
+                      f"{name}: 期望恰好 1 处「{before}」，实际 {count} 处"
+                      "（钉死点漂移/重复？先跑 check-version-pins.sh 定位）"
+                  )
+              path.write_text(text.replace(before, after, 1), encoding="utf-8")
+              print(f"{name}: {old} -> {new}")
+          PY
+          # 权威校验：6 处必须全部等于新版本，且新版本必须等于 Cargo.toml。
+          bash script/ci/check-version-pins.sh --version "$VERSION"
+
+      # dry_run：把「将要发生的事」完整摊开（diff 就是真实写入前的工作树状态）。
+      - name: Preview (dry_run)
+        if: steps.v.outputs.dry_run != '0'
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION:-?}" TAG="${TAG:-?}" GITHUB_REF_NAME="${GITHUB_REF_NAME:-?}"
+          echo "**dry_run：只预演，不 commit / 不 push / 不打 tag / 不 dispatch**"
+          git status --short
+          echo "--- git diff ---"
+          git diff
+          echo "--- 正式执行时会做 ---"
+          echo "1) git commit -m \"chore(release): ${VERSION}\""
+          echo "2) git push origin HEAD:${GITHUB_REF_NAME}"
+          echo "3) git tag -a ${TAG} -m \"rstun ${VERSION}\" && git push origin refs/tags/${TAG}"
+          echo "4) gh workflow run release.yml --ref ${TAG} -f version=${VERSION}"
+
+      - name: Commit and push
+        id: commit
+        if: steps.v.outputs.dry_run == '0'
+        run: |
+          set -euo pipefail
+          # 双保险：写入步骤自己再确认一次（前置 if 已挡住 dry_run，这里防「env 丢值」）。
+          [ "${DRY_RUN:-?}" = "0" ] || { echo "::error::DRY_RUN=${DRY_RUN:-?} 却进入写入步骤，拒绝执行"; exit 1; }
+          # 只加本次 bump 涉及的文件（不用 `git add -A`：生成物/别人的改动不该进发版提交）。
+          git add -- Cargo.toml Cargo.lock CHANGELOG.md README.md \
+            docs/book/src/docker.md contrib/k8s/deployment.yaml \
+            contrib/docker/compose.yaml contrib/helm/Chart.yaml contrib/helm/values.yaml
+          git diff --cached --stat
+          git commit -m "chore(release): ${VERSION}"
+          # 推到 dispatch 时选的那个分支（不硬编码 main；演练可以走测试分支）。
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Tag and push tag
+        id: tag
+        if: steps.v.outputs.dry_run == '0'
+        run: |
+          set -euo pipefail
+          [ "${DRY_RUN:-?}" = "0" ] || { echo "::error::DRY_RUN=${DRY_RUN:-?} 却进入写入步骤，拒绝执行"; exit 1; }
+          # tag 已存在就停：**不 force 移动**（已发布 tag 指向的树是消费者的锚点）。
+          # 同版本重跑会在上一步「version 必须严格大于」处先失败，这里是第二道保险
+          # （例如远端已有手工打的 tag）。
+          if [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
+            echo "::error::tag ${TAG} 已存在于 origin —— 不 force 移动；请换一个新版本号"
+            exit 1
+          fi
+          git tag -a "$TAG" -m "rstun ${VERSION}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Dispatch release workflow
+        id: dispatch
+        if: steps.v.outputs.dry_run == '0'
+        run: |
+          set -euo pipefail
+          [ "${DRY_RUN:-?}" = "0" ] || { echo "::error::DRY_RUN=${DRY_RUN:-?} 却进入写入步骤，拒绝执行"; exit 1; }
+          # `--ref ${TAG}`：让 release 从**tag 指向的树**构建。不指定 ref 时它取默认分支
+          # 的当前头 —— 万一这期间有人 push，资产里的 `+<sha6>` 就会与 tag 不一致
+          # （`post-release-verify` 会因此红）。tag 一定包含 release.yml（就在这次提交里）。
+          gh workflow run release.yml --ref "$TAG" -f version="$VERSION" -R "$REPO"
+
+      # 单条 summary：用进程环境里的 DRY_RUN（`$GITHUB_ENV` 在 run 脚本里一定可见）
+      # 与各步 outcome 组合，dry_run / 正式 / 失败三种形态都能看懂。
+      - name: Summary
+        if: always()
+        env:
+          COMMIT: ${{ steps.commit.outcome || 'skipped' }}
+          TAG_STEP: ${{ steps.tag.outcome || 'skipped' }}
+          DISPATCH: ${{ steps.dispatch.outcome || 'skipped' }}
+        run: |
+          set -euo pipefail
+          # 兜底：正常路径下这些都由 Normalize 步骤写好；万一它挂了，summary 仍要能打出来。
+          VERSION="${VERSION:-?}" OLD_VERSION="${OLD_VERSION:-?}" TAG="${TAG:-?}"
+          mode=dry_run
+          if [ "${DRY_RUN:-1}" = "0" ]; then mode=正式; fi
+          {
+            echo "## Release prep —— \`${VERSION}\`"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 模式 | ${mode} |"
+            echo "| 版本 | \`${OLD_VERSION}\` → \`${VERSION}\` |"
+            echo "| 分支 | \`${GITHUB_REF_NAME}\` |"
+            echo "| commit + push | ${COMMIT} |"
+            echo "| tag \`${TAG}\` + push | ${TAG_STEP} |"
+            echo "| dispatch \`release.yml\` | ${DISPATCH} |"
+            echo ""
+            if [ "${DRY_RUN:-1}" != "0" ]; then
+              echo "预演模式：远端未发生任何变化（无 commit / 无 tag / 无 dispatch）。"
+              echo "确认上面的 diff 后，用同一 \`version\` 把 \`dry_run\` 设为 **false** 重跑。"
+            else
+              echo "- Release run: <${GITHUB_SERVER_URL}/${REPO}/actions/workflows/release.yml>"
+              echo "- Release: <${GITHUB_SERVER_URL}/${REPO}/releases/tag/${TAG}>"
+              echo ""
+              echo "下一步：release 跑完后 dispatch **Post-release verify**（version=\`${VERSION}\`），"
+              echo "逐项核对 13 个资产 / deb / tap sha256 / 镜像双架构；crates.io 由 \`publish-crates\` 自动发布（幂等）。"
+              echo "若 dispatch 失败而 tag 已存在：**不要**重跑 prep，直接手工"
+              echo "\`gh workflow run release.yml --ref ${TAG} -f version=${VERSION}\` 补发。"
+              echo ""
+              echo "下一版开工前：在 \`CHANGELOG.md\` 顶部补回 \`## Unreleased\`（本版段已收口为 \`${VERSION}\`；"
+              echo "缺失时下一次 prep 会 fail-fast）。"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"

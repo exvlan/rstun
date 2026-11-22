@@ -36,7 +36,8 @@ mdbook build docs/book                     # 文档站能构建（改了 docs/bo
 | TURN（`src/turn*`） | `bash script/lab/rstun-turn.sh`（lean；`--tls`/`--dtls` 自动 full 构建） |
 | 压测 / 混沌 | `bash script/lab/rstun-load.sh`、`bash script/lab/rstun-chaos.sh`（需 root + `tc`） |
 | 版本号 / 镜像示例 / 部署清单 | `bash script/ci/check-version-pins.sh`（6 处钉死点必须一致） |
-| 打包 / 发布 | `bash script/ci/build-deb.sh`、`.github/workflows/release.yml` 的资产断言；发版前跑 `release-preflight.yml`，发布后跑 `post-release-verify.yml`（两个都只读）|
+| 打包 / 发布 | `bash script/ci/build-deb.sh`、`.github/workflows/release.yml` 的资产断言；发版顺序 **preflight（只读）→ release-prep（bump+tag+dispatch，`dry_run` 默认 true）→ release（自动 publish crates.io）→ post-release-verify（只读）**；详细契约见 `.trellis/spec/backend/release-artifacts.md` |
+| CHANGELOG 维护 | 功能/修复合入 `main` 时在 `CHANGELOG.md` 顶部维护 `## Unreleased`：`release-prep` 依赖它（缺了会 fail-fast，不会发出没有 changelog 的版本）|
 
 CI 里这些作业**都是必需的**（`continue-on-error` 只出现在覆盖率作业上）。
 
