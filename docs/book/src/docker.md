@@ -7,7 +7,7 @@
 # 发行版镜像（推荐）：版本号与 Release tag 的版本串一致
 docker run -d --name rstun \
   -p 3478:3478/udp -p 3478:3478/tcp \
-  ghcr.io/exvlan/rstun:26.410.106-dev.0 server --tcp
+  ghcr.io/exvlan/rstun:26.410.106-dev.1 server --tcp
 
 # 本地构建（context = 仓库根）
 docker build -t rstun:dev .

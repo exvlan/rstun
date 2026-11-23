@@ -3,7 +3,7 @@ name = "rstun"
 description = "Standalone STUN/TURN server (RFC 5389 Binding with optional short/long-term authentication; RFC 5780 NAT behaviour discovery with `--alt-listen`; RFC 8656 relay with `--turn`: UDP/TCP, `turns:` (TLS) and DTLS behind the `tls`/`dtls` features; TURN REST credentials and per-allocation bandwidth quotas)."
 homepage = "https://github.com/exvlan/rstun"
 repository = "https://github.com/exvlan/rstun"
-version = "26.410.106-dev.0"
+version = "26.410.106-dev.1"
 # 本 crate 是一个**独立项目**：没有 workspace、没有 path 依赖，
 # `docker build .` 与 `cargo install --path .` 都能直接工作，
 # 所以 edition / rust-version / 依赖版本都写实数。

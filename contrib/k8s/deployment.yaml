@@ -43,7 +43,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: rstun
-          image: ghcr.io/exvlan/rstun:26.410.106-dev.0
+          image: ghcr.io/exvlan/rstun:26.410.106-dev.1
           imagePullPolicy: IfNotPresent
           args:
             - server
