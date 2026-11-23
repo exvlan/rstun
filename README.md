@@ -125,6 +125,10 @@ dispatch `release.yml`（固定从该 tag 的树构建，保证资产里的 `+sh
 
 手工 `bump` + `gh workflow run release.yml --ref rstun-v<version> -f version=…` 仍可用（逃生口；
 `--ref` 不能省 —— `sign` 默认 `true` 时非 tag ref 会被 `prepare` 拒绝，见下）。
+版本号含 `-`（预发布，如 `26.410.106-dev.0`）会被自动标成 **GitHub prerelease**：它**不会**占用
+`/releases/latest`，所以 tap 同步与 `brew install` 仍指向最近一个正式版；说明里也会写明「不建议生产使用」。
+预发布 deb 的**文件名**用 `-`（`rstun_26.410.106-dev.0_amd64.deb`，与 `SHA256SUMS` 一致），
+包内 Debian `Version:` 用 `~`（`26.410.106~dev.0`）—— GitHub 会改写资产名里的 `~`，所以构建时统一。
 
 ### 验证产物（cosign keyless）
 

@@ -18,6 +18,15 @@
   证书身份绑在触发 ref 上（`@refs/tags/rstun-v<version>`），从 `main` dispatch 会得到 `@refs/heads/main`
   并在说明里写出假身份。手工发版请用 `gh workflow run release.yml --ref rstun-v<version> -f version=…`；
   要从分支发版必须显式 `-f sign=false`。
+- **预发布自动标 `--prerelease`**：版本号含 `-`（如 `26.410.106-dev.0`）时 `gh release create` 带
+  `--prerelease`，已存在的 Release 用 `gh release edit --prerelease=<true|false>` 幂等校正，发布说明
+  首行提示「不建议生产使用」。修的是 dev 演练暴露的真实缺陷：漏标让 `/releases/latest` 指向 dev，
+  而 tap 的 `sync.yml` 读 latest → `brew install` 会被切到预发布。
+- **预发布 deb 的文件名统一用 `-`**：`build-deb.sh` 在 nfpm 打包后把文件名里的 `~` 改成 `-`
+  （`rstun_26.410.106-dev.0_amd64.deb`），**包内 Debian `Version:` 仍是 `~`**（`26.410.106~dev.0`）。
+  原因：GitHub Release 会把资产名里的 `~` 改写成 `.`，导致 `SHA256SUMS`（按本地名算）与用户下载到的
+  名字不一致、`sha256sum -c` 全红；`release.yml` 的暂存步骤另加「不得含 `~`」的断言，
+  `post-release-verify` 的 deb 断言同时接受两种 `Version:` 形式。
 - `post-release-verify` 新增 `require_signature`（默认 `true`）：逐个 `cosign verify-blob` 把证书身份
   绑定到**本仓 `release.yml` + 该 tag**（issuer = GitHub OIDC），再用 `SHA256SUMS` 校验每个资产的哈希，
   并 `cosign verify <digest>` 校验镜像签名。回看签名上线前的历史版本传 `false` 只告警。

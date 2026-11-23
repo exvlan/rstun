@@ -198,6 +198,7 @@ ALLOW_NON_RSTUN = {
     "--network": "docker run --network host",
     "--path": "cargo install --path",
     "--password-stdin": "docker login --password-stdin（docs/book/src/verify.md 的 ghcr 登录）",
+    "--prerelease": "gh release create/edit（预发布标记；release.yml 与 CHANGELOG 的发布说明）",
     "--platform": "docker build --platform",
     "--ref": "gh workflow run --ref <tag>（发布演练/补发 crate、release-prep 从 tag 树构建）",
     "--release": "cargo build --release",

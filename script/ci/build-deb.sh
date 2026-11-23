@@ -207,6 +207,21 @@ pkg="$(RSTUN_VERSION="$VERSION" NFPM_ARCH="$ARCH" RSTUN_BIN="$BIN" \
 rm -f "$rendered"
 [ -f "$pkg" ] || die "nfpm 没有产出 .deb（看上面的输出）"
 
+# ---- 文件名规范化：`~` → `-`（只改文件名，不改包内 Version）--------------------
+# nfpm 按 Debian 版本规则把预发布的 `-` 写成 `~`：`26.410.106-dev.0` →
+# `rstun_26.410.106~dev.0_amd64.deb`（包内 `Version:` 也是 `~` 形式，这是**对的**）。
+# 但 GitHub Release 会把**资产名**里的 `~` 改写成 `.`（实测 2026-11-23 dev 演练），
+# 于是 `SHA256SUMS`（按本地文件名算）与用户下载到的文件名对不上，verify 也找不到资产。
+# 所以文件名统一用版本串的 `-` 形式，与 zip/资产命名一致；**包内 `Version:` 保持 `~`**，
+# 因为 `~` 让预发布版排在同版本正式版之前（改成 `-` 会变成 Debian 修订号，语义/排序都变）。
+if [[ "$(basename "$pkg")" == *"~"* ]]; then
+  pkg_name="$(basename "$pkg")"
+  renamed="$(dirname "$pkg")/${pkg_name//\~/-}"
+  mv "$pkg" "$renamed"
+  echo "build-deb: 文件名 ${pkg_name} → $(basename "$renamed")（GitHub 会改写 ~；包内 Version 不变）"
+  pkg="$renamed"
+fi
+
 # ---- 校验：包内文件 + unit -------------------------------------------------
 echo
 echo "== 包：$pkg"

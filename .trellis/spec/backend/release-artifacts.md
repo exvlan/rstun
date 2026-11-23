@@ -50,7 +50,8 @@
 | 下游 digest | 对外报 **manifest list digest**（amd64+arm64 index）| 下游按 digest 校验对不上 |
 | 版本串 | `version` 输入 == `Cargo.toml` 的 `version`；二进制 `--version` = `<version>+<sha6>` | 包与报的版本不一致 |
 | 镜像 | `ghcr.io/exvlan/rstun:<version>`，稳定版附 `:latest`；双架构必须由 manifest 合并 | 单架构冒充双架构 |
-| deb 资产 | `rstun_<version>_{amd64,arm64}.deb` 各一份（lean、musl static-pie，包内二进制与 lean zip 同源）；缺任一即失败 | 用户装到旧版/异构二进制 |
+| Release 状态（prerelease / latest）| 版本号含 `-`（预发布）→ `gh release create --prerelease`；已存在的 Release 用 `gh release edit "$TAG" --prerelease=${PRERELEASE}` 幂等校正（正式版传 `--prerelease=false`）。**`/releases/latest` 只指向正式版**：预发布一旦漏标，latest 会被 dev 占用，而 tap 的 `sync.yml` 读的正是 latest → Homebrew formula 被切到预发布 | dev 演练实测：`26.410.106-dev.0` 漏 `--prerelease` → `releases/latest` 变 dev，tap 同步把 `brew install` 指到预发布 |
+| deb 资产 | `rstun_<version>_{amd64,arm64}.deb` 各一份（lean、musl static-pie，包内二进制与 lean zip 同源）；缺任一即失败。**预发布**：文件名用版本串的 `-` 形式（`rstun_26.410.106-dev.0_amd64.deb`，`build-deb.sh` 把 nfpm 的 `~` 改掉 —— GitHub 会把资产名里的 `~` 改写成 `.`，不改则 `SHA256SUMS`/verify 与下载名不一致），而**包内 Debian `Version:` 保持 `~`**（`26.410.106~dev.0`，Debian 预发布规范：排在同版本正式版之前）| 用户装到旧版/异构二进制；或清单里的名字与下载到的名字不同（哈希校验全红）|
 | Homebrew tap | `exvlan/homebrew-rstun` 的 formula 与该 Release 的 `rstun.rb` 类体一致 | `brew install` 拉到不存在的 sha256 |
 | 包可见性 | 新包默认 private：有凭证可拉、匿名 401 | 「我这边能 pull」误判 |
 | 动态链接 | linux 目标为 static-pie（musl）| 依赖宿主 glibc 版本 |
@@ -123,6 +124,8 @@ tap 同步：`exvlan/homebrew-rstun` 的 `sync.yml`（每日 05:30 UTC cron + �
 | Release 已存在 | 只 `--clobber` 覆盖资产，不移动 tag、不改说明 |
 | zip 数为 0 | 失败（禁止空 Release）|
 | 镜像缺 amd64 或 arm64 | 发布失败（manifest 不完整）|
+| 是预发布（版本含 `-`）但 Release 未标 prerelease | `gh release create --prerelease`；已存在则 `gh release edit --prerelease=true`。漏标 → `/releases/latest` 指向 dev → tap 同步到预发布 |
+| 版本含 `-` 却标成正式版 / 反之（历史上误标）| 重跑 `release.yml` 的同版本：`gh release edit --prerelease=${PRERELEASE}` 幂等校正（不改 tag、不动资产）|
 | Fulcio/Rekor 不可达 / `cosign sign-blob` 失败（文件侧）| `release` 作业失败，**不产出 Release**；错误可读 |
 | `cosign sign` 失败（`sign-image`，镜像侧）| 整个 run 红；资产可能已上传，但 verify 的镜像签名项会红 —— 修好后重跑签名，**不要**宣称已签名 |
 | `sign=false` | 不产生 `SHA256SUMS`/bundle（13 资产）；发布说明写「本版未签名」；`post-release-verify` 默认（`require_signature=true`）判失败 |
@@ -195,6 +198,18 @@ tap 同步：`exvlan/homebrew-rstun` 的 `sync.yml`（每日 05:30 UTC cron + �
     `GITHUB_REF=refs/heads/main` + `sign=true` → **exit 1**（三条 `::error::`）；
     `GITHUB_REF=refs/tags/<tag>` → exit 0；`refs/tags/<别的 tag>` → exit 1；
     `sign=false` 时该步骤被 `if: inputs.sign` 跳过（不执行、不失败）。
+20. `release.yml` 的 prerelease 分支（把「Create or update release」的 `run` 抽出来，桩 `gh` 记录 argv）：
+    `PRERELEASE=true` + Release 不存在 → `gh release create … --prerelease`；
+    `PRERELEASE=false` + 不存在 → **不带** `--prerelease`；
+    Release 已存在 → `gh release upload --clobber` 之后必定执行 `gh release edit "$TAG" --prerelease=<true|false>`；
+    发布说明在预发布时含「**预发布版本** … 不建议生产使用」，正式版不含该行。
+    真实验证：预发布发完后 `gh api repos/exvlan/rstun/releases/latest --jq .tag_name` **不得**是该 dev tag。
+21. 预发布 deb 的命名/版本双形式（本地实测）：
+    `build-deb.sh --version 26.410.106-dev.0` 产出的**文件名**是 `rstun_26.410.106-dev.0_<arch>.deb`
+    （无 `~`），而 `dpkg-deb -I` 的 `Version:` 是 `26.410.106~dev.0`（Debian 预发布规范，**不改**）；
+    `post-release-verify` 的 deb 断言对这两种 `Version:` 都接受，但文件名只认 `-` 形式
+    （只有 GitHub 改写后的 `.` 形式 → `dpkg-deb` 打不开 → 失败）；
+    `release.yml` 的暂存断言对含 `~` 的文件名 → `::error::` + 打印清单。
 
 ## 7. Wrong vs Correct
 

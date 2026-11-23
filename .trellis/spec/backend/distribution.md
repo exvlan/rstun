@@ -14,7 +14,7 @@
 | 入口 | 契约 |
 | --- | --- |
 | `check-docs.sh` | 扫描 `docs/book/src/**` + 仓库根 `*.md`；比对 ① `rstun --help` 片段（**逐 token**，避免 clap 折行假红）② `--flag` 名存在 ③ `rstun_*` 指标名存在 ④ 链接与跨章锚点 |
-| `build-deb.sh` | 版本必须等于 `Cargo.toml`；架构映射 **amd64→`x86_64-unknown-linux-musl`**、arm64→`aarch64-…`；musl 缺失时回退 glibc **并警告**（动态链接需 libc6 约束）|
+| `build-deb.sh` | 版本必须等于 `Cargo.toml`；架构映射 **amd64→`x86_64-unknown-linux-musl`**、arm64→`aarch64-…`；musl 缺失时回退 glibc **并警告**（动态链接需 libc6 约束）；**产物文件名里的 `~` 统一改成 `-`**（nfpm 按 Debian 规则把预发布写成 `26.410.106~dev.0`，但 GitHub Release 会把资产名里的 `~` 改写成 `.` → 清单/verify 与下载名不一致）；**包内 `Version:` 保持 `~`** |
 | `build-deb.sh --foreign-bin` | 跨架构打包时跳过「执行二进制做版本自检」（仅用于二进制来自可信发布物，如 Release 的 zip；调用方必须核对 sha256）|
 | deb 产物位置 | Release 资产 `rstun_<version>_{amd64,arm64}.deb`，由 `release.yml` 的 Linux 构建作业产出（lean、musl static-pie）；补历史版本时可从已发布 zip 打包，**不重跑流水线**（避免镜像 digest 变化）|
 | Homebrew tap | `exvlan/homebrew-rstun` 的 `Formula/rstun.rb` 必须与同版本 Release 的 `rstun.rb` 类体一致（sha256 对得上）；每版发版后人工同步（`gen-brew.sh` 产物覆盖）|

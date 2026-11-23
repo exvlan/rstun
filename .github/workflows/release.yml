@@ -595,12 +595,19 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           SIGN: ${{ inputs.sign }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
           owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           {
             echo "独立 STUN 服务器 \`rstun\`（RFC 5389 Binding；RFC 5780 需 \`--alt-listen\`）。"
             echo ""
+            # 预发布必须**在说明里**就说清：它不会被标成 latest，也不该拿去生产。
+            if [ "${PRERELEASE}" = "true" ]; then
+              echo "> **预发布版本**（\`${VERSION}\`，版本号含 \`-\`）：用于验证发布流程/新特性，**不建议生产使用**；"
+              echo "> 它不会被标为 latest（\`releases/latest\` 与 Homebrew tap 仍指向最近一个正式版）。"
+              echo ""
+            fi
             echo "| 平台 | lean（默认） | full（+ \`turns:\` + DTLS） |"
             echo "| --- | --- | --- |"
             echo "| Linux x86_64 | \`rstun-linux-x86_64-${VERSION}.zip\` | \`rstun-full-linux-x86_64-${VERSION}.zip\` |"
@@ -647,6 +654,18 @@ jobs:
           rm -rf signed_assets
           mkdir -p signed_assets
           cp zipped_assets/*.zip sbom_assets/*.cdx.json dist/homebrew/*.rb deb_assets/*.deb signed_assets/
+          # 文件名里**不能有 `~`**：GitHub Release 会把资产名的 `~` 改写成 `.`（2026-11-23 dev 演练
+          # 实测：nfpm 的 `rstun_<ver>~dev.0_amd64.deb` 上传后变成 `rstun_<ver>.dev.0_amd64.deb`），
+          # 而 `SHA256SUMS` 是按本地文件名算的 → 用户下载后 `sha256sum -c` 全红。
+          # build-deb.sh 已把 deb 文件名规范化成 `-`；这里再守一道，防止别处漏出 `~`。
+          # 用赋值而不是 `| grep -q`：目录不存在时 find 的非 0 要能失败（管道会把它吞掉）。
+          tilde_files="$(find signed_assets -maxdepth 1 -type f -name '*~*' -print)"
+          if [ -n "$tilde_files" ]; then
+            echo "::error::暂存目录里有含 \`~\` 的文件名（GitHub 会把它改写成 \`.\`，哈希清单将对不上）"
+            printf '  %s\n' "$tilde_files"
+            ls -l signed_assets
+            exit 1
+          fi
           # 8 zip + 2 SBOM + 1 formula + 2 deb = 13
           count="$(find signed_assets -maxdepth 1 -type f | wc -l)"
           if [ "$count" -ne 13 ]; then
@@ -707,6 +726,7 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SIGN: ${{ inputs.sign }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -733,13 +753,25 @@ jobs:
             ( cd signed_assets && sha256sum -c --strict SHA256SUMS )
           fi
           ls -l "${assets[@]}"
+          # 预发布（版本号含 `-`）必须标 `--prerelease`：否则 GitHub 会把它算作「最新正式版」，
+          # `/releases/latest` 随之指向 dev —— tap 的 `sync.yml` 读的就是 latest，会把
+          # Homebrew formula 切到预发布（2026-11-23 dev 演练实测踩到）。
+          # 两个分支都要设置：`--clobber` 重跑不会改既有 Release 的 prerelease 标志，必须显式 edit。
+          create_args=()
+          if [ "${PRERELEASE}" = "true" ]; then
+            create_args+=(--prerelease)
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在 → 只覆盖资产（--clobber，幂等；不动标题与说明）"
             gh release upload "$TAG" "${assets[@]}" --clobber
+            # 幂等校正状态：正式版传 `--prerelease=false`（顺手修掉历史上误标为预发布的稳定版）。
+            gh release edit "$TAG" "--prerelease=${PRERELEASE}"
+            echo "Release $TAG 的 prerelease=${PRERELEASE}"
           else
-            echo "创建 Release $TAG"
+            echo "创建 Release $TAG（prerelease=${PRERELEASE}）"
             gh release create "$TAG" "${assets[@]}" \
-              --title "rstun ${VERSION}" --notes-file release_notes.md
+              --title "rstun ${VERSION}" --notes-file release_notes.md \
+              "${create_args[@]}"
           fi
 
       - name: Summary
