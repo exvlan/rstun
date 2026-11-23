@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "门禁与周度回归口径（守卫阈值/触发）"}
+{"file": ".trellis/spec/backend/release-artifacts.md", "reason": "workflow 约定（action 锁 SHA、权限最小化）"}

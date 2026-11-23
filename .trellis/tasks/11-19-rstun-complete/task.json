@@ -32,7 +32,8 @@
     "11-21-rstun-dist-complete",
     "11-21-rstun-perf-refresh",
     "11-22-rstun-release-automation",
-    "11-22-rstun-maint-batch1"
+    "11-22-rstun-maint-batch1",
+    "11-23-rstun-schedule-guard"
   ],
   "parent": null,
   "relatedFiles": [],
