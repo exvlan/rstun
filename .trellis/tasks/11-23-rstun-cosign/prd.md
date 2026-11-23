@@ -15,6 +15,8 @@ release workflow 构建」。
 1. 生成 `SHA256SUMS`（覆盖 13 个资产）并对它签名；
 2. 对 2 份 SBOM 分别签名（它们是「资产里装了什么」的声明）；
 3. 签名产物以 **cosign bundle**（`.bundle`，含签名 + 证书 + Rekor 证明）随 Release 上传；
+3b. **容器镜像也签**：对 `ghcr.io/exvlan/rstun@<manifest digest>` 做 `cosign sign`（keyless），
+   验证用 `cosign verify <digest>`（同一身份/issuer 约束）；
 4. `post-release-verify` 自动验证：证书身份绑定到**本仓 release workflow + 该 tag**、
    OIDC issuer 为 GitHub、且 sum 与资产哈希一致；
 5. 文档给出用户可照抄的验证命令。
@@ -50,8 +52,8 @@ release workflow 构建」。
 
 ## 非目标
 
-- **不签容器镜像**（`cosign sign ghcr.io/...`）：需在 image 作业加 OIDC + 写 OCI artifact，
-  属独立增量；本任务只覆盖 Release 文件资产（如需要，另立子任务）；
+- 不做 `--recursive` 的平台镜像逐个签名（只签 manifest list digest；如需逐平台另议）；
+- 不签 crates.io、不自管密钥；
 - 不签 crates.io（cargo 自带校验）；
 - 不自管密钥/不做长期密钥轮换；
 - 不改资产内容（只增加 `.bundle`）。
@@ -71,4 +73,5 @@ release workflow 构建」。
 - [ ] 手工按文档命令验证通过；**篡改任一资产**后验证失败（负例）
 - [ ] `sign=false` 时：不产生 bundle、发布说明标注未签名、verify 对缺失 bundle 明确失败（或按输入跳过）
 - [ ] 签名身份绑定正确：用错误的 `--certificate-identity-regexp` 验证会失败
+- [ ] 镜像签名：`cosign verify ghcr.io/exvlan/rstun@<digest>` 通过；篡改/错误身份验证失败
 - [ ] 默认路径/协议行为零变化；`check-docs` 通过

@@ -33,6 +33,15 @@
 | 2.4 | 输入 `require_signature`（默认 true；false 时缺 bundle 仅 WARN）| 与 `require_tap` 同款 |
 | 2.5 | Summary 增加「签名」一行 | 同上 |
 
+## 阶段 2b · 镜像签名
+
+| # | 事项 | 验证 |
+| --- | --- | --- |
+| 2b.1 | `release.yml` 新增 `sign-image`（needs manifest；`packages: write` + `id-token: write`）| `yaml` |
+| 2b.2 | `cosign sign --yes ghcr.io/<owner>/rstun@<manifest digest>` | dev 版本演练（阶段 3）|
+| 2b.3 | `post-release-verify` 增加 `cosign verify <digest>`（同一 identity/issuer）| 同上 |
+| 2b.4 | `sign=false` 时镜像也不签；verify 的 `require_signature=false` 时只 WARN | 读代码 |
+
 ## 阶段 3 · 端到端验证（不触碰 `.105`）
 
 | # | 事项 | 验证 |

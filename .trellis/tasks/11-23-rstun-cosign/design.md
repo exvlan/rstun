@@ -52,6 +52,16 @@ cosign verify-blob --bundle SHA256SUMS.bundle \
   SHA256SUMS
 ```
 
+## 3b. 容器镜像签名
+
+- 新作业 `sign-image`（`needs: manifest`）：
+  - 权限：`contents: read` + **`packages: write`** + **`id-token: write`**；
+  - 登录 ghcr（`GITHUB_TOKEN`），取 manifest list digest（`docker buildx imagetools inspect`）；
+  - `cosign sign --yes ghcr.io/<owner>/rstun@sha256:<digest>`（不 `--recursive`）；
+- 签名声明存放在 registry 的 OCI artifact（**不增加 Release 资产**，所以 13→16 只算文件侧）；
+- 验证：`cosign verify ghcr.io/<owner>/rstun@sha256:<digest>` + 同一 identity/issuer 约束
+  （`post-release-verify` 已登录 ghcr，权限 `packages: read` 够用）。
+
 ## 4. `post-release-verify.yml` 改动
 
 - 资产数 13 → **16**（并断言 3 个 `.bundle` + `SHA256SUMS` 存在）；
