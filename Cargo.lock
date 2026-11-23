@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "rstun"
-version = "26.410.106-dev.1"
+version = "26.410.106"
 dependencies = [
  "clap",
  "hmac 0.13.0",
