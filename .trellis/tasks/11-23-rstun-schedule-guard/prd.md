@@ -29,7 +29,8 @@ $ gh api "repos/exvlan/rstun/actions/runs?event=schedule&per_page=5" --jq .total
 - 新增 `.github/workflows/schedule-guard.yml`：
   - 触发：`schedule`（每日 06:00 UTC）+ `push`（`main`）+ `workflow_dispatch`
   - 输入（dispatch）：`max_age_days`（默认 8）、`dry_run`（默认 false）
-  - 权限：`contents: read` + `issues: write`
+  - 权限：`contents: read` + `issues: write` + `actions: read`（`gh run list` 走 Actions API，
+    显式 `permissions:` 块会把未列出的 scope 置为 none，缺这一项会 403）
   - 检查对象：`QA scheduled`、`Verify platforms`（workflow 名从 `gh run list --event schedule -w …` 取）
   - 结论写 step summary；`dry_run=true` 只打印不建 issue
 - 文档：`CONTRIBUTING.md` / `README` 增加「周度作业失效时如何手动补跑」；

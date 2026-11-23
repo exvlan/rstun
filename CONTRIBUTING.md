@@ -41,6 +41,48 @@ mdbook build docs/book                     # 文档站能构建（改了 docs/bo
 
 CI 里这些作业**都是必需的**（`continue-on-error` 只出现在覆盖率作业上）。
 
+## 定时作业（周度回归）
+
+两个作业**不靠 PR 触发**，只按周跑：
+
+| 作业 | 时间（UTC） | 内容 |
+| --- | --- | --- |
+| `qa-scheduled.yml`（QA scheduled） | 每周一 04:00 | fuzz、互操作矩阵、基准冒烟（只存数值，不设阈值） |
+| `verify-platforms.yml`（Verify platforms） | 每周四 06:00 | linux-aarch64 / macOS x86_64 真机实跑 |
+
+**已知风险：定时触发可能整体失效，而且没有任何信号。** 2026-11-23 盘点发现本仓
+`event=schedule` 的运行数是 **0**（`gh api "repos/exvlan/rstun/actions/runs?event=schedule"` →
+`total_count=0`），两个 workflow 的状态却都是 `active`、仓库非 fork、Actions 开启、`main` 持续有推送。
+也就是说这两项周度回归可能一直没跑。
+
+因此在告警解除前，**每周二（UTC）把这两个周度作业各手动补跑一次**：
+
+```bash
+gh workflow run qa-scheduled.yml -R exvlan/rstun
+gh workflow run verify-platforms.yml -R exvlan/rstun
+gh run list -e schedule -w "QA scheduled" -L 1     # 核对是否真的出现了 schedule 运行
+```
+
+`schedule-guard.yml`（每日 06:00 UTC，**外加每次 push 到 `main`** —— 后者保证 cron 整体失效时
+守卫自己仍会跑）检查这两个作业最近一次 `event=schedule` 运行的年龄：超过 **8 天**（或 0 次）就建一条
+`[schedule-guard] <workflow> 的定时运行已停滞` 的 issue；同标题只保留一条 open issue（不刷屏）。
+恢复后（出现新的 schedule run 且年龄 ≤ 阈值）自动评论并关闭。
+
+**手动补跑不会清掉告警**：`gh workflow run` 产生的是 `workflow_dispatch`，不是 `event=schedule`。
+
+**手动关闭 issue 也无效**：守卫只按「固定标题 + `state=open`」去重，stale 没解除时下一次 push
+（或次日 cron）会立刻**重建同标题 issue** —— 那个重建是**预期行为，不是守卫 bug**。
+
+真正销账只有两条路：
+
+1. **等平台的定时触发恢复**（推荐，什么都不用做）：一旦出现新的 `event=schedule` 运行且年龄 ≤ 阈值，
+   守卫会评论「已恢复」并自动关闭 issue；
+2. **书面承认不再按周监控**：改 `schedule-guard.yml` 的目标列表或把阈值调大并提交，
+   下次运行起不再对该作业告警。
+
+演练（不写 issue）：Actions → **Schedule guard** → Run workflow，`max_age_days=0`、
+`dry_run=true` —— 检测到停滞时该次运行以 exit 1 结束，summary 里列出目标与年龄。
+
 ## 提交规范
 
 - 一个提交一件事。信息用 Conventional Commits 前缀（仓库历史即例子）：

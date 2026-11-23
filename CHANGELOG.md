@@ -3,6 +3,17 @@
 版本线**独立于任何宿主项目**：`YY.QMM.Mmpp`（年.季度月.月日+序号），首发 `26.410.100`。
 `rstun-v*` 的 Release tag / 镜像 tag / 资产名都用这里给出的版本号。
 
+## Unreleased
+
+### 定时作业可见性（维护者可见）
+
+- 新增 **`schedule-guard`**（每日 06:00 UTC + 每次 push 到 `main` + 手动可调）：检查
+  `QA scheduled` / `Verify platforms` 最近一次 `event=schedule` 运行的年龄，超过 **8 天**或
+  **从未运行** → 建一条固定标题的 issue（同标题去重，恢复后自动评论并关闭）。背景：本仓实测
+  `event=schedule` 运行数为 **0**（两个 workflow 状态都还是 `active`），周度回归可能长期静默未跑。
+  `push` 触发是刻意的：cron 整体失效时，只靠 cron 的守卫自己也跑不起来。
+  手动 `workflow run` 补跑**不算** schedule 运行，不会清掉告警。
+
 ## 26.410.105
 
 ### TURN：证书轮询可关闭 / 可调（`--tls-cert-poll`）

@@ -1,0 +1,320 @@
+name: Schedule guard
+
+# 定时作业的 staleness 守卫：把「周度回归没跑」变成**可见**。
+#
+# 为什么需要它（2026-11-23 实测）：
+#   * `QA scheduled`（周一 04:00 UTC）与 `Verify platforms`（周四 06:00 UTC）都配了
+#     `schedule`、状态 `active`、仓库非 fork、`actions.enabled=true`，
+#     但本仓**从未有过任何 `event=schedule` 的运行**：
+#       gh api "repos/exvlan/rstun/actions/runs?event=schedule" --jq .total_count  →  0
+#   * 也就是说周度回归可能一直没跑，而没有任何信号 —— 典型「静默失效」。
+#
+# 守卫的三种触发（**push 是关键**）：
+#   * `push` 到 `main`：如果 cron 整体失效，守卫仍然会被推送带起来；
+#   * 每日 06:00 UTC：与周一 04:00 的 `qa-scheduled` 错开；与周四 06:00 的 `verify-platforms`
+#     同一分钟 —— 守卫只调几次 API（秒级），不占 runner 时长，也不读对方产物；
+#   * `workflow_dispatch`：`max_age_days` 可调小/调 0 复现告警，`dry_run` 只看不写。
+#
+# 判据：每个目标取**最近一次 `event=schedule` 运行**的 `createdAt`，`(now - createdAt)` 超过
+# `max_age_days`（默认 **8** = 周度 1 个周期 + 1 天余量）→ stale；0 次运行 → `never ran`（也是 stale）。
+# **手动 dispatch 不算**：它不会产生 `event=schedule` 的运行，所以手动补跑只补回归、不清告警。
+#
+# 可见性靠 issue，不靠红灯：正常模式**始终 exit 0**（stale 是天数问题，每天红只会变成噪声）；
+# 只有「守卫自己坏了」才红 —— 输入非法、`gh run list` / issue API 失败（失败不能被静默当成 OK）。
+# `dry_run=true` 时若检测到 stale 则 **exit 1**，方便在测试/演练里断言「确实检测到了」。
+
+on:
+  schedule:
+    # 每日 06:00 UTC（北京时间 14:00）。
+    - cron: "0 6 * * *"
+  push:
+    # 关键：`schedule` 整体失效时，推送仍会把守卫带起来（不依赖 cron）。
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: "「最近一次 schedule 运行」的最大年龄（天）；0 = 只有此刻的运行才算新鲜（用来演练告警）"
+        required: false
+        default: "8"
+        type: string
+      dry_run:
+        description: "只检测不写入（不建/不关 issue；检测到停滞时 exit 1）"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+  # `gh run list` 走 Actions API：显式 `permissions` 块会把未列出的 scope 置为 none，
+  # 缺这一项会 403（守卫红，而不是假绿）。
+  actions: read
+
+# 串行化：push 与 cron 同时触发时不要并发建 issue（并发会两个都 create 出重复 issue）。
+# 不取消进行中的运行（它可能正在写 issue）。
+concurrency:
+  group: schedule-guard
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guard:
+    name: guard (schedule staleness)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # 不需要 checkout：本作业只调 GitHub API（gh 与 python3 都是 runner 自带）。
+      # 因此 workflow 里**没有任何 action** —— 也就没有 action 版本漂移面。
+      - name: Detect stale schedules
+        id: detect
+        env:
+          MAX_AGE_DAYS_INPUT: ${{ inputs.max_age_days || '8' }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          max_age="${MAX_AGE_DAYS_INPUT}"
+          # 只接受非负整数：负数/小数/空串一律明确报错（不猜、不夹取）。
+          case "$max_age" in
+            '' | *[!0-9]*)
+              echo "::error::max_age_days 必须是 >= 0 的整数（天），实际 '${max_age}'"
+              exit 2
+              ;;
+          esac
+
+          dry_run=false
+          case "${DRY_RUN_INPUT,,}" in
+            true | 1) dry_run=true ;;
+          esac
+
+          tmp="${RUNNER_TEMP:-/tmp}/schedule-guard"
+          mkdir -p "$tmp"
+          report="$tmp/report.tsv"
+          : >"$report"
+
+          # 年龄计算（python3 自带，不引入依赖）：输出 `when \t age_days \t state \t url \t conclusion`。
+          # 用浮点天数只为展示；判据是 `age > max_age`（严格大于），边界不靠 `count*1.15` 这类比例。
+          cat >"$tmp/age.py" <<'PY'
+          import json
+          import sys
+          from datetime import datetime, timezone
+
+          path, max_age = sys.argv[1], int(sys.argv[2])
+          runs = json.load(open(path, encoding="utf-8"))
+          if not runs:
+              # 从未运行：age 记为 `-`（不是 0，不能被当成「刚跑过」）。
+              print("never\t-\tSTALE\t-\tnever")
+              sys.exit(0)
+          run = max(runs, key=lambda r: r["createdAt"])
+          ts = datetime.fromisoformat(run["createdAt"].replace("Z", "+00:00"))
+          if ts.tzinfo is None:
+              ts = ts.replace(tzinfo=timezone.utc)
+          age = (datetime.now(timezone.utc) - ts).total_seconds() / 86400.0
+          state = "OK" if age <= max_age else "STALE"
+          when = ts.strftime("%Y-%m-%d %H:%M UTC")
+          conclusion = run.get("conclusion") or run.get("status") or "-"
+          print(f"{when}\t{age:.2f}\t{state}\t{run.get('url') or '-'}\t{conclusion}")
+          PY
+
+          # 检查对象：**workflow 显示名 | 文件名**。显示名给 `gh run list --workflow`，
+          # 文件名给「手动补跑」的文案（`gh workflow run <file>`）。
+          targets=(
+            "QA scheduled|qa-scheduled.yml"
+            "Verify platforms|verify-platforms.yml"
+          )
+
+          {
+            echo "## Schedule guard"
+            echo
+            echo "触发：\`$GITHUB_EVENT_NAME\` ｜ 阈值：\`max_age_days=$max_age\` ｜ dry_run：\`$dry_run\`"
+            echo
+            echo "| 目标 | 最近一次 schedule run | 年龄 | 状态 |"
+            echo "| --- | --- | --- | --- |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          stale=()
+          for entry in "${targets[@]}"; do
+            name="${entry%%|*}"
+            file="${entry##*|}"
+            # `--workflow` 接显示名（已在 2026-11-23 实测：两个名字都能解析；
+            # 名字写错时 gh 以非 0 退出，下面显式判失败 —— 不允许「查不到 → 当作 OK」）。
+            if ! gh run list --event schedule --workflow "$name" --limit 1 \
+              --json createdAt,conclusion,status,url >"$tmp/run.json"; then
+              echo "::error::读取 '$name' 的 schedule 运行失败（对应 .github/workflows/$file）——workflow 名是否改了？"
+              exit 1
+            fi
+            row="$(python3 "$tmp/age.py" "$tmp/run.json" "$max_age")"
+            IFS=$'\t' read -r when age state url conclusion <<<"$row"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$name" "$file" "$when" "$age" "$state" "$url" "$conclusion" >>"$report"
+
+            if [ "$age" = "-" ]; then
+              cell_run="never（0 次）"
+              cell_age="—"
+            else
+              cell_run="[$when（$conclusion）]($url)"
+              cell_age="${age} 天"
+            fi
+            if [ "$state" = "OK" ]; then
+              cell_state="OK"
+            else
+              cell_state="**STALE**"
+              stale+=("$name")
+            fi
+            printf '| %s | %s | %s | %s |\n' \
+              "$name" "$cell_run" "$cell_age" "$cell_state" >>"$GITHUB_STEP_SUMMARY"
+            echo "$name: $state（$cell_run，$cell_age）"
+          done
+
+          {
+            if [ "${#stale[@]}" -gt 0 ]; then
+              echo
+              echo "**:warning: 停滞目标**：$(IFS=,; echo "${stale[*]}")"
+            fi
+            if [ "$dry_run" = "true" ]; then
+              echo
+              echo "> dry_run=true：不建/不关 issue；检测到停滞时本作业 exit 1（便于演练断言）。"
+            else
+              echo
+              echo "> 正常模式不因 stale 变红（可见性靠 issue）；issue 写入失败才红。"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "stale_count=${#stale[@]}"
+            if [ "${#stale[@]}" -gt 0 ]; then
+              echo "stale_names=$(IFS=,; echo "${stale[*]}")"
+            else
+              echo "stale_names="
+            fi
+            echo "dry_run=$dry_run"
+            echo "max_age_days=$max_age"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo "MAX_AGE_DAYS_RESOLVED=$max_age"
+            echo "SCHEDULE_GUARD_REPORT=$report"
+          } >>"$GITHUB_ENV"
+
+      # stale → 建 issue（同标题只留一个 open）；恢复 → 评论 + 关闭。
+      # 去重同时用 `--search` 与实际标题**精确比对**：搜索索引会漏（新 issue 有延迟、中文分词差异），
+      # 只靠 search 会重复建 issue；search 未命中时回退到全量 open 列表里精确比对。
+      - name: Reconcile issues
+        if: steps.detect.outputs.dry_run != 'true'
+        env:
+          MAX_AGE: ${{ steps.detect.outputs.max_age_days }}
+        run: |
+          set -euo pipefail
+
+          report="${SCHEDULE_GUARD_REPORT:?detect 步骤没有写出报告路径}"
+          max_age="${MAX_AGE:?缺少 max_age_days}"
+          repo="${GH_REPO:?缺少 GH_REPO}"
+
+          # 返回码：0 = 成功（stdout 为 issue number，找不到则空）；1 = **读不到** open 列表（调用方必须红）。
+          find_open_issue() {
+            local title="$1" num=""
+            # search 分支：搜索索引漏命中是常态（新 issue 有延迟、中文分词差异），
+            # 吞错可以接受 —— 后面还有全量列举兜底。
+            num="$(gh issue list --state open --search "$title in:title" --limit 50 \
+              --json number,title --jq '.[] | "\(.number)\t\(.title)"' 2>/dev/null \
+              | awk -F'\t' -v t="$title" '$2 == t {print $1; exit}')" || true
+            if [ -z "$num" ]; then
+              # 全量回退是「去重」的最后保险：读不到就无法判定是否已有同名 open issue，
+              # 此时继续 create 会静默重复建 issue —— 因此**不吞错**，返回非 0 让调用方红。
+              # 注意：这里不能 `exit`（本函数在 `$( )` 子 shell 里调用，exit 只结束子 shell，
+              # 且会把错误文案当成 issue number 捕获走）。
+              num="$(gh issue list --state open --limit 200 \
+                --json number,title --jq '.[] | "\(.number)\t\(.title)"' \
+                | awk -F'\t' -v t="$title" '$2 == t {print $1; exit}')" || return 1
+            fi
+            printf '%s' "$num"
+          }
+
+          # 先整表读进来再遍历：循环体里调 gh，直接从文件读 stdin 容易被子进程吃掉。
+          mapfile -t rows <"$report"
+          if [ "${#rows[@]}" -eq 0 ]; then
+            echo "::error::报告为空（detect 步骤没有产出）"
+            exit 1
+          fi
+
+          for row in "${rows[@]}"; do
+            IFS=$'\t' read -r name file when age state url conclusion <<<"$row"
+            [ -n "$name" ] || continue
+            title="[schedule-guard] ${name} 的定时运行已停滞"
+            if ! num="$(find_open_issue "$title")"; then
+              echo "::error::读取 open issue 列表失败（'$title' 的去重无法判定）——拒绝在无法去重时建 issue"
+              exit 1
+            fi
+
+            if [ "$state" = "OK" ]; then
+              if [ -z "$num" ]; then
+                echo "$name: OK，无 open issue"
+                continue
+              fi
+              comment="$(printf '已恢复：`%s` 最近一次 `event=schedule` 运行是 %s（%s 天前），已回到阈值 %s 天以内。\n由 schedule-guard 自动关闭（若仍有疑问可重新打开）。\n' \
+                "$name" "$when" "$age" "$max_age")"
+              gh issue comment "$num" --body "$comment"
+              gh issue close "$num" --reason completed
+              echo "$name: 已恢复 → 评论并关闭 #$num"
+              continue
+            fi
+
+            if [ -n "$num" ]; then
+              # 已有 open issue：不重复创建、也不每天刷评论（issue 本身就是持续信号）。
+              echo "$name: 仍停滞，open issue #$num 已存在（不重复创建）"
+              continue
+            fi
+
+            if [ "$age" = "-" ]; then
+              detail="**从未运行过** \`event=schedule\`（0 次）"
+            else
+              detail="最近一次 \`event=schedule\` 运行是 **${when}**（${age} 天前，结论 \`${conclusion}\`）"
+            fi
+
+            body="$(cat <<'EOF'
+          **现象**：@@NAME@@（`.github/workflows/@@FILE@@`）@@DETAIL@@，
+          已超过阈值 `max_age_days=@@MAX_AGE@@`。GitHub 侧的定时触发可能已整体失效。
+
+          **影响**：周度回归（fuzz / 互操作矩阵 / 基准冒烟 / 平台实跑）没有按计划执行，
+          而 workflow 状态仍是 `active`，从面板上看不出任何异常。
+
+          **先手动补一次**（不依赖 cron）：
+
+              gh workflow run @@FILE@@ -R @@REPO@@
+
+          再核对是否真的出现 schedule 运行（手动 dispatch **不算** schedule，不会清掉本 issue）：
+
+              gh run list --event schedule --workflow "@@NAME@@" --limit 1 --json createdAt,conclusion
+
+          **恢复后关闭**：出现新的 `event=schedule` 运行、年龄 ≤ 阈值时，守卫会自动评论并关闭本 issue；
+          若确认将长期手动补跑，也可以在本 issue 下说明后手动关闭。
+
+          守卫：`.github/workflows/schedule-guard.yml`（每日 06:00 UTC + push 到 `main`，阈值默认 8 天）。
+          EOF
+          )"
+            body="${body//@@NAME@@/$name}"
+            body="${body//@@FILE@@/$file}"
+            body="${body//@@DETAIL@@/$detail}"
+            body="${body//@@MAX_AGE@@/$max_age}"
+            body="${body//@@REPO@@/$repo}"
+
+            gh issue create --title "$title" --body "$body"
+            echo "$name: 新建 issue '$title'"
+          done
+
+          echo "reconcile 完成（stale=$(grep -c $'\tSTALE\t' "$report" || true)）"
+
+      # 演练模式：检测到 stale 就 exit 1（不改 issue，方便验证判据与阈值）。
+      - name: Fail when stale (dry run only)
+        if: steps.detect.outputs.dry_run == 'true' && steps.detect.outputs.stale_count != '0'
+        run: |
+          set -euo pipefail
+          echo "::error::dry_run 检测到停滞目标：${{ steps.detect.outputs.stale_names }}（阈值 ${{ steps.detect.outputs.max_age_days }} 天）"
+          exit 1
