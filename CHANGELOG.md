@@ -19,6 +19,11 @@
 - lab 新增 `cert-poll` 项：无 secure 监听 + flag → 拒绝启动；`0` 下改文件 4s **不**重载而
   `SIGHUP` 重载；`2s` 下改文件约 2s 内重载。
 
+### 依赖
+
+- `x509-parser 0.16 → 0.18.1`（证书到期 gauge 的解析器，仅 `tls` 构建）。
+  `cert-reload` lab 复验：`expires` 与 `openssl x509 -enddate` **drift 0s**，解析语义未变。
+
 ### 发布与回归自动化（维护者可见）
 
 - **发版前预检 `release-preflight`**（只读）：版本钉死点、测试/clippy/fmt、interop 矩阵、

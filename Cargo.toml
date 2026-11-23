@@ -84,7 +84,7 @@ tokio-rustls = { version = "0.26.6", optional = true, default-features = false, 
 ] }
 rustls-pemfile = { version = "2.2", optional = true }
 # 证书到期指标（`rstun_turn_tls_cert_expires_seconds`）需要读 X.509 validity，
-# 而 rustls 的 `ServerConfig` 不回读 `notAfter`。`x509-parser 0.16` 本来就在
+# 而 rustls 的 `ServerConfig` 不回读 `notAfter`。`x509-parser` 本来就在
 # 依赖树里（`webrtc-dtls` 的传递依赖），提升为直接依赖**不新增 crate**；仅
 # `tls` feature 启用，lean 构建完全不受影响。只解析 DER（不做链验签），
 # `default-features = false` 已无额外特性可关，显式写出来只为表明这一意图。
