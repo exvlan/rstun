@@ -480,6 +480,11 @@ run_raf() {
   if [[ $ipv4 == ok && $ipv6 == ok && -n "$family" && "$family" -gt 0 ]]; then
     ok "$name" "uclient -X relays (RAF IPv4), -x → error 440; rejected_family=$family"
   else
+    # 失败时把 uclient 的尾部打进 CI 日志：只看 ipv4=failed 分不清「丢包」还是「硬错误」。
+    echo "--- $name-ipv4.log (tail) ---"
+    tail -n 8 "$LOG_DIR/$name-ipv4.log" 2>/dev/null || true
+    echo "--- $name-ipv6.log (tail) ---"
+    tail -n 5 "$LOG_DIR/$name-ipv6.log" 2>/dev/null || true
     fail "$name" "ipv4=$ipv4 ipv6=$ipv6 rejected_family=$family (see $LOG_DIR/$name-*.log)"
   fi
   stop_server "$name"
