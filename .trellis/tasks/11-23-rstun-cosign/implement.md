@@ -124,3 +124,38 @@ nfpm 把预发布版本写成 `rstun_26.410.106~dev.0_amd64.deb`；verify 期望
 
 修复合入后，用 `26.410.106-dev.1` 重新走 prep → release（新 tag 里包含修复后的 workflow）→ verify；
 随后把 dev.0/dev.1 标 prerelease 并 `cargo yank`。
+
+## dev.1 复验（修复后，全部通过）
+
+run [45192444157](https://github.com/exvlan/rstun/actions/runs/45192444157)（release）与
+[45193288345](https://github.com/exvlan/rstun/actions/runs/45193288345)（post-release-verify）：
+
+| 检查 | 结果 |
+| --- | --- |
+| Release 标记 | `isPrerelease=true`；`/releases/latest` → `rstun-v26.410.105`（tap 不被污染）|
+| 资产 | 17（13 核心 + `SHA256SUMS` + 3 bundle）|
+| deb 名 | `rstun_26.410.106-dev.1_amd64.deb`（dash，与清单一致）|
+| `sha256sum -c --strict`（本地下载 13 资产）| **13/13 成功** |
+| `cosign verify-blob`（本地，正确身份）| **Verified OK** |
+| `cosign verify-blob`（错误身份 `refs/heads/main`）| 失败并打印实际 SAN（绑定有效）|
+| 镜像 | `Sign container image` success；verify 的 `Verify image signature (cosign keyless)` success |
+| post-release-verify | **13/13 步 success**（含 deb、签名+清单、镜像签名、tap warn 路径）|
+
+## 清理
+
+- dev.0 已补标 `prerelease`（此前占用 `latest`）；
+- `cargo yank 26.410.106-dev.0` 与 `26.410.106-dev.1` 已执行；
+- dev 镜像 `ghcr.io/exvlan/rstun:26.410.106-dev.{0,1}` 保留（未删；如需清理另行执行）；
+- 本地/远端 tags 均保留 `rstun-v26.410.106-dev.{0,1}` 作为演练证据。
+
+## 演练共修复 4 个真实缺陷
+
+1. dev Release 未标 `prerelease` → `latest` 被占用、tap 会同步 dev；
+2. **`SHA256SUMS` 与 GitHub 改写后的资产名不一致**（nfpm 用 `~`，GitHub 改成 `.`）→ 用户 `sha256sum -c` 必败；
+3. verify 期望 deb 名/包内 Version 未按 Debian 规则处理；
+4. `Install cosign` 排在失败链之后 → `exit 127` 被 `continue-on-error` 洗成绿步骤。
+
+## 未做（记录）
+
+- 正式版发布（`26.410.106`）不在本任务范围；发版时按标准流程 `preflight → prep`。
+- 镜像签名的 `--recursive`（逐平台签名）未启用，只签 manifest list digest。
