@@ -6,9 +6,15 @@ name: Post-release verify
 # 用户拿到的是 **Release 资产**（zip 解压后的权限位、deb 元数据、tap 的 sha256、
 # 镜像的 manifest）。中间任何一步（上传/覆盖/打包）出问题，只有对资产实测才能发现。
 #
+# 签名（2026-11-23 起）：发布产物由 cosign keyless 签名（`SHA256SUMS` + 两份 SBOM 各一个 bundle；
+# 镜像按 manifest list digest 签）。这里逐个 `cosign verify-blob` 校验身份绑定到
+# **本仓 `release.yml` + 该 tag**，再用 `SHA256SUMS` 校验 13 个资产的哈希 ——
+# 「签名覆盖的哈希」与「实际下载的字节」必须一致，篡改任一资产都会红。
+#
 # 只读承诺：不建/改 Release、不 push、不 publish。`permissions` 只有
 # `contents: read` + `packages: read`（ghcr 包默认 private，匿名 401，
-# 只读 inspect 也需要登录一次 —— 用仓库自带 GITHUB_TOKEN，不需要额外 PAT）。
+# 只读 inspect / 验证签名也需要登录一次 —— 用仓库自带 GITHUB_TOKEN，不需要额外 PAT）。
+# 验证签名**不需要** `id-token`（那是签名方的事）。
 #
 # 用法：Actions → Post-release verify → Run workflow，version 填**不带 v** 的版本号
 # （例如 26.410.104）。任一项失败 → 整个 workflow 红，step summary 里逐项 PASS/FAIL。
@@ -24,6 +30,13 @@ on:
         description: >-
           是否把「Homebrew tap 公式」当作硬失败（默认 true）。
           刚发布后 tap 还没同步时，可传 false 只看 Release 资产；同步后再跑一次不带该参数。
+        required: false
+        default: true
+        type: boolean
+      require_signature:
+        description: >-
+          是否把「cosign keyless 签名（SHA256SUMS + 3 个 bundle + 镜像签名）」当作硬失败
+          （默认 true）。回看**签名上线前**的历史版本（13 个资产、无 bundle）时传 false，只告警。
         required: false
         default: true
         type: boolean
@@ -68,12 +81,14 @@ jobs:
           } >>"$GITHUB_ENV"
           echo "version=${version} tag=rstun-v${version}"
 
-      # ---- 1. 资产清单：13 个，且每个名字都对得上 -----------------------------
+      # ---- 1. 资产清单：13 个核心资产恒存在；签名版本再加 4 个（共 17）----------
       # 只数「13」不够：`--clobber` 重发时可能少一个多一个、或名字里的版本串没换。
-      # 这里既断言数量分布，也断言 11 个已知名字逐个在场。
-      - name: Assert release assets (13)
+      # 这里既断言数量分布，也断言 13 个已知名字逐个在场，并核对签名资产是否**成套**。
+      - name: Assert release assets (13 core + 4 signature)
         id: assets
         continue-on-error: true
+        env:
+          REQUIRE_SIGNATURE: ${{ inputs.require_signature }}
         run: |
           set -euo pipefail
           if ! gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name' >assets.txt; then
@@ -88,8 +103,16 @@ jobs:
           full="$(grep -cE '^rstun-full-.*\.zip$' assets.txt || true)"
           sboms="$(grep -cE '^rstun-.*\.cdx\.json$' assets.txt || true)"
           debs="$(grep -cE '^rstun_.*\.deb$' assets.txt || true)"
-          echo "assets=${count} zips=${zips}（lean=${lean} full=${full}） sbom=${sboms} deb=${debs}"
-          [ "$count" -eq 13 ] || { echo "::error::期望 13 个资产，实际 ${count}"; exit 1; }
+          # 签名资产：哈希清单 + 3 个 bundle（清单与两份 SBOM 各一）。
+          sigs=0
+          for want in \
+            "SHA256SUMS" \
+            "SHA256SUMS.bundle" \
+            "rstun-${VERSION}-lean.cdx.json.bundle" \
+            "rstun-${VERSION}-full.cdx.json.bundle"; do
+            if grep -qxF "$want" assets.txt; then sigs=$((sigs + 1)); fi
+          done
+          echo "assets=${count} zips=${zips}（lean=${lean} full=${full}） sbom=${sboms} deb=${debs} signature=${sigs}/4"
           [ "$zips" -eq 8 ] && [ "$lean" -eq 4 ] && [ "$full" -eq 4 ] ||
             { echo "::error::期望 8 个 zip（4 lean + 4 full），实际 ${zips}（lean=${lean} full=${full}）"; exit 1; }
           [ "$sboms" -eq 2 ] && [ "$debs" -eq 2 ] ||
@@ -111,8 +134,31 @@ jobs:
             "rstun_${VERSION}_arm64.deb"; do
             grep -qxF "$want" assets.txt || { echo "::error::缺少资产 ${want}"; exit 1; }
           done
-          echo "13 个资产齐全且命名正确"
+          # 数量：已签名 = 13 + 4 = 17。分支写清楚，不写死一个数。
+          if [ "${REQUIRE_SIGNATURE:-true}" = "true" ]; then
+            [ "$sigs" -eq 4 ] ||
+              { echo "::error::签名资产不全（${sigs}/4）：缺 SHA256SUMS 或 .bundle —— 该版本未签名？历史版本请传 require_signature=false"; exit 1; }
+            [ "$count" -eq 17 ] || { echo "::error::期望 17 个资产（13 核心 + 4 签名），实际 ${count}"; exit 1; }
+          else
+            case "$count" in
+              13 | 17) ;;
+              *) echo "::error::期望 13（未签名）或 17（已签名）个资产，实际 ${count}"; exit 1 ;;
+            esac
+            # 半套签名同样不可接受（有 SHA256SUMS 但缺 bundle，说明上传被截断）。
+            if [ "$sigs" -ne 0 ] && [ "$sigs" -ne 4 ]; then
+              echo "::error::签名资产只存在 ${sigs}/4 —— 半套签名不可接受"
+              exit 1
+            fi
+            if [ "$sigs" -eq 0 ]; then
+              echo "::warning::该版本无签名资产（require_signature=false）——签名项只告警"
+            fi
+          fi
+          echo "count=${count}" >>"$GITHUB_OUTPUT"
+          echo "assets=${sigs}" >>"$GITHUB_OUTPUT"
+          echo "资产清单齐全（${count} 个，签名资产 ${sigs}/4）"
 
+      # 全量下载：签名版本的 `SHA256SUMS` 与 `.bundle` 也要落地（`-p '*.bundle'` 在未签名
+      # 版本上会因「没有匹配项」直接失败，所以不按 pattern 过滤），数量与上一步一致。
       - name: Download assets
         id: download
         continue-on-error: true
@@ -121,10 +167,19 @@ jobs:
           set -euo pipefail
           rm -rf dist
           mkdir -p dist
-          gh release download "$TAG" -R "$REPO" -p '*.zip' -p '*.deb' -p 'rstun.rb' -D dist
+          gh release download "$TAG" -R "$REPO" -D dist
           ls -l dist
-          [ "$(ls -1 dist/*.zip dist/*.deb dist/rstun.rb 2>/dev/null | wc -l)" -eq 11 ] ||
-            { echo "::error::下载到的文件数不是 11（8 zip + 2 deb + rstun.rb）"; exit 1; }
+          got="$(find dist -maxdepth 1 -type f | wc -l)"
+          [ "$got" -eq "${{ steps.assets.outputs.count }}" ] ||
+            { echo "::error::下载到 ${got} 个文件，资产清单是 ${{ steps.assets.outputs.count }} 个"; exit 1; }
+
+      # 验证签名只需要 cosign 本体（不需要 key、不需要 OIDC token）：keyless 的信任来自
+      # Fulcio 证书链 + Rekor 证明，全部随 `.bundle` 下载。版本固定，与 `release.yml` 同步升级。
+      - name: Install cosign (verify only)
+        if: steps.download.outcome == 'success'
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
 
       # ---- 2. 架构：四个 lean zip 解包后用 `file` 验证 -------------------------
       # 只验 zip 能解、二进制架构对；不执行非本机架构的二进制（那是 QEMU 的事）。
@@ -362,7 +417,92 @@ jobs:
               raise SystemExit(f"镜像缺少架构 {sorted(missing)}（实际 {archs}）—— 单架构不能冒充双架构")
           PY
 
-      # ---- 7. 结论：逐项 PASS/FAIL + 任一失败让 workflow 红 -------------------
+      # ---- 7. 文件签名：3 个 bundle 的身份绑定 + SHA256SUMS 覆盖 13 个资产 --------
+      # 两件事必须都成立：
+      #   a) bundle 的签名者身份 = **本仓 `release.yml` @ refs/tags/rstun-v<version>**（OIDC issuer 为
+      #      GitHub）—— 否则「用 main 的签名冒充某 tag 的产物」会过；
+      #   b) `SHA256SUMS` 里的哈希与**实际下载的字节**逐条一致 —— 否则签名只证明了别的文件。
+      # 因此不需要逐个签 10 个二进制：先验清单的签名，再用清单校验每个文件。
+      - name: Verify signatures and SHA256SUMS
+        id: signature
+        continue-on-error: true
+        if: steps.download.outcome == 'success'
+        run: |
+          set -euo pipefail
+          if [ ! -f dist/SHA256SUMS ]; then
+            echo "::error::Release 里没有 SHA256SUMS（该版本未签名？）——若是签名上线前的历史版本，传 require_signature=false"
+            exit 1
+          fi
+          # 身份锚点：**本仓 + 本 workflow 文件 + 本 tag**，用 `--certificate-identity` 做**逐字**比较。
+          # 刻意不拼正则：`${VERSION//./\\.}` 这类转义在双引号里会产出 `\\.`（正则里是
+          # 「字面反斜杠 + 任意字符」），曾让**正确身份也匹配不上**。逐字比较没有转义面，
+          # 负例也天然成立（`refs/heads/main`、别的 owner、别的版本都逐字不等）。
+          identity="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/rstun-v${VERSION}"
+          issuer='https://token.actions.githubusercontent.com'
+          echo "期望身份（逐字）：${identity}"
+          for f in \
+            "SHA256SUMS" \
+            "rstun-${VERSION}-lean.cdx.json" \
+            "rstun-${VERSION}-full.cdx.json"; do
+            [ -f "dist/${f}" ] || { echo "::error::缺少待验文件 ${f}"; exit 1; }
+            [ -f "dist/${f}.bundle" ] || { echo "::error::缺少签名 ${f}.bundle"; exit 1; }
+            cosign verify-blob "dist/${f}" \
+              --bundle "dist/${f}.bundle" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$issuer"
+            echo "ok: ${f} 的 bundle 身份与 issuer 正确"
+          done
+          # 清单必须**恰好覆盖** 13 个核心资产：少一条 `sha256sum -c` 不会报（它只校验列出的行）。
+          entries="$(grep -cE '^[0-9a-f]{64}  ' dist/SHA256SUMS || true)"
+          [ "$entries" -eq 13 ] ||
+            { echo "::error::SHA256SUMS 有 ${entries} 条合法行，期望 13 条"; exit 1; }
+          names="$(sed -n 's/^[0-9a-f]\{64\}  *//p' dist/SHA256SUMS)"
+          for want in \
+            "rstun-linux-x86_64-${VERSION}.zip" \
+            "rstun-linux-aarch64-${VERSION}.zip" \
+            "rstun-macos-x86_64-${VERSION}.zip" \
+            "rstun-windows-x86_64-${VERSION}.zip" \
+            "rstun-full-linux-x86_64-${VERSION}.zip" \
+            "rstun-full-linux-aarch64-${VERSION}.zip" \
+            "rstun-full-macos-x86_64-${VERSION}.zip" \
+            "rstun-full-windows-x86_64-${VERSION}.zip" \
+            "rstun-${VERSION}-lean.cdx.json" \
+            "rstun-${VERSION}-full.cdx.json" \
+            "rstun.rb" \
+            "rstun_${VERSION}_amd64.deb" \
+            "rstun_${VERSION}_arm64.deb"; do
+            printf '%s\n' "$names" | grep -qxF "$want" ||
+              { echo "::error::SHA256SUMS 未覆盖 ${want}"; exit 1; }
+          done
+          # 清单里的 13 条哈希必须与本目录下的文件一致（少一个文件 → 失败，不跳过）。
+          ( cd dist && sha256sum -c --strict SHA256SUMS )
+          echo "SHA256SUMS 覆盖的 13 个资产与实测字节一致"
+
+      # ---- 8. 镜像签名：签的是 manifest list digest，验证必须用同一个 digest ------
+      # 用 tag 验证会被「tag 被重新指向」蒙混；digest 才是不可变的（下游记录的就是它）。
+      - name: Verify image signature (cosign keyless)
+        id: image_signature
+        continue-on-error: true
+        if: steps.image.outcome == 'success'
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          digest="$(sed -n 's/^Digest: *\(sha256:[0-9a-f]\{64\}\)$/\1/p' "$RUNNER_TEMP/image-inspect.txt" | head -n1)"
+          [ -n "$digest" ] || { echo "::error::没有 manifest list digest（上一步 image inspect 未产出）"; exit 1; }
+          # 同一个**逐字**身份（见上：不拼正则，避免 `\\.` 之类的转义陷阱）。
+          identity="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/rstun-v${VERSION}"
+          issuer='https://token.actions.githubusercontent.com'
+          echo "期望身份（逐字）：${identity}"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
+          cosign verify "${image}@${digest}" \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer"
+          echo "镜像签名身份正确：${image}@${digest}"
+
+      # ---- 9. 结论：逐项 PASS/FAIL + 任一失败让 workflow 红 -------------------
       - name: Summary
         if: always()
         env:
@@ -373,13 +513,28 @@ jobs:
           DEB: ${{ steps.deb.outcome || 'skipped' }}
           FORMULA: ${{ steps.formula.outcome || 'skipped' }}
           IMAGE: ${{ steps.image.outcome || 'skipped' }}
+          SIGNATURE: ${{ steps.signature.outcome || 'skipped' }}
+          IMAGE_SIGNATURE: ${{ steps.image_signature.outcome || 'skipped' }}
           REQUIRE_TAP: ${{ inputs.require_tap }}
+          REQUIRE_SIGNATURE: ${{ inputs.require_signature }}
         run: |
           set -euo pipefail
           verdict=PASS
           for outcome in "$ASSETS" "$DOWNLOAD" "$ARCH" "$VERSION_CHECK" "$DEB" "$IMAGE"; do
             [ "$outcome" = success ] || verdict=FAIL
           done
+          # 签名：默认硬失败（防「声称已签名其实没有」）；require_signature=false 时只告警，
+          # 用于回看签名上线前的历史版本（13 个资产、无 bundle）。
+          signature_state="$SIGNATURE"
+          image_signature_state="$IMAGE_SIGNATURE"
+          if [ "$SIGNATURE" != success ] || [ "$IMAGE_SIGNATURE" != success ]; then
+            if [ "${REQUIRE_SIGNATURE:-true}" = "true" ]; then
+              verdict=FAIL
+            else
+              [ "$SIGNATURE" != success ] && signature_state="warn（未签名/缺 bundle；require_signature=false）"
+              [ "$IMAGE_SIGNATURE" != success ] && image_signature_state="warn（镜像未签名；require_signature=false）"
+            fi
+          fi
           # tap 是**跨仓、异步**同步的派生产物：刚发布后它可能还没跟上。
           # 默认仍把不一致当失败（防漏同步），但允许 require_tap=false 只看 Release 资产。
           formula_state="$FORMULA"
@@ -395,13 +550,15 @@ jobs:
             echo ""
             echo "| 项 | 状态 |"
             echo "| --- | --- |"
-            echo "| 1. 资产 13 个且命名正确 | ${ASSETS} |"
-            echo "| （下载 11 个待验资产） | ${DOWNLOAD} |"
+            echo "| 1. 资产 13 个（签名版 17）+ 命名正确 | ${ASSETS} |"
+            echo "| （下载全部资产） | ${DOWNLOAD} |"
             echo "| 2. 四平台 zip 架构 | ${ARCH} |"
             echo "| 3. --version 与 tag 提交 sha6 | ${VERSION_CHECK} |"
             echo "| 4. deb 元数据 + 二进制 --version | ${DEB} |"
             echo "| 5. tap formula 类体 + 3 个 sha256 | ${formula_state} |"
             echo "| 6. 镜像双架构 manifest | ${IMAGE} |"
+            echo "| 7. 3 个 bundle 身份 + SHA256SUMS 覆盖 13 资产 | ${signature_state} |"
+            echo "| 8. 镜像签名（manifest list digest） | ${image_signature_state} |"
             echo "| **结论** | **${verdict}** |"
           } >>"$GITHUB_STEP_SUMMARY"
           if [ "$verdict" != PASS ]; then

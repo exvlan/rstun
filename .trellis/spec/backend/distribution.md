@@ -32,8 +32,8 @@
 | 包范围 | 只发 **lean** 的 brew/deb；full 走 Release `rstun-full-*` 与镜像（避免同版本两个包）|
 | deb 安装路径 | 二进制 `/usr/local/bin/rstun`（**有意选择**：不覆盖发行版包管理器；代价是 lintian E 级，已在 `contrib/README.md` 说明）|
 | deb 服务 | unit 在 `/lib/systemd/system/rstun.service`；postinst 幂等、不 `rm -rf`、无 systemd 时不起服务；preremove 只 `daemon-reload`（不 stop，升级由 systemd 处理）|
-| SBOM | 随 Release 上传（lean/full 各一份）；**不含 hashes/签名**（Release notes 已声明，cosign 后置）；`components` 含 build/proc-macro 闭包，**不是运行期 crate 数** |
-| 资产数量 | Release 断言 **13** 个（8 zip + 2 cdx + 1 rb + 2 deb），缺 SBOM/deb 直接失败 |
+| SBOM | 随 Release 上传（lean/full 各一份）；**内容不含 hashes/签名**（签名以独立 `<file>.bundle` 随 Release 提供，`SHA256SUMS` 覆盖其哈希）；`components` 含 build/proc-macro 闭包，**不是运行期 crate 数** |
+| 资产数量 | 13 个核心资产（8 zip + 2 cdx + 1 rb + 2 deb）必须齐全，缺 SBOM/deb 直接失败；keyless 签名（`11-23-rstun-cosign`）再加 `SHA256SUMS` + 3 个 `.bundle` = **17**（`sign=false` 时 13）|
 | 供应链门禁 | `cargo audit` 与 `cargo deny` **都**是必需作业（`deny` 无 `continue-on-error`）；豁免清单两处同步：`.cargo/audit.toml` 与 `deny.toml`，只 ignore `RUSTSEC-2026-0387` |
 
 ## 4. Validation & Error Matrix
@@ -46,7 +46,7 @@
 | 版本与 `Cargo.toml` 不一致 | `build-deb.sh` / `gen-brew.sh` exit 1 |
 | musl 产物缺失 | 回退 glibc 并打 3 行警告；**发布前必须确认走 musl** |
 | SBOM 缺组件/悬空 ref | 生成脚本自检失败 |
-| Release 资产 ≠ 13（或 deb ≠ 2）| release 作业 `::error::` |
+| Release 资产 ≠ 13（未签名）/ 17（已签名）（或 deb ≠ 2）| release 作业 `::error::` |
 
 ## 5. Good / Base / Bad
 

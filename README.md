@@ -119,17 +119,48 @@ dispatch `release.yml`（固定从该 tag 的树构建，保证资产里的 `+sh
 缺了、或该版本已在 CHANGELOG 出现，prep 会 fail-fast（不发没有 changelog 的版本）；发版后记得
 把它补回来，供下一版使用。
 
-发布完成后跑 **Post-release verify**（只读）：逐项核对 13 个资产、四平台 zip 架构、`--version` 与 tag 指向的
-`sha6`、两个 deb、tap formula 的三个 sha256、镜像双架构 manifest，结果写进 run summary。
+发布完成后跑 **Post-release verify**（只读）：逐项核对资产（13 个核心；签名版 17 个）、四平台 zip 架构、
+`--version` 与 tag 指向的 `sha6`、两个 deb、tap formula 的三个 sha256、镜像双架构 manifest，以及
+**cosign 签名**（3 个 `.bundle` 的身份 + `SHA256SUMS` 覆盖的哈希 + 镜像 digest 签名），结果写进 run summary。
 
-手工 `bump` + `gh workflow run release.yml -f version=…` 仍可用（逃生口）。
+手工 `bump` + `gh workflow run release.yml --ref rstun-v<version> -f version=…` 仍可用（逃生口；
+`--ref` 不能省 —— `sign` 默认 `true` 时非 tag ref 会被 `prepare` 拒绝，见下）。
 
-传 `version`（**不带 `v`**，如 `26.410.100`）即可，一次 dispatch 交付三样：
+### 验证产物（cosign keyless）
+
+发布产物已用 **cosign keyless**（GitHub OIDC + Sigstore Fulcio/Rekor）签名，不依赖任何长期私钥。
+下载到同一个目录后，三条命令即可验完（完整说明见
+[`docs/book/src/verify.md`](docs/book/src/verify.md)）：
+
+```bash
+# 1) 验 SHA256SUMS 的签名：证书身份 = 本仓 release.yml @ 该 tag（**逐字**相等，非正则）
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.bundle \
+  --certificate-identity 'https://github.com/exvlan/rstun/.github/workflows/release.yml@refs/tags/rstun-v<version>' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# 2) 用签名过的清单校验每个资产（裸文件名，必须同目录）
+sha256sum -c SHA256SUMS
+
+# 3) 两份 SBOM 的签名（证书身份同上；full 把 lean 换成 full）
+cosign verify-blob rstun-<version>-lean.cdx.json \
+  --bundle rstun-<version>-lean.cdx.json.bundle \
+  --certificate-identity 'https://github.com/exvlan/rstun/.github/workflows/release.yml@refs/tags/rstun-v<version>' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+镜像签的是 **manifest list digest**：`docker buildx imagetools inspect ghcr.io/exvlan/rstun:<version>`
+取 digest，再 `cosign verify ghcr.io/exvlan/rstun@sha256:<digest>`（`--certificate-identity` 同上）。
+**资产被改 1 个字节 → 第 2 条失败**；identity 只要有一个字符不同（`refs/heads/main`、别的 owner、
+别的版本）→ 第 1/3 条失败。
+`26.410.105` 及更早的 Release **未签名**（只有 13 个核心资产、没有 `.bundle`）。
+
+传 `version`（**不带 `v`**，如 `26.410.100`）即可，一次 dispatch 交付产物 + 镜像 + crate：
 
 | 产出          | 内容                                                                                                                                 |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | Release       | tag **`rstun-v<version>`** + **八**个 zip：四个平台（Linux x86_64/aarch64 musl、macOS x86_64、Windows x86_64）× 两种构建 —— lean `rstun-<platform>-<version>.zip`、full `rstun-full-<platform>-<version>.zip` |
-| SBOM + formula | **两份** CycloneDX（`rstun-<version>-lean.cdx.json` / `-full.cdx.json`）+ Homebrew formula `rstun.rb`（lean；tap 仓 `exvlan/homebrew-rstun` 的 `sync.yml` 每 05:30 UTC 反向拉取，无需人工同步） |
+| SBOM + formula | **两份** CycloneDX（`rstun-<version>-lean.cdx.json` / `-full.cdx.json`）+ Homebrew formula `rstun.rb`（lean；tap 仓 `exvlan/homebrew-rstun` 的 `sync.yml` 每 05:30 UTC 反向拉取，无需人工同步）+ 2 个 deb |
+| 签名          | `SHA256SUMS`（覆盖 13 个核心资产）+ 3 个 cosign `.bundle`（`SHA256SUMS`、两份 SBOM）；合计 **17** 个资产 |
 | 镜像          | **`ghcr.io/<owner>/rstun:<version>`**（双架构 amd64+arm64，**full** 构建；版本不含 `-` 的稳定版追加 `latest`）                        |
 | crates.io     | **`rstun <version>`**（`publish-crates` 作业，与 `release` 并行；**幂等**：已发布即跳过，重跑不红）                                    |
 
@@ -151,8 +182,8 @@ dispatch `release.yml`（固定从该 tag 的树构建，保证资产里的 `+sh
   `--version`；Linux 上 full 产物还多跑一次 TLS 冒烟（自签 ECDSA 证书起 `turns:` 监听 +
   `openssl s_client` 握手 + 另一实例的明文 Binding）。
 - `sbom` 作业（与平台无关，只跑一次）用 `script/ci/gen-sbom.sh` 生成 lean / full 两份 SBOM；
-  `release` 作业断言 **8 个 zip + 2 份 SBOM + 1 份 formula + 2 个 deb = 13 个资产**，少一个就拒绝发版
-  （SBOM 的组件数还额外断言直接依赖 10 / 15）。
+  `release` 作业断言 **8 个 zip + 2 份 SBOM + 1 份 formula + 2 个 deb = 13 个核心资产**，少一个就拒绝发版
+  （SBOM 的组件数还额外断言直接依赖 10 / 15）；签名时再加 `SHA256SUMS` + 3 个 `.bundle`，合计 **17**。
 - `publish-crates` 作业与 `release` **并行**（crate 发布失败不拦资产）：先查
   `https://crates.io/api/v1/crates/rstun/<version>`（**必须带 `User-Agent`**，无 UA 是 403）——
   已存在则跳过、不存在才发布（`cargo publish`，并锁定 `Cargo.lock`），所以**重跑同一版本不红**。crates.io 上的版本
@@ -469,7 +500,9 @@ OpenSSL/libssl-dev）。引入它们的原因：鉴权要 HMAC-SHA1、HMAC-SHA25
 - Dependabot（`.github/dependabot.yml`）：cargo **每周**、GitHub Actions **每月**，**只开 PR 不自动合并**。
 - Release 附 **CycloneDX 1.5 SBOM**：`rstun-<version>-lean.cdx.json` / `rstun-<version>-full.cdx.json`
   （`script/ci/gen-sbom.sh` 用 `cargo metadata` 生成，按 feature 分别算依赖闭包，并断言直接依赖数
-  10 / 15）；另附 Homebrew formula `rstun.rb`。**发布产物未签名**（cosign/sigstore 后置）。
+  10 / 15）；另附 Homebrew formula `rstun.rb`、`SHA256SUMS` 与 3 个 cosign `.bundle`
+  （`SHA256SUMS` + 两份 SBOM 各一）。**发布产物已用 cosign keyless 签名**（GitHub OIDC + Fulcio/Rekor，
+  镜像按 manifest list digest 签），验证命令见 [`docs/book/src/verify.md`](docs/book/src/verify.md)。
 
 ## 测试
 

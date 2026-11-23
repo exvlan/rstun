@@ -56,4 +56,7 @@
 - `cargo audit`（`.cargo/audit.toml` 的豁免清单）与 `cargo deny`（`deny.toml`：licenses /
   bans / sources）在 CI 里是**必需作业**。
 - Release 资产附 CycloneDX SBOM（`rstun-<version>-lean.cdx.json` / `-full.cdx.json`）。
-- **发布产物未做签名**（cosign/sigstore 后置）：请用 SBOM + `sha256` 校验，并在信任前自行构建。
+- **发布产物已用 cosign keyless 签名**（GitHub OIDC + Sigstore Fulcio/Rekor，`26.410.106` 起）：
+  `SHA256SUMS`（覆盖 13 个核心资产）+ 3 个 `.bundle`，容器镜像按 manifest list digest 签名。
+  验证命令见 [验证发布产物](docs/book/src/verify.md)；**未签名的历史版本**（≤ `26.410.105`）
+  只能自行计算 `sha256` 与 SBOM 对照，或在信任前自行构建。

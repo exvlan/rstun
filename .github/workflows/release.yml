@@ -3,14 +3,23 @@ name: Release
 # 手动发版（`workflow_dispatch`，不靠 tag 自动触发）。标准路径是
 # `release-preflight`（只读预检）→ `release-prep`（bump + tag + dispatch 本 workflow）；
 # 本 workflow 也可以手工 dispatch，作为逃生口：
-#   · 只传一个 `version`（**不带 `v`**，如 `26.410.100`），必须与 `Cargo.toml` 的
-#     `version` 一致 —— 不一致直接失败，避免「tag 说 A、二进制说 B」；
+#   · 传 `version`（**不带 `v`**，如 `26.410.100`）必须与 `Cargo.toml` 的 `version` 一致
+#     —— 不一致直接失败，避免「tag 说 A、二进制说 B」；
+#   · **`--ref` 不能省**：`sign` 默认 `true` 时 `prepare` 会断言 `GITHUB_REF == refs/tags/<tag>`
+#     （keyless 证书身份绑在 ref 上；从 `main` 发版会写出「证书 @refs/heads/main + 说明写 tag」的
+#     假声明，且 verify 必红）。要从分支发版只能显式 `-f sign=false`（说明会写「本版未签名」）；
 #   · 一次 dispatch 交付三样：
-#       Release `rstun-v<version>` + **八**个资产：四个平台 × 两种构建
+#       Release `rstun-v<version>` + **八**个二进制资产（四个平台 × 两种构建）：
 #         lean  `rstun-<platform>-<version>.zip`       STUN + TURN(UDP/TCP) + REST + 带宽
 #         full  `rstun-full-<platform>-<version>.zip`  再加 `turns:`(TLS) 与 DTLS
+#         另加 2 份 SBOM + `rstun.rb` + 2 个 deb = **13** 个核心资产；
+#         签名时再加 `SHA256SUMS` + 3 个 `.bundle` = **17**（见下）
 #       镜像 `ghcr.io/<owner>/rstun:<version>`（linux/amd64 + linux/arm64 双架构，**full** 构建）
 #       crates.io `rstun <version>`（`publish-crates` 作业，与 `release` 并行、互不阻塞）
+#   · 签名（keyless，`sign` 输入默认 `true`）：`SHA256SUMS`（覆盖 13 个核心资产）与两份 SBOM 各一份
+#     cosign bundle；镜像由 `sign-image` 作业对 **manifest list digest** 签名（OCI 附件，不占资产位）。
+#     keyless 需要 `id-token: write`；Fulcio/Rekor 不可达 → 作业失败（宁可发不出去，也不发「假已签名」）。
+#     `sign=false` 仅作应急逃生口：不产生 sums/bundle，发布说明会明示「本版未签名」。
 #   · 幂等：Release 已存在则 `gh release upload --clobber` 只覆盖资产；
 #     镜像 tag 重复推即覆盖，manifest 用 `--amend` 重建；
 #     crates.io 上已存在的版本由 `publish-crates.yml` 的 API 检查跳过（重跑不红）。
@@ -28,6 +37,14 @@ on:
           `rstun-<platform>-<version>.zip`（lean）/ `rstun-full-<platform>-<version>.zip`（full）
         type: string
         required: true
+      sign:
+        description: >-
+          是否用 cosign keyless（GitHub OIDC + Sigstore Fulcio/Rekor）签名发布产物（默认 true）。
+          传 false 只作应急逃生口：不产生 SHA256SUMS / .bundle，发布说明会明示「本版未签名」，
+          post-release-verify 默认（require_signature=true）会判失败。
+        type: boolean
+        required: false
+        default: true
 
 # 默认最小权限；写权限按作业单独授予（Release 要 contents: write，推镜像要 packages: write）。
 # 全部用 `GITHUB_TOKEN`，不新增 secret。
@@ -91,6 +108,26 @@ jobs:
             echo "prerelease=${prerelease}"
           } >>"$GITHUB_OUTPUT"
           echo "version=${version}  tag=rstun-v${version}  build=${version}+${sha6}  prerelease=${prerelease}"
+
+      # keyless 证书的 SAN 是「本 workflow 文件 @ 触发时所在的 ref」：
+      #   · 从 tag 触发 → `…@refs/tags/rstun-v<version>`（发布说明与文档宣称的就是这个）；
+      #   · 从 main 触发 → `…@refs/heads/main` —— `post-release-verify` 按 tag 身份逐字比对，
+      #     必然红；而发布说明仍会写 tag 身份 → 「事实性错误的签名声明」。
+      # 所以 sign=true 只允许从 tag ref 触发（`release-prep` 就是这么 dispatch 的）。
+      # 确实要从分支发版时显式传 `-f sign=false`（说明会写「本版未签名」）。
+      - name: Require tag ref when signing
+        if: inputs.sign
+        env:
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/tags/${TAG}" ]; then
+            echo "::error::sign=true 必须从 tag ref 触发（当前 ${GITHUB_REF}）：keyless 证书身份会绑到这个 ref"
+            echo "::error::请用 gh workflow run release.yml --ref ${TAG} -f version=…；"
+            echo "::error::若确实要从分支发版，显式传 -f sign=false（发布说明会写「本版未签名」）"
+            exit 1
+          fi
+          echo "ref=${GITHUB_REF} == refs/tags/${TAG} → 可签名"
 
   # 四端二进制：两个 linux-musl 在对应架构的 runner 上 native 构建并真跑冒烟；
   # Windows native 跑 `--version`；macOS runner 是 arm64，x86_64 产物只编译（需 Rosetta）。
@@ -376,6 +413,43 @@ jobs:
             tag latest
           fi
 
+  # 镜像签名（keyless）：签名以 OCI 附件（referrer）存进 registry，**不增加 Release 资产**。
+  # 只签 **manifest list digest**（`--recursive` 留给「要逐平台校验」的场景）：下游按 digest 固定
+  # 的就是 index，签它才与「我拉到的就是这一份」对齐。
+  # 与 `release` 作业并行是安全的：它不碰文件资产。
+  sign-image:
+    name: Sign container image
+    needs: [prepare, manifest]
+    if: inputs.sign
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # 读回本 run 刚推的 manifest list 并推签名附件
+      id-token: write # keyless：OIDC → Fulcio 短期证书
+    steps:
+      - name: Install cosign (keyless)
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+
+      - name: Sign manifest list digest
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repo="ghcr.io/${owner}/rstun"
+          # cosign 复用 docker 的凭证（`~/.docker/config.json`），不需要额外 secret。
+          printf '%s' "${GH_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          # 摘要**从 registry 读回**（而不是拿本地推断值）：签的必须是别人拉得到的那份 index。
+          digest="$(docker buildx imagetools inspect "${repo}:${VERSION}" \
+            | sed -n 's/^Digest: *\(sha256:[0-9a-f]\{64\}\)$/\1/p' | head -n1)"
+          [ -n "$digest" ] || { echo "::error::没拿到 ${repo}:${VERSION} 的 manifest list digest"; exit 1; }
+          echo "signing ${repo}@${digest}"
+          cosign sign --yes "${repo}@${digest}"
+          echo "- 镜像签名：\`${repo}@${digest}\`" >>"$GITHUB_STEP_SUMMARY"
+
   # SBOM：lean / full 各一份 CycloneDX（`cargo metadata` 生成，不需要额外工具链）。
   # 与平台无关，只跑一次；`gen-sbom.sh` 会断言**直接依赖数**（lean 10 / full 15；Windows full 14）——
   # 依赖面一变就红，避免 SBOM 与「依赖面」文档各说各话。
@@ -425,6 +499,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write # 建/更新 Release 并上传资产
+      id-token: write # keyless 签名：OIDC → Fulcio 短期证书（cosign sign-blob）
     steps:
       # `gh release create` 需要 git 仓库来解析/创建 tag（无 checkout 会
       # `fatal: not a git repository`）。二进制走 artifact 传递。
@@ -519,6 +594,7 @@ jobs:
       - name: Render release notes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          SIGN: ${{ inputs.sign }}
         run: |
           set -euo pipefail
           owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
@@ -544,31 +620,117 @@ jobs:
             echo "Homebrew：\`brew install exvlan/rstun/rstun\`（tap；同一份 formula 也在本 Release 的 \`rstun.rb\` 里）。"
             echo "Debian/Ubuntu：\`rstun_${VERSION}_amd64.deb\` / \`rstun_${VERSION}_arm64.deb\`"
             echo "（lean，musl static-pie；\`sudo dpkg -i rstun_${VERSION}_amd64.deb\`）。"
-            echo "**发布产物未做签名**（cosign/sigstore 后置）：请用 SBOM + 自行计算的 sha256 校验，"
-            echo "或在信任前从 tag 自行构建。"
+            if [ "${SIGN}" = "true" ]; then
+              echo "**已用 cosign keyless 签名**（GitHub OIDC + Sigstore Fulcio/Rekor）："
+              echo "\`SHA256SUMS\`（覆盖上述 13 个资产）+ \`SHA256SUMS.bundle\` + 两份 SBOM 的 \`.bundle\`；"
+              echo "容器镜像按 **manifest list digest** 签名（OCI 附件）。证书身份绑定到"
+              echo "\`exvlan/rstun\` 的 \`release.yml\` **@refs/tags/rstun-v${VERSION}\`**，验证命令见"
+              echo "README 的「验证产物」节（\`docs/book/src/verify.md\`）。"
+            else
+              echo "**本版未签名**（dispatch 时 \`sign=false\`）：只能自行计算 sha256 与 SBOM 对照，"
+              echo "或在信任前从 tag 自行构建。"
+            fi
             echo ""
             echo "跑起来：\`rstun server --listen 0.0.0.0:3478\`（UDP；加 \`--tcp\` 同时答 TCP）。"
           } > release_notes.md
           cat release_notes.md
+
+      # ---- 签名（keyless）---------------------------------------------------
+      # 三个前提，缺一个都会让「已签名」变成空话：
+      #   1) `SHA256SUMS` 必须基于**最终上传的字节** —— 所以先复制到扁平目录，之后不再改动；
+      #   2) bundle 由 cosign 写入（签名 + 证书 + Rekor 证明），与清单文件同名 + `.bundle`；
+      #   3) 失败即发布失败（Fulcio/Rekor 不可达时报可读错误，不发半套「声称已签名」的资产）。
+      - name: Stage assets for checksums
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rm -rf signed_assets
+          mkdir -p signed_assets
+          cp zipped_assets/*.zip sbom_assets/*.cdx.json dist/homebrew/*.rb deb_assets/*.deb signed_assets/
+          # 8 zip + 2 SBOM + 1 formula + 2 deb = 13
+          count="$(find signed_assets -maxdepth 1 -type f | wc -l)"
+          if [ "$count" -ne 13 ]; then
+            echo "::error::待签名目录里应有 13 个文件，实际 ${count}"
+            ls -l signed_assets
+            exit 1
+          fi
+          ls -l signed_assets
+
+      # 版本固定、action 锁 40 位 SHA：验证口径与 cosign 版本绑定（换版本 = 换 spec）。
+      - name: Install cosign (keyless)
+        if: inputs.sign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+
+      - name: Generate SHA256SUMS
+        if: inputs.sign
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd signed_assets
+          # **裸文件名** + 按文件名稳定排序：用户在同一个下载目录里 `sha256sum -c SHA256SUMS` 即可
+          # （不写路径，免得换个目录就整份失效）。
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c --strict SHA256SUMS
+          echo "13 个资产的哈希已写入 SHA256SUMS"
+
+      - name: Sign SHA256SUMS and SBOMs (keyless)
+        if: inputs.sign
+        working-directory: signed_assets
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 签「全部资产的哈希清单」+「依赖声明」：前者让 10 个二进制/包各只需一次间接验证，
+          # 后者是「产物里装了什么」的独立声明。签名数 3，验证成本最低。
+          targets=(
+            "SHA256SUMS"
+            "rstun-${VERSION}-lean.cdx.json"
+            "rstun-${VERSION}-full.cdx.json"
+          )
+          for f in "${targets[@]}"; do
+            [ -f "$f" ] || { echo "::error::待签文件不存在：$f"; exit 1; }
+            cosign sign-blob --yes --bundle "${f}.bundle" "$f"
+          done
+          ls -l ./*.bundle
+          # bundle 必须是「签名 + 证书 + Rekor 证明」的单文件；缺一个也不该发出去。
+          for f in "${targets[@]}"; do
+            [ -s "${f}.bundle" ] || { echo "::error::bundle 为空：${f}.bundle"; exit 1; }
+          done
 
       - name: Create or update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          SIGN: ${{ inputs.sign }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # 八份二进制 + 两份 SBOM + Homebrew formula。zip 数量在「Package assets」里已单独断言
-          # （8 个），这里只保证 SBOM/formula 也进来了 —— 它们缺失不该悄悄发出去。
-          assets=(zipped_assets/*.zip sbom_assets/*.cdx.json dist/homebrew/*.rb deb_assets/*.deb)
-          zips=(zipped_assets/*.zip)
-          debs=(deb_assets/*.deb)
-          # 8 zip（4 平台 × lean/full）+ 2 SBOM + 1 formula + 2 deb（amd64/arm64）= 13
-          if [ "${#zips[@]}" -ne 8 ] || [ "${#debs[@]}" -ne 2 ] || [ "${#assets[@]}" -ne 13 ]; then
-            echo "::error::资产数不对：zip ${#zips[@]}（期望 8）+ deb ${#debs[@]}（期望 2）+ 其它 $(( ${#assets[@]} - ${#zips[@]} - ${#debs[@]} ))（期望 3）"
+          # 13 个核心资产（8 zip + 2 SBOM + formula + 2 deb）恒存在；签名时再加
+          # `SHA256SUMS` + 3 个 `.bundle` = **17**。数量期望按 `sign` 分支写，不写死一个数。
+          assets=(signed_assets/*)
+          zips=(signed_assets/*.zip)
+          debs=(signed_assets/*.deb)
+          expected=13
+          if [ "${SIGN}" = "true" ]; then expected=17; fi
+          if [ "${#zips[@]}" -ne 8 ] || [ "${#debs[@]}" -ne 2 ] || [ "${#assets[@]}" -ne "$expected" ]; then
+            echo "::error::资产数不对（sign=${SIGN}）：zip ${#zips[@]}（期望 8）+ deb ${#debs[@]}（期望 2）+ 其它 $(( ${#assets[@]} - ${#zips[@]} - ${#debs[@]} ))，合计 ${#assets[@]}（期望 ${expected}）"
             printf '  %s\n' "${assets[@]}"
             exit 1
+          fi
+          if [ "${SIGN}" = "true" ]; then
+            for want in \
+              "SHA256SUMS" \
+              "SHA256SUMS.bundle" \
+              "rstun-${VERSION}-lean.cdx.json.bundle" \
+              "rstun-${VERSION}-full.cdx.json.bundle"; do
+              [ -f "signed_assets/${want}" ] || { echo "::error::缺少签名资产 ${want}"; exit 1; }
+            done
+            ( cd signed_assets && sha256sum -c --strict SHA256SUMS )
           fi
           ls -l "${assets[@]}"
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -583,15 +745,21 @@ jobs:
       - name: Summary
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
+          SIGN: ${{ inputs.sign }}
         run: |
           {
             echo "### Release"
             echo ""
             echo "- Release: \`${TAG}\`"
+            if [ "${SIGN}" = "true" ]; then
+              echo "- 签名: cosign keyless（17 个资产 = 13 + \`SHA256SUMS\` + 3 个 \`.bundle\`）；镜像由 \`sign-image\` 签 digest"
+            else
+              echo "- 签名: **未签名**（\`sign=false\` 应急路径）"
+            fi
           } >>"$GITHUB_STEP_SUMMARY"
 
   # crates.io 自动发布（P1）：与 `release` 作业**并行**，互不阻塞 ——
-  #   * 不 `needs: release`：crate 发布失败不该拦住 13 个资产的发布；
+  #   * 不 `needs: release`：crate 发布失败不该拦住 17 个资产的发布；
   #   * 但 `needs: [prepare, build]`：先确认版本合法且四端都编出来了再花掉一次不可撤回的发布；
   #   * 逻辑全在可复用件里（幂等 API 检查 + token 守卫 + `cargo publish --locked`），
   #     演练走它的 `workflow_dispatch`，**不要**为了重试 publish 而重跑整个 release

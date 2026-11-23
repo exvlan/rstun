@@ -15,7 +15,7 @@ name: Publish to crates.io
 # `permissions` 只有 `contents: read` —— 发布凭证是 secret，不是 GITHUB_TOKEN。
 #
 # 失败语义：本 workflow 红只表示「crate 没发出去」，**不撤 Release、不回滚镜像**；
-# 修好后单独 dispatch 补发即可（13 个资产不受影响）。
+# 修好后单独 dispatch 补发即可（Release 资产不受影响）。
 
 on:
   workflow_call:

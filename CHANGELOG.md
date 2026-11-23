@@ -5,6 +5,24 @@
 
 ## Unreleased
 
+### 发布产物 keyless 签名（cosign + OIDC）
+
+- Release 资产新增 `SHA256SUMS`（覆盖 13 个核心产物的裸文件名哈希）与 3 个 cosign bundle
+  （`SHA256SUMS` + lean/full 两份 SBOM），签名时共 **17** 个资产。签清单而不是逐个签二进制：
+  签名数从 10 降到 1，而每个资产的字节仍被清单绑定。**发布产物不再「未签名」**。
+- 容器镜像以**同一身份**对 **manifest list digest** 签名（存为 registry 的 OCI 附件，不增加 Release
+  资产位）；不使用逐平台递归签名 —— 下游固定的就是 index。
+- `release.yml` 新增 `sign` 输入（默认 `true`）与 `id-token: write`；`sign=false` 仅作应急逃生口
+  （不产生清单/bundle，发布说明明示「本版未签名」）。签名失败 = 发布失败（不发「声称已签名」的资产）。
+- **`sign=true` 只允许从 tag ref 触发**：`prepare` 新增 `Require tag ref when signing` 守卫 ——
+  证书身份绑在触发 ref 上（`@refs/tags/rstun-v<version>`），从 `main` dispatch 会得到 `@refs/heads/main`
+  并在说明里写出假身份。手工发版请用 `gh workflow run release.yml --ref rstun-v<version> -f version=…`；
+  要从分支发版必须显式 `-f sign=false`。
+- `post-release-verify` 新增 `require_signature`（默认 `true`）：逐个 `cosign verify-blob` 把证书身份
+  绑定到**本仓 `release.yml` + 该 tag**（issuer = GitHub OIDC），再用 `SHA256SUMS` 校验每个资产的哈希，
+  并 `cosign verify <digest>` 校验镜像签名。回看签名上线前的历史版本传 `false` 只告警。
+- 新增文档页「验证发布产物（cosign keyless）」（`docs/book/src/verify.md`），README 给出可照抄的三条命令。
+
 ### 定时作业可见性（维护者可见）
 
 - 新增 **`schedule-guard`**（每日 06:00 UTC + 每次 push 到 `main` + 手动可调）：检查

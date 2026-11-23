@@ -10,5 +10,6 @@
 - [抗滥用（限速 / 并发 / 反射防护）](rate-limit.md)
 - [TURN（UDP / TCP / `turns:` / DTLS）](turn.md)
 - [容器（Docker）](docker.md)
+- [验证发布产物（cosign）](verify.md)
 - [FAQ](faq.md)
 - [Changelog](changelog.md)

@@ -22,8 +22,9 @@ name: Release prep
 # CHANGELOG 必须已经有 `## Unreleased` 段（发布前把本版条目写进去）。找不到、或该版本
 # 已在 CHANGELOG 里出现（重复发版）→ 失败并说明原因。
 #
-# 逃生口：全部手工路径仍然可用（bump + `gh workflow run release.yml`）。push 到受保护
-# 分支时会被拒绝 —— 这是有意的 fail-fast（改用 PR 流程或临时放开保护）。
+# 逃生口：手工路径仍然可用，但 `sign` 默认 `true` 时必须带 `--ref rstun-v<version>`
+# （bump + `gh workflow run release.yml --ref <tag> -f version=…`；从分支发版需显式 `-f sign=false`）。
+# push 到受保护分支时会被拒绝 —— 这是有意的 fail-fast（改用 PR 流程或临时放开保护）。
 
 on:
   workflow_dispatch:
@@ -351,7 +352,7 @@ jobs:
               echo "- Release: <${GITHUB_SERVER_URL}/${REPO}/releases/tag/${TAG}>"
               echo ""
               echo "下一步：release 跑完后 dispatch **Post-release verify**（version=\`${VERSION}\`），"
-              echo "逐项核对 13 个资产 / deb / tap sha256 / 镜像双架构；crates.io 由 \`publish-crates\` 自动发布（幂等）。"
+              echo "逐项核对资产（13 核心；签名版 17）/ deb / tap sha256 / 镜像双架构 / cosign 签名；crates.io 由 \`publish-crates\` 自动发布（幂等）。"
               echo "若 dispatch 失败而 tag 已存在：**不要**重跑 prep，直接手工"
               echo "\`gh workflow run release.yml --ref ${TAG} -f version=${VERSION}\` 补发。"
               echo ""
