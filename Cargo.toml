@@ -88,7 +88,7 @@ rustls-pemfile = { version = "2.2", optional = true }
 # 依赖树里（`webrtc-dtls` 的传递依赖），提升为直接依赖**不新增 crate**；仅
 # `tls` feature 启用，lean 构建完全不受影响。只解析 DER（不做链验签），
 # `default-features = false` 已无额外特性可关，显式写出来只为表明这一意图。
-x509-parser = { version = "0.16", optional = true, default-features = false }
+x509-parser = { version = "0.18", optional = true, default-features = false }
 # `rustls` 不支持 DTLS；`webrtc-dtls` 是纯 Rust 实现（内置 rcgen/ring 的传递依赖）。
 # `pem` 只用于把 PEM 证书/私钥读成 `Certificate`。
 webrtc-dtls = { version = "0.12", optional = true, features = ["pem"] }
