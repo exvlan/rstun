@@ -383,7 +383,7 @@ Rust 1.95）：
 | 直接依赖 | **10** | **15** | `cargo tree -e normal --depth 1 [--all-features] \| tail -n +2 \| wc -l` |
 | 依赖树行数（含重复的 feature 合并） | 90 | 361 | `cargo tree -e normal [--all-features] \| wc -l` |
 | 唯一 crate 数 | 66 | 213 | `cargo tree -e normal [--all-features] --format '{p}' \| sed 's/^[│├└─ \t]*//' \| sort -u \| wc -l` |
-| release 二进制（未 strip） | **3.92 MB** | **8.15 MB** | `cargo build --release [--features full] && ls -l target/release/rstun` |
+| release 二进制（未 strip） | **3.93 MB** | **8.16 MB** | `cargo build --release [--features full] && ls -l target/release/rstun` |
 | 镜像/发布用的二进制（LTO + strip） | **2.44 MB** | **4.95 MB** | 见 Dockerfile 的 `CARGO_PROFILE_RELEASE_{LTO,CODEGEN_UNITS,STRIP}` |
 
 > 直接依赖是 **unix 口径**：`libc` 在 `[target.'cfg(unix)'.dependencies]` 里（DF 位的

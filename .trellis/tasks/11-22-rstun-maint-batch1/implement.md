@@ -91,3 +91,16 @@ failed items: cert-poll
   （tokio 定时器把超长 deadline 饱和到 far future）。
 - D3：`cert_poll_interval` 在「不传 + 无 secure 监听」返回 `Some(30s)`（值在 `build_turn` 里丢弃），
   保持「默认值」单一来源，避免为校验再写一个分支。
+
+## B 项执行记录（性能快照，2026-11-23）
+
+| 项 | 结果 |
+| --- | --- |
+| 被测二进制 | `26.410.104+a4c38a3`（HEAD，未发版；四个构建均 `--version` 核对）|
+| 依赖面 | lean **10 / 90 行**、full **15 / 361 行** |
+| 体积（未 strip） | **3.93 / 8.16 MB**；LTO+strip **2.44 / 4.95 MB** |
+| 采样 | 56 次运行，busy 窗口 **6.1–12.4%（中位 ≈8%）**，逐次记录在 §8.3 |
+| 关键结论 | UDP p50 0.034–0.035 ms；`TCP connect/首字节 p99` 比 `.103` 文档高 20–53%，**同机 A/B 证明是机器状态**（`.103` 今日重跑 connect p99=0.253，与 `.104` 0.255 一致），不是本轮代码 |
+| 100 k/s | 服务端 `ok=500000`/`dropped=0`；客户端 6 次中 5 次跟得上（前次 0/5）——同属 busy 更低 |
+| 同步 | README / `release.yml` 发布说明 / `docs/book/src/docker.md` 的体积数字改为实测 **3.93 / 8.16 MB** |
+| 门禁 | `check-docs` ✓、`check-version-pins` ✓ |
