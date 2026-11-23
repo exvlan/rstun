@@ -4,7 +4,7 @@ description: Standalone STUN Binding server (RFC 5389; RFC 5780 with alt-listen)
 type: application
 version: 0.1.0
 # 镜像 tag 就是 rstun 的发布版本（见 CHANGELOG）；改镜像不必改 chart 版本。
-appVersion: "26.410.105"
+appVersion: "26.410.106-dev.0"
 kubeVersion: ">=1.24.0-0"
 home: https://github.com/exvlan/rstun
 sources:
