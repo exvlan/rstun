@@ -3,6 +3,18 @@
 版本线**独立于任何宿主项目**：`YY.QMM.Mmpp`（年.季度月.月日+序号），首发 `26.410.100`。
 `rstun-v*` 的 Release tag / 镜像 tag / 资产名都用这里给出的版本号。
 
+## Unreleased
+
+### 修复：预发布版本的发布链路（dev 演练暴露）
+
+- 版本号含 `-` 的 Release 现在会标 **prerelease**（此前 `/releases/latest` 会被 dev 版本占用，
+  Homebrew tap 会同步到预发布）；
+- `deb` 资产文件名统一用 `-`（nfpm 产出 `~`；GitHub 会把资产名里的 `~` 改写成 `.`，
+  导致 `SHA256SUMS` 与实际下载名不一致、用户 `sha256sum -c` 必失败）。包内 Debian `Version`
+  仍是 `~`（预发布排序语义不变）；
+- `post-release-verify` 的 deb 断言接受 Debian 化的 `Version`，并把 cosign 安装提前、
+  镜像签名依赖安装成功（此前失败链会留下 `exit 127` 的假绿步骤）。
+
 ## 26.410.106-dev.0
 
 ### 发布产物 keyless 签名（cosign + OIDC）
