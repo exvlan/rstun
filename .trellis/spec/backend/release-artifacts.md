@@ -24,6 +24,7 @@
 | 发版前只读预检 | `gh workflow run release-preflight.yml -R exvlan/rstun -f version=<x.y.z>`（或 Actions → Release preflight）|
 | 发布后只读验收 | `gh workflow run post-release-verify.yml -R exvlan/rstun -f version=<x.y.z>`（或 Actions → Post-release verify）。**tap 是跨仓异步派生**：刚发布后公式可能还没同步——默认 `require_tap=true` 会把不一致判失败（防漏同步）；只想先看 Release 资产时传 `-f require_tap=false`，tap 同步后**再跑一次**不带该参数 |
 | tap 同步触发 | `gh workflow run sync.yml -R exvlan/homebrew-rstun`（或等每日 05:30 UTC）。同步完成后公式版本应等于本次 release tag |
+| tap 的 CDN 缓存 | `raw.githubusercontent.com` 有 CDN 缓存（实测同步后 2–5 分钟仍返回旧文件，且 `?t=` 查询串破不了）。因此 verify **轮询等待**：`require_tap=true` 时每 30s 重试、最多约 6 分钟；`false` 时只试一次 | 刚同步就验收会假红 |
 | 补发 / 幂等演练 crate | `gh workflow run publish-crates.yml -R exvlan/rstun --ref <ref> -f version=<version>`（**必须 `--ref`**：workflow 断言「输入 == 检出树的 `Cargo.toml` version」；默认分支在下一版 bump 后已不等于历史版本。**ref 选择**：版本发布时该 tag 里必须有此 workflow 文件 → `rstun-v26.410.104` 及更早的 tag **没有**（本 workflow 于 2026-11-22 才落地），这类历史版本只能用 `--ref main` 且要求 main 的 `Cargo.toml` 仍等于该版本；下一个版本起的 tag 可用 `--ref rstun-v<version>`。**不要**为此重跑 `release.yml`：会重建镜像、改 digest）|
 | 核对 crate | `curl -s -o /dev/null -w '%{http_code}\n' -A 'rstun-release/1.0' https://crates.io/api/v1/crates/rstun/<x.y.z>`（200=已发布，404=未发布）|
 | 版本钉死点（6 处）| `bash script/ci/check-version-pins.sh [--version <x.y.z>]` |

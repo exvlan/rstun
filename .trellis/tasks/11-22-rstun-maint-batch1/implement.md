@@ -127,3 +127,10 @@ failed items: cert-poll
    实测：同一 URL 在 `03:33` 读到 `.104`，`03:36` 读到 `.105`。
 
 两项修复后重跑 `post-release-verify`（默认 `require_tap=true`）应全绿。
+
+### verify 的 tap 检查最终形态（第三次修正）
+
+- 第一次：`gh api` 匿名 → gh 无登录态直接拒绝（exit 4）；
+- 第二次：`curl raw` + `?t=` cache-bust → **对 GitHub raw CDN 无效**（实测 03:34 仍拿到 `.104`）；
+- 最终：**轮询等待**——`require_tap=true` 每 30s 重试、最多 12 次（~6 分钟）；
+  `require_tap=false` 只试一次（优先验收 Release 资产）。spec 已记录该缓存事实。
