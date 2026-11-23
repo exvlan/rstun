@@ -20,6 +20,13 @@ on:
         description: "已发布的版本号（不带 v，例如 26.410.104）"
         required: true
         type: string
+      require_tap:
+        description: >-
+          是否把「Homebrew tap 公式」当作硬失败（默认 true）。
+          刚发布后 tap 还没同步时，可传 false 只看 Release 资产；同步后再跑一次不带该参数。
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -344,12 +351,23 @@ jobs:
           DEB: ${{ steps.deb.outcome || 'skipped' }}
           FORMULA: ${{ steps.formula.outcome || 'skipped' }}
           IMAGE: ${{ steps.image.outcome || 'skipped' }}
+          REQUIRE_TAP: ${{ inputs.require_tap }}
         run: |
           set -euo pipefail
           verdict=PASS
-          for outcome in "$ASSETS" "$DOWNLOAD" "$ARCH" "$VERSION_CHECK" "$DEB" "$FORMULA" "$IMAGE"; do
+          for outcome in "$ASSETS" "$DOWNLOAD" "$ARCH" "$VERSION_CHECK" "$DEB" "$IMAGE"; do
             [ "$outcome" = success ] || verdict=FAIL
           done
+          # tap 是**跨仓、异步**同步的派生产物：刚发布后它可能还没跟上。
+          # 默认仍把不一致当失败（防漏同步），但允许 require_tap=false 只看 Release 资产。
+          formula_state="$FORMULA"
+          if [ "$FORMULA" != success ]; then
+            if [ "${REQUIRE_TAP:-true}" = "true" ]; then
+              verdict=FAIL
+            else
+              formula_state="warn（tap 尚未同步；同步后重跑本 workflow）"
+            fi
+          fi
           {
             echo "## Post-release verify —— \`${VERSION}\`"
             echo ""
@@ -360,7 +378,7 @@ jobs:
             echo "| 2. 四平台 zip 架构 | ${ARCH} |"
             echo "| 3. --version 与 tag 提交 sha6 | ${VERSION_CHECK} |"
             echo "| 4. deb 元数据 + 二进制 --version | ${DEB} |"
-            echo "| 5. tap formula 类体 + 3 个 sha256 | ${FORMULA} |"
+            echo "| 5. tap formula 类体 + 3 个 sha256 | ${formula_state} |"
             echo "| 6. 镜像双架构 manifest | ${IMAGE} |"
             echo "| **结论** | **${verdict}** |"
           } >>"$GITHUB_STEP_SUMMARY"

@@ -18,11 +18,12 @@
 
 | 动作 | 命令 |
 | --- | --- |
-| 标准发版顺序 | **preflight（只读）→ release-prep（bump+commit+tag+dispatch）→ release（资产/镜像/crate 并行）→ post-release-verify（只读）** |
+| 标准发版顺序 | **preflight（只读）→ release-prep（bump+commit+tag+dispatch）→ release（资产/镜像/crate 并行）→ tap 同步（触发或等每日 05:30）→ post-release-verify（只读）** |
 | 触发发布 | `gh workflow run release.yml -R exvlan/rstun -f version=<x.y.z>` |
 | 一键 bump + tag + 触发 | `gh workflow run release-prep.yml -R exvlan/rstun -f version=<x.y.z> -f dry_run=false`（**默认 `dry_run=true` 只预演**）|
 | 发版前只读预检 | `gh workflow run release-preflight.yml -R exvlan/rstun -f version=<x.y.z>`（或 Actions → Release preflight）|
-| 发布后只读验收 | `gh workflow run post-release-verify.yml -R exvlan/rstun -f version=<x.y.z>`（或 Actions → Post-release verify）|
+| 发布后只读验收 | `gh workflow run post-release-verify.yml -R exvlan/rstun -f version=<x.y.z>`（或 Actions → Post-release verify）。**tap 是跨仓异步派生**：刚发布后公式可能还没同步——默认 `require_tap=true` 会把不一致判失败（防漏同步）；只想先看 Release 资产时传 `-f require_tap=false`，tap 同步后**再跑一次**不带该参数 |
+| tap 同步触发 | `gh workflow run sync.yml -R exvlan/homebrew-rstun`（或等每日 05:30 UTC）。同步完成后公式版本应等于本次 release tag |
 | 补发 / 幂等演练 crate | `gh workflow run publish-crates.yml -R exvlan/rstun --ref <ref> -f version=<version>`（**必须 `--ref`**：workflow 断言「输入 == 检出树的 `Cargo.toml` version」；默认分支在下一版 bump 后已不等于历史版本。**ref 选择**：版本发布时该 tag 里必须有此 workflow 文件 → `rstun-v26.410.104` 及更早的 tag **没有**（本 workflow 于 2026-11-22 才落地），这类历史版本只能用 `--ref main` 且要求 main 的 `Cargo.toml` 仍等于该版本；下一个版本起的 tag 可用 `--ref rstun-v<version>`。**不要**为此重跑 `release.yml`：会重建镜像、改 digest）|
 | 核对 crate | `curl -s -o /dev/null -w '%{http_code}\n' -A 'rstun-release/1.0' https://crates.io/api/v1/crates/rstun/<x.y.z>`（200=已发布，404=未发布）|
 | 版本钉死点（6 处）| `bash script/ci/check-version-pins.sh [--version <x.y.z>]` |
@@ -48,7 +49,7 @@
 | 动态链接 | linux 目标为 static-pie（musl）| 依赖宿主 glibc 版本 |
 | full 构建的 C 工具链 | Linux musl 目标必须装 `musl-tools` 且设 `CC_<triple>=musl-gcc`（full 的 `ring` 含 C 代码）| `cc-rs: failed to find <triple>-musl-gcc`，构建 exit 101 |
 | 发版前预检 | **发布前必须 `release-preflight.yml` 全绿**（pins / tests+clippy+fmt / interop all / TURN lean+full（含 frozen）/ SBOM / deb / brew 渲染 / `cargo publish --dry-run`）；只读、无 secret | 发版当天才发现打包或协议回归 |
-| 发布后验收 | **发布后必须 `post-release-verify.yml` 全绿**：13 资产命名、四平台 zip 架构、`--version` 含 `<version>` 且 `+sha6` == tag 指向提交、两个 deb 的 Version/Architecture、tap formula 类体 + 3 个 sha256、镜像 amd64+arm64 manifest；只读，`packages: read` 只为私有 ghcr 登录 | 「流水线绿了但用户下载到坏资产」 |
+| 发布后验收 | **发布后必须 `post-release-verify.yml` 全绿**（tap 同步之后）：13 资产命名、四平台 zip 架构、`--version` 含 `<version>` 且 `+sha6` == tag 指向提交、两个 deb 的 Version/Architecture、tap formula 类体 + 3 个 sha256、镜像 amd64+arm64 manifest；只读，`packages: read` 只为私有 ghcr 登录 | 「流水线绿了但用户下载到坏资产」 |
 | 版本钉死点 | `Cargo.toml` 的 `version` 必须同时等于 6 处：README「已发布」、`docs/book/src/docker.md`、`contrib/k8s/deployment.yaml`、`contrib/docker/compose.yaml`、`contrib/helm/{Chart,values}.yaml`；`script/ci/check-version-pins.sh`（CI `version-pins` 作业）守 | 文档说 A、镜像示例说 B（拉镜像 404）|
 | crate 打包预检 | CI `packaging` 作业：`cargo package --list` 断言不含 `fuzz/` `tests/` `.github/` `.trellis/` `.env`，版本与 `cargo metadata --locked` 一致，且 `cargo publish --dry-run` 通过 | 发版时才发现 crate 包混进夹具/密钥 |
 | 发版流程顺序 | **先 `release-preflight` 全绿，再 `release-prep`（默认 `dry_run=true` 看 diff），最后 `release`**；跳过 preflight 直接 prep = 把「打包/协议回归」发现时间推到 crates.io 已发布之后（crate 不可删除）| crates.io 上留下一个坏版本（只能 yank）|
