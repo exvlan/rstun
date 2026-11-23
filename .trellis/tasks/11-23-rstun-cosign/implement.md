@@ -90,3 +90,37 @@ git status --short; git diff --stat
 ## 回滚
 
 单 commit；revert 后资产数回 13、verify 去掉签名步骤与 `require_signature`。
+
+## dev 演练（26.410.106-dev.0）发现并修复的缺陷
+
+### 已确认可用的部分（真实 keyless）
+
+- release run `45189777328`：17 资产、`Sign container image` 成功、自动 publish 成功；
+- 本地 cosign v3.1.4 对真实 bundle 验证：
+  - 正确身份 `…release.yml@refs/tags/rstun-v26.410.106-dev.0` → **`Verified OK`**；
+  - 错误身份 `refs/heads/main` → 失败并打印实际 SAN（身份绑定有效）；
+  - 两份 SBOM bundle 同样 `Verified OK`。
+
+### 缺陷 1：dev Release 未标 prerelease
+
+`gh release create` 没有 `--prerelease` → `releases/latest` 指向 dev 版本，
+tap 次日 05:30 会把 formula 同步成 dev。修：版本含 `-` 时 `--prerelease`（create 与已存在时的 edit 都加）。
+
+### 缺陷 2：verify 的 deb 期望名未考虑 Debian 规范化
+
+nfpm 把预发布版本写成 `rstun_26.410.106~dev.0_amd64.deb`；verify 期望 `-` 形式 → 「缺少资产」，
+后续步骤被跳过（并因 cosign 未装出现 `exit 127`）。修：
+- `build-deb.sh` 产出后把文件名 `~` → `-`（与版本串一致；稳定版无影响）；
+- verify 的包内 `Version:` 允许 `$VERSION` 或 `${VERSION//-/\~}`；
+- `Install cosign` 提前、镜像签名步骤依赖 cosign 安装成功；
+- `signed_assets/` 断言文件名不含 `~`（GitHub 会把 `~` 改写为 `.`）。
+
+### 缺陷 3：GitHub 改写资产名（`~` → `.`）
+
+实测 Release 资产名 `rstun_26.410.106.dev.0_amd64.deb`，而 nfpm 本地名是 `~` 形式 →
+`SHA256SUMS` 与实际下载名不一致，用户 `sha256sum -c` 必失败。与缺陷 2 同一修法（统一文件名）。
+
+### 重新演练计划
+
+修复合入后，用 `26.410.106-dev.1` 重新走 prep → release（新 tag 里包含修复后的 workflow）→ verify；
+随后把 dev.0/dev.1 标 prerelease 并 `cargo yank`。
