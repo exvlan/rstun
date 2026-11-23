@@ -13,7 +13,7 @@
 
 services:
   rstun:
-    image: ghcr.io/exvlan/rstun:26.410.105
+    image: ghcr.io/exvlan/rstun:26.410.106-dev.0
     container_name: rstun
     network_mode: host
     restart: unless-stopped
