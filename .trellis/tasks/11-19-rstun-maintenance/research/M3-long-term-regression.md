@@ -40,3 +40,29 @@ run [45021337538](https://github.com/exvlan/rstun/actions/runs/45021337538) — 
 M3 的「发布前矩阵全绿 + fuzz 10 分钟无崩溃」已有**可复现 run ID**，且两条由 workflow 自动执行
 （无需人工跑）。维护任务继续保持 `in_progress` 到观察期结束（约 2026-12-05），期间观察：
 周度 `qa-scheduled`（周一 04:00 UTC）与 `verify-platforms`（周四 06:00 UTC）的红绿与 flaky。
+
+## 2026-11-23 观察补充：`event=schedule` **从未触发**
+
+盘点时发现：
+
+```
+$ gh api "repos/exvlan/rstun/actions/runs?event=schedule" --jq .total_count
+0
+```
+
+- 仓库非 fork、`actions.enabled=true`、`allowed_actions=all`、`main` 持续推送、两个 workflow 均 `active`；
+- 但 2026-11-23 04:00 UTC 的 `qa-scheduled` 定时 run **没有出现**（首个周一）。
+- 结论：配置侧正常，最可能是平台调度未触发；已建任务 `11-23-rstun-schedule-guard`
+  加守卫（push+cron 双触发 → 停滞即建 issue），把「静默不跑」变成可见。
+
+**手动补跑（本周证据）**：`gh workflow run qa-scheduled.yml` → run
+[45159067628](https://github.com/exvlan/rstun/actions/runs/45159067628) **completed/success**：
+
+```
+interop matrix (container: buildpack-deps:trixie + coturn + go 1.24)  success
+fuzz (parse, 600s)                                                   success
+bench smoke (numbers only)                                           success
+```
+
+> 注意：手动 dispatch 产生的是 `workflow_dispatch`，**不会**让守卫的 staleness 告警消失
+> （守卫只认 `event=schedule`）。M3 的归档条件因此顺延到「真实周度 run 恢复」或人工确认长期手动补跑。
