@@ -27,3 +27,21 @@
 - 手动 `gh workflow run` **不会**消除告警（产生的是 `workflow_dispatch`，不是 `event=schedule`）；
 - `release-prep` 用 `GITHUB_TOKEN` push，**不会再触发** workflow（避免 bot commit 自我循环）；
 - 当前事实：`event=schedule` 全仓 0 次 → 守卫上线后会对两个周度作业各建一条 issue，属预期。
+
+## 端到端验收（2026-11-23）
+
+合入推送（`8e8aa0d`）本身触发守卫（`push` 通道）—— run
+[45161546250](https://github.com/exvlan/rstun/actions/runs/45161546250) **completed/success**：
+
+```
+Detect stale schedules            success
+Reconcile issues                  success
+Fail when stale (dry run only)    skipped
+```
+
+结果：建了两条 issue（如实反映 `event=schedule` 为 0）：
+
+- #9 `[schedule-guard] QA scheduled 的定时运行已停滞`
+- #10 `[schedule-guard] Verify platforms 的定时运行已停滞`
+
+即「静默失效」已经变成仓库里可见的待办。
