@@ -45,3 +45,20 @@ Fail when stale (dry run only)    skipped
 - #10 `[schedule-guard] Verify platforms 的定时运行已停滞`
 
 即「静默失效」已经变成仓库里可见的待办。
+
+## 去重与 dry_run 二次验证
+
+| 场景 | 证据 |
+| --- | --- |
+| 第二次 push（docs 提交 `e6533cf`）| 守卫再次运行，issue 数**仍为 2**（#9/#10），未重复创建 |
+| `dry_run=true` 手动 dispatch | run [45161682915](https://github.com/exvlan/rstun/actions/runs/45161682915) **failure**（设计如此：stale → exit 1）、`Reconcile issues` **skipped**、issue 数仍 2 → 演练不写任何东西且证明检测有效 |
+| `never` 语义 | 0 次 `event=schedule` 恒为 stale（`max_age_days` 调大也不能「模拟恢复」）——恢复路径只能在真实 schedule run 出现后验证，逻辑已由 gh 桩覆盖（评论+关闭） |
+
+## 验收对照
+
+- [x] 当前 0 次 → 建 issue（#9/#10）
+- [x] 去重（重复 push / 重复 dispatch 不新增）
+- [x] `dry_run` 不写 + stale 时 exit 1
+- [x] `push` 到 main 会触发（不依赖 cron）
+- [x] 文档/spec/CHANGELOG 同步，`check-docs` 通过
+- [ ] 「新鲜 schedule run → 不建 issue / 自动关闭」：待在真实定时恢复后自然验证（无法用阈值模拟，因为 never 恒 stale）
