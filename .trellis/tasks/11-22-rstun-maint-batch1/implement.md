@@ -104,3 +104,26 @@ failed items: cert-poll
 | 100 k/s | 服务端 `ok=500000`/`dropped=0`；客户端 6 次中 5 次跟得上（前次 0/5）——同属 busy 更低 |
 | 同步 | README / `release.yml` 发布说明 / `docs/book/src/docker.md` 的体积数字改为实测 **3.93 / 8.16 MB** |
 | 门禁 | `check-docs` ✓、`check-version-pins` ✓ |
+
+## 发版执行记录（26.410.105，首次全自动链路）
+
+| 环节 | 结果 |
+| --- | --- |
+| `release-prep`（dry_run=true）| ✅ run `45106036585`：bump/CHANGELOG/钉死点/Preview 全绿，写步骤 skipped |
+| `release-prep`（真跑）| ✅ run `45106124057`：commit `27bf657`、tag `rstun-v26.410.105`、dispatch release |
+| `release` | ✅ run `45106154370` 12/12，**含自动 `cargo publish`**（`Publish to crates.io` success）|
+| Release 资产 | ✅ 13（8 zip + 2 SBOM + rb + 2 deb）|
+| crates.io | ✅ API 200（`/crates/rstun/26.410.105`）|
+| 镜像 | ✅ `ghcr.io/exvlan/rstun:26.410.105`，digest `sha256:8882b71cd08b0d1afede0010551ae358d7a0bdcbd78ec84d92023484b06f888c` |
+| tap 同步 | ✅ run `45106530105` → formula `26.410.105`（commit `1e49199`）|
+
+### 发布后验收暴露的两个缺陷（已修）
+
+1. **tap 是跨仓异步派生**：`post-release-verify` 默认把「tap 未同步」判失败 →
+   刚发布后必然红。修：新增 `require_tap`（默认 `true` 仍防漏同步；`-f require_tap=false`
+   可先只看 Release 资产），spec 的标准顺序补上「tap 同步」这一步（`1f07e20`）。
+2. **raw.githubusercontent 有 CDN 缓存**：同步完成后数分钟内仍可能读到旧公式 → 假红。
+   修：raw URL 加 `?t=$(date +%s)` cache-bust（`e00db89`）。
+   实测：同一 URL 在 `03:33` 读到 `.104`，`03:36` 读到 `.105`。
+
+两项修复后重跑 `post-release-verify`（默认 `require_tap=true`）应全绿。
