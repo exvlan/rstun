@@ -134,3 +134,19 @@ failed items: cert-poll
 - 第二次：`curl raw` + `?t=` cache-bust → **对 GitHub raw CDN 无效**（实测 03:34 仍拿到 `.104`）；
 - 最终：**轮询等待**——`require_tap=true` 每 30s 重试、最多 12 次（~6 分钟）；
   `require_tap=false` 只试一次（优先验收 Release 资产）。spec 已记录该缓存事实。
+
+### 发布后验收（终态）
+
+run [45106869018](https://github.com/exvlan/rstun/actions/runs/45106869018) **completed/success**，`verdict=PASS`：
+
+```
+Assert release assets (13)              success
+Verify binary architectures (4 zips)    success
+Verify --version and tag commit         success
+Verify Debian packages                  success
+Verify tap formula (class body + sha256) success   ← 轮询等到 tap 同步
+Verify container image (multi-arch)     success
+Summary                                 success
+```
+
+至此 `26.410.105` 的三条分发渠道（crates.io / Release / 镜像）与 tap 派生全部由自动化核对完成。
