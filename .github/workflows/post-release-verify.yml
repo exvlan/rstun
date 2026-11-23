@@ -221,6 +221,8 @@ jobs:
         id: formula
         continue-on-error: true
         if: steps.download.outcome == 'success'
+        env:
+          REQUIRE_TAP: ${{ inputs.require_tap }}
         run: |
           set -euo pipefail
           # tap 是**另一个仓库**，这里必须用**匿名 curl 读 raw 端点**：
@@ -230,12 +232,30 @@ jobs:
           #   * 本仓的 `GITHUB_TOKEN` 是 App token，权限只覆盖本仓，跨仓读会 404。
           # raw.githubusercontent.com 匿名可读、无限流焦虑、内容就是文件原文（实测 200）。
           # 失败必须显式红，不能静默跳过（PRD 要求该步真跑）。
-          # raw.githubusercontent 有 CDN 缓存（同步后数分钟内可能仍拿到旧文件），
-          # 用时间戳查询串做 cache-bust；否则「刚同步完立刻验收」会假红。
-          if ! curl -fsSL \
-            "https://raw.githubusercontent.com/exvlan/homebrew-rstun/main/Formula/rstun.rb?t=$(date +%s)" \
-            >dist/tap-rstun.rb; then
-            echo "::error::取不到 tap 的 Formula/rstun.rb（raw.githubusercontent.com 失败：网络/路径/分支变了？）"
+          # raw.githubusercontent 有 **CDN 缓存**（实测同步后 2–5 分钟内仍返回旧文件，
+          # 且 `?t=` 查询串**不能**破缓存）。所以这里改为**轮询等待**：
+          #   * require_tap=true（默认）：每 30s 重试一次，最多约 6 分钟；
+          #   * require_tap=false：只试一次（不阻塞 Release 资产验收）。
+          attempts=1
+          if [ "${REQUIRE_TAP:-true}" = "true" ]; then
+            attempts=12
+          fi
+          synced=0
+          for i in $(seq 1 "$attempts"); do
+            if curl -fsSL \
+              "https://raw.githubusercontent.com/exvlan/homebrew-rstun/main/Formula/rstun.rb?t=$(date +%s%N)" \
+              >dist/tap-rstun.rb 2>/dev/null \
+              && grep -qE "^  version \"${VERSION}\"" dist/tap-rstun.rb; then
+              synced=1
+              break
+            fi
+            if [ "$i" -lt "$attempts" ]; then
+              echo "tap formula 还不是 ${VERSION}（$i/$attempts，CDN 缓存或尚未同步），30s 后重试…"
+              sleep 30
+            fi
+          done
+          if [ "$synced" != 1 ]; then
+            echo "::error::tap 的 formula 仍不是 ${VERSION}：先 \`gh workflow run sync.yml -R exvlan/homebrew-rstun\`（或等每日 05:30 UTC），稍后重跑；只想验 Release 资产可传 require_tap=false"
             exit 1
           fi
           echo "tap formula 首行：$(head -n1 dist/tap-rstun.rb)"
