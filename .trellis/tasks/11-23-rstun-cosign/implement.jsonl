@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/release-artifacts.md", "reason": "Release 资产口径（13→16）、签名契约与失败策略"}
+{"file": ".trellis/spec/backend/distribution.md", "reason": "下游消费方（brew/deb）与资产命名"}
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "门禁与发布前契约"}
