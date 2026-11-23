@@ -137,7 +137,7 @@
 | TLS | `--turn-tls-listen` + `--tls-cert`/`--tls-key`；材料在**启动时**解析，缺失/不可读/不配对 → exit 1（**不降级明文**）；TLS 与明文**不共用端口**；握手 **5s** 超时，失败计数（退出日志 `handshake_failed`），日志不含证书内容 |
 | DTLS | `--turn-dtls-listen` + 同材料；DTLS **1.2**（`webrtc-dtls`）；**一个 datagram = 一个 STUN/TURN 消息或一个 `ChannelData`**（无 4 字节对齐）；5 元组 client transport = `ClientTransport::Dtls`；握手在每客户端任务里（5s），不阻塞 accept |
 | DTLS 私钥 | 必须 PKCS#8 + **ECDSA P-256 / Ed25519**（`webrtc-dtls` 的硬限制）；启动时明确报错，不得静默跳过 DTLS |
-| **证书热加载** | `SIGHUP`（`cfg(unix)`，独立任务，不塞进 `wait_for_shutdown`）+ **30s 轮询**（`(mtime,len)` 去重，Windows 唯一路径）共用同一个 `reload`，该 reload **必须**调用 `load_secure_material`（不得另写校验）；成功后**一次** `Arc` swap 整个 `SharedMaterial`（TLS `Arc<ServerConfig>` + DTLS `Config`），TLS/DTLS 同时生效；失败后 1s 重试一次，两次都失败才计 failed 并保留旧材料；SIGHUP 立即重试，轮询只在 `(mtime,len)` 变化时解析。**生效范围**：新连接/新 DTLS 会话用新材料，已建立会话持旧材料（无重协商）；路径不可运行期修改。日志含路径与 mtime/notAfter，不含私钥 |
+| **证书热加载** | `SIGHUP`（`cfg(unix)`，独立任务，不塞进 `wait_for_shutdown`）+ **文件轮询**（`(mtime,len)` 去重；间隔由 `--tls-cert-poll <秒>` 决定：**默认 30s**、`0` = **不启动轮询**、只认 `SIGHUP`、其它正整数 = 该间隔；Windows 无 `SIGHUP` ⇒ 轮询是唯一触发，`0` **启动即拒绝**）共用同一个 `reload`，该 reload **必须**调用 `load_secure_material`（不得另写校验）；成功后**一次** `Arc` swap 整个 `SharedMaterial`（TLS `Arc<ServerConfig>` + DTLS `Config`），TLS/DTLS 同时生效；失败后 1s 重试一次，两次都失败才计 failed 并保留旧材料；SIGHUP 立即重试，轮询只在 `(mtime,len)` 变化时解析。`--tls-cert-poll` 属 secure-material 组：给了却没有 `--turn-tls-listen`/`--turn-dtls-listen` → 启动失败；lean 构建给出 → `` `tls` feature `` 错误。**启动时**打一行 `rstun: certificate reloader started poll=Some(30s)|None`（即 `?setup.poll` 的原值；SIGHUP 注册失败时按 `poll` 分支：`Some` → warn「falls back to polling」，`None` → error「不再自动轮换」），lab 用它断言 `0` 真的没装定时器（只等 4s 抓不到 30s 定时器的变异体：`setup.poll.or(Some(30s))` 必须让 `poll=None` 断言变红）。**生效范围**：新连接/新 DTLS 会话用新材料，已建立会话持旧材料（无重协商）；路径不可运行期修改。日志含路径与 mtime/notAfter，不含私钥 |
 | **材料校验范围** | DTLS 的密钥规则**只在该次启动真的配了 `--turn-dtls-listen` 时**才应用。只开 `--turn-tls-listen` 时 RSA 证书必须被接受（Let's Encrypt 的默认形态）；`--features tls`（无 dtls）单独构建同理。反例：同时配 DTLS 监听 + RSA → 启动失败（热载沿用同一 `needs_dtls`）|
 | TLS 5 元组 | 与明文 TCP 相同（`ClientTransport::Tcp`）；区分靠监听端口 |
 | REST | `--rest-secret`；`username=<expiry>:<label>`（按**第一个** `:` 切分，label 可含 `:`）、`password=base64(HMAC-SHA1(secret, username))`（**标准 base64，带 padding**）；过期 → **401**（不是 438）；错 secret → 401；**REST 优先于用户表**（能解出时间戳即不查表）；`--rest-secret` 需要 `--realm` + `--auth-secret`，可以没有静态用户 |
@@ -163,13 +163,20 @@
    同一份 RSA 材料再开 `--turn-dtls-listen` → 启动失败。
 9. **lean 构建拒绝 secure flag**：`--turn-tls-listen` → 错误含 `` `tls` feature ``；
    `--turn-dtls-listen` → 错误含 `` `dtls` feature ``（`#[cfg(not(feature = …))]` 单测）。
-10. **脚本**：`rstun-turn.sh` 默认用 lean 构建，`tls`/`dtls`/`cert-reload` 项记 SKIP 并说明；
-   `--tls`/`--dtls`（或 `--only tls|dtls|cert-reload|coturn`）自动 `--features full` 构建；
+10. **脚本**：`rstun-turn.sh` 默认用 lean 构建，`tls`/`dtls`/`cert-reload`/`cert-poll` 项记 SKIP 并说明；
+   `--tls`/`--dtls`（或 `--only tls|dtls|cert-reload|cert-poll|coturn`）自动 `--features full` 构建；
    `--no-build` 时探测二进制是否带 feature（读启动错误里的 feature 名，不猜）。
 11. **热载成功**：`reload_swaps_atomically_and_keeps_the_old_material_on_failure`
    （成功换 `Arc`、失败保持同一 `Arc` 且只计一次 failed）；
    `material_stamp_tracks_rewrites_and_missing_files`（`(mtime,len)` 去重、缺文件返回 None）；
    lab `cert-reload` 项：SIGHUP 后 TLS 与 DTLS 新连接指纹同时变化、轮询路径换第三张证书。
+11a. **`--tls-cert-poll`**：`cert_poll_interval_defaults_to_30s_and_can_be_disabled`
+   （不传 → `Some(30s)`；`0` → `None`，即不 spawn 轮询；`2` → `Some(2s)`）；
+   `cert_poll_needs_a_secure_listener_and_a_signal_source`（无 secure 监听 → 错误；
+   `has_sighup=false` + `0` → 错误且文案含 `SIGHUP`；Windows 下正整数值仍可用）；
+   `tls_cert_poll_needs_a_secure_listener`（`build_turn` 两条负例 + 有监听时接受 0/2）；
+   lab `cert-poll` 项：无监听 + flag → 启动失败、`0` 下改文件 4s 不重载而 `SIGHUP` 重载、
+   `2s` 下改文件约 2s 内重载。
 12. **坏材料**：不配对 / 截断 / 非 PKCS#8 / RSA（DTLS 监听下）→ 旧证书继续服务、
    `reload_total{result="failed"}` 增长、进程存活（单测两条 + lab 的坏密钥对一段）。
 13. **到期 gauge**：`load_reads_the_leaf_not_after`、`secure_stats_expiry_follows_the_clock_and_marks_unknown_as_minus_one`；

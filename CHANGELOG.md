@@ -5,6 +5,20 @@
 
 ## Unreleased
 
+### TURN：证书轮询可关闭 / 可调（`--tls-cert-poll`）
+
+- 新增 `--tls-cert-poll <SECONDS>`：默认 **30**（不传时与 .104 逐行为一致）；`0` = **不启动
+  轮询任务**，只认 `SIGHUP`；其它正整数 = 轮询间隔（秒）。只用信号轮换的部署（例如侧车写完
+  两张文件再发信号）不再在「先写 cert 后写 key」的窗口里收到一次
+  `reload_total{result="failed"}` 噪音。
+- **半配置仍拒绝启动**：给了该 flag 却没有 `--turn-tls-listen`/`--turn-dtls-listen` →
+  启动失败（与 `--tls-cert`/`--tls-key` 同一条规则）；lean 构建给出它同样以
+  `` `tls` feature `` 拒绝。Windows 没有 `SIGHUP`，轮询是唯一触发，因此 `0` 启动即被拒绝。
+- `RSTUN_TLS_CERT_POLL` 同步映射；指标不变（`rstun_turn_tls_reload_total` /
+  `rstun_turn_tls_cert_expires_seconds`）。
+- lab 新增 `cert-poll` 项：无 secure 监听 + flag → 拒绝启动；`0` 下改文件 4s **不**重载而
+  `SIGHUP` 重载；`2s` 下改文件约 2s 内重载。
+
 ### 发布与回归自动化（维护者可见）
 
 - **发版前预检 `release-preflight`**（只读）：版本钉死点、测试/clippy/fmt、interop 矩阵、

@@ -19,7 +19,8 @@
 RFC 8489 §9.2 的 SHA256/USERHASH，**默认关闭**）+ **可选的 RFC 8656 中继**
 （`--turn`，**默认关闭、缺长期凭据拒绝启动**）：UDP / TCP 客户端传输、`turns:`（TLS）、
 DTLS 1.2、TURN REST 临时凭据（coturn `use-auth-secret`）、每 allocation 带宽配额、
-**证书热加载**（`SIGHUP` 或 30s 文件轮询，不重启、不中断监听）。
+**证书热加载**（`SIGHUP` 或文件轮询：默认 30s，`--tls-cert-poll` 可调、`0` = 只认 `SIGHUP`；
+不重启、不中断监听）。
 RFC 6062 的**出站** TCP allocation（`--turn-tcp-relay`，默认关）也支持：`Allocate` +
 `Connect` + `ConnectionBind`，中继数据是裸 TCP 字节。**不做**：RFC 6062 的被动模式
 （`ConnectionAttempt`）、ACME/OCSP、租户/数据库/配置文件。需要这些时请用 coturn。
@@ -82,14 +83,15 @@ cargo build --release --features full    # full：再加 turns:(TLS) 与 DTLS 1.
 **不带 feature 时**给 `--turn-tls-listen` / `--turn-dtls-listen` 会明确拒绝启动：
 
 ```
-ERROR rstun: invalid TURN configuration --turn-tls-listen / --tls-cert / --tls-key need a build
-with the `tls` feature (cargo build --features tls,dtls)
+ERROR rstun: invalid TURN configuration --turn-tls-listen / --tls-cert / --tls-key / --tls-cert-poll
+need a build with the `tls` feature (cargo build --features tls,dtls)
 ```
 
 证书轮换**不用重启**：把 `--tls-cert`/`--tls-key` 原地覆盖成新文件，然后
-`kill -HUP <pid>`（Linux/macOS，新连接立即生效）。Windows 或不想发信号时，30 秒轮询会
-自动发现 `(mtime,len)` 变化（最坏 30s 生效）。坏材料（不配对/RSA 非 DTLS/非 PKCS#8/截断）
-会被拒绝并保留旧证书，计数见 `rstun_turn_tls_reload_total{result="failed"}`。
+`kill -HUP <pid>`（Linux/macOS，新连接立即生效）。Windows 或不想发信号时，文件轮询会
+自动发现 `(mtime,len)` 变化（默认 30 秒一次，`--tls-cert-poll <秒>` 可调；`--tls-cert-poll 0`
+= 关掉轮询、只认 `SIGHUP`，Windows 上该值会被拒绝）。坏材料（不配对/RSA 非 DTLS/非 PKCS#8/
+截断）会被拒绝并保留旧证书，计数见 `rstun_turn_tls_reload_total{result="failed"}`。
 
 安装（`cargo install` 装的是 **lean**；要 `turns:`/DTLS 请 `--features full`）：
 ```bash
@@ -420,8 +422,8 @@ full = ["tls", "dtls"]
 
 - **lean 构建里没有 TLS/DTLS 代码**（`#[cfg(feature = ...)]`），也不链接那 5 个 crate 与
   它们带来的 ~136 个传递 crate（65 → 201）。`--turn-tls-listen` / `--turn-dtls-listen` /
-  `--tls-cert` / `--tls-key` **仍然出现在 `--help`**（帮助文本不随构建变化），但给了就
-  **拒绝启动**并说明缺哪个 feature。
+  `--tls-cert` / `--tls-key` / `--tls-cert-poll` **仍然出现在 `--help`**（帮助文本不随构建
+  变化），但给了就 **拒绝启动**并说明缺哪个 feature。
 - `--rest-secret` 与 `--turn-bandwidth` **不 gate**：它们与传输无关，lean 构建的
   UDP/TCP TURN 一样能用。
 - `webrtc-util` 是 `webrtc-dtls` 已有的同版本依赖，只是从传递依赖提升为直接依赖

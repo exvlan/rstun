@@ -1111,6 +1111,7 @@ const ENV_FLAGS: &[(&str, EnvKind)] = &[
     ("turn_dtls_listen", EnvKind::List),
     ("tls_cert", EnvKind::Value),
     ("tls_key", EnvKind::Value),
+    ("tls_cert_poll", EnvKind::Value),
     ("rest_secret", EnvKind::Value),
     ("turn_bandwidth", EnvKind::Value),
 ];
@@ -1276,6 +1277,7 @@ fn overlay(args: &mut Args, from_env: &mut Args, matches: &ArgMatches) {
         turn_dtls_listen,
         tls_cert,
         tls_key,
+        tls_cert_poll,
         rest_secret,
         turn_bandwidth,
     );

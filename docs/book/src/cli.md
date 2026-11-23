@@ -195,6 +195,11 @@ Options:
           PEM private key for --turn-tls-listen / --turn-dtls-listen (unencrypted PKCS#8, e.g.
           `openssl genpkey`)
 
+      --tls-cert-poll <SECONDS>
+          Certificate rotation poll interval in seconds (default 30; 0 = no polling, SIGHUP only).
+          Needs --turn-tls-listen or --turn-dtls-listen. Windows has no SIGHUP, so 0 is refused
+          there
+
       --rest-secret <SECRET>
           TURN REST API shared secret (coturn `use-auth-secret`): username = `<expiry>:<label>`,
           password = base64(HMAC-SHA1(secret, username)). Needs --realm and --auth-secret; wins over

@@ -33,7 +33,7 @@ rstun server \
 | 响应属性 | 成功响应带 `SOFTWARE`（RFC 8656 §14.10 SHOULD），401/438 挑战不带；`ChannelBind` 隐式创建的 permission 与 `CreatePermission` 共用同一个上限 |
 | 数据面 | `Send` 仅在 permission 覆盖 peer 时转发（否则静默丢弃）；relay 收到 peer 数据时，命中 channel → `ChannelData`，否则 → `Data` indication；`ChannelData` 不解析 STUN；**UDP 上声明长度大于实际报文的 `ChannelData` 静默丢弃**（不转发截断内容）；TCP 客户端写队列有界（64 帧，溢出丢 relayed 数据）|
 | 其它 transport | `REQUESTED-TRANSPORT=6`（TCP allocation / RFC 6062）：**默认 `442`**；加 `--turn-tcp-relay` 后走下面的「RFC 6062」小节（仅出站 `Connect` + `ConnectionBind`）；`EVEN-PORT`（含 R=1 reservation token）支持；`REQUESTED-ADDRESS-FAMILY`（0x0017，§18.6）已解析：与 relay 地址族一致 → 正常分配（relay 族跟随客户端：IPv4 客户端 + IPv4、IPv6 客户端 + IPv6）；请求的族本端提供不了（如 IPv4 客户端请求 `0x02`）或族值非 `0x01`/`0x02` → **`440 Address Family not Supported`**；长度 ≠ 4 → `400`；**保留 24 位忽略**（非零不报错）；`Refresh` 上族不匹配 → **`443 Peer Address Family Mismatch`**（§8.2 MUST）、匹配 → 正常续期、长度 ≠ 4 → `400`；`RESERVATION-TOKEN` 与 `EVEN-PORT`/RAF 互斥 → **`400`**（§7.2 步骤 5 先于步骤 7，异族 token 也是 400）；`ADDITIONAL-ADDRESS-FAMILY`（0x8000，comprehension-optional）未实现 → 忽略（因此步骤 6 的「RAF+AAF → 400」不生效）；`DONT-FRAGMENT`（0x001A，§18.9）在 **Linux/macOS/iOS** 上真支持（`Allocate` 置 DF、长度 ≠ 0 → `400`、`setsockopt` 失败 → `500`；`Send` 带它而置不上 DF → **丢弃该 indication**，§11.2），其它平台（Windows/FreeBSD 等）仍按未知 comprehension-required → `420`（§7.2 步骤 4 允许）|
-| TLS（`--turn-tls-listen`）| **仅 full 构建**（`tls` feature；lean 给出该 flag 会拒绝启动并说明）。在 TCP 分帧之上套 TLS 1.2/1.3（`tokio-rustls`，ring provider）。`--tls-cert`/`--tls-key` 在**启动时**解析：路径不可读、证书/私钥不配对、给了监听却没给材料 → **启动失败**（绝不降级明文）。**运行期可热加载**：`SIGHUP`（unix）或两条路径的 `(mtime,len)` 变化（30s 轮询，Windows 唯一路径）会用**同一套校验**重新解析，成功后整体替换 `ServerConfig` —— 新连接用新证书，**已建立会话持有旧证书**（TLS 无重协商）；失败保留旧材料、`reload_total{result="failed"}` +1、`warn` 日志。握手 5s 超时、失败计数（退出日志 `handshake_failed`），日志不含证书内容。TLS 与明文**不共用端口** |
+| TLS（`--turn-tls-listen`）| **仅 full 构建**（`tls` feature；lean 给出该 flag 会拒绝启动并说明）。在 TCP 分帧之上套 TLS 1.2/1.3（`tokio-rustls`，ring provider）。`--tls-cert`/`--tls-key` 在**启动时**解析：路径不可读、证书/私钥不配对、给了监听却没给材料 → **启动失败**（绝不降级明文）。**运行期可热加载**：`SIGHUP`（unix）或两条路径的 `(mtime,len)` 变化（`--tls-cert-poll` 轮询，默认 30s、`0` = 只认 `SIGHUP`，Windows 唯一路径）会用**同一套校验**重新解析，成功后整体替换 `ServerConfig` —— 新连接用新证书，**已建立会话持有旧证书**（TLS 无重协商）；失败保留旧材料、`reload_total{result="failed"}` +1、`warn` 日志。握手 5s 超时、失败计数（退出日志 `handshake_failed`），日志不含证书内容。TLS 与明文**不共用端口** |
 | DTLS（`--turn-dtls-listen`）| **仅 full 构建**（`dtls` feature，含 `tls`）。DTLS 1.2（`webrtc-dtls`，纯 Rust）。**一个 datagram = 一个 STUN/TURN 消息或一个 `ChannelData`**（与 UDP 同构，无 4 字节对齐）；5 元组的 client transport 记为 `Dtls`；握手在每客户端独立任务里做（5s 超时），不阻塞 accept。私钥必须是 **PKCS#8** 且算法为 **ECDSA P-256 / Ed25519**（`webrtc-dtls` 的限制，启动时明确报错）。与 TLS 共用同一份材料与同一个替换槽位：热加载一次对两侧**同时**生效，新会话用新证书、已建立会话保持旧证书（DTLS 无重协商/会话恢复）|
 | REST 临时凭据（`--rest-secret`）| coturn `use-auth-secret` 兼容：`username = <expiry-unix>:<label>`、`password = base64(HMAC-SHA1(secret, username))`（**标准 base64**，带 `=` 填充）。过期 → `401`（不是 438：nonce 仍有效，换凭据而不是换 nonce）；HMAC 不匹配 → `401`。**与长期凭据并存时 REST 优先**（用户名能解出时间戳即走 REST，不再查用户表）；`<expiry>:<label>` 的 label 可含 `:`（按**第一个** `:` 切分，coturn 同）|
 | 带宽配额（`--turn-bandwidth`）| 每 allocation 两个令牌桶（client→peer / peer→client），容量 = 1 秒的字节数，默认 **1 MiB/s**、`0` = 不限。超限**丢该包并计数**，allocation 与通话不受影响；与端口/分配配额独立 |
@@ -58,7 +58,13 @@ rstun server \
   DTLS 的 **UDP**；常见失败是「只放了 TCP 5349，DTLS 握手超时」。
   **证书热加载**：保持 `--tls-cert`/`--tls-key` 路径不变，在原地覆盖文件后
   `kill -HUP <pid>`（Linux/macOS）即可，**不用重启**；不想发信号或 Windows 上则依赖
-  **30s 轮询**（比对 `(mtime,len)`，最坏 30s + 一次握手生效）。校验规则与启动时**完全相同**：
+  **文件轮询**（比对 `(mtime,len)`，最坏一个轮询间隔 + 一次握手生效）。轮询间隔用
+  `--tls-cert-poll <秒>` 调（默认 **30**）；`--tls-cert-poll 0` = **关掉轮询、只认 `SIGHUP`**
+  —— 只用信号轮换的部署（例如侧车写完两张文件再发信号）可以借此避免「先写 cert 后写 key」
+  窗口里的一次 `reload_total{result="failed"}` 噪音。Windows 没有 `SIGHUP`，轮询是唯一触发，
+  所以在那里 `0` 会在启动时被**拒绝**。该 flag 与 `--tls-cert`/`--tls-key` 同组：给了它却
+  没有 `--turn-tls-listen`/`--turn-dtls-listen` → 启动失败（避免「设了但从不生效」）。
+  校验规则与启动时**完全相同**：
   不配对 / RSA 以外的 DTLS 限制 / 非 PKCS#8 / 截断 / 空文件都会被拒绝，**旧材料继续服务**，
   `rstun_turn_tls_reload_total{result="failed"}` +1 并打 `warn` 日志（不含私钥）。
   先写证书再写私钥的中间态会因 1s 重试被跳过。生效范围：**新连接/新 DTLS 会话**用新证书，
@@ -138,7 +144,7 @@ rstun server \
 验收：
 
 ```bash
-bash script/lab/rstun-turn.sh            # 21 项（lean 构建：tls/dtls/cert-reload 标 SKIP）
+bash script/lab/rstun-turn.sh            # 22 项（lean 构建：tls/dtls/cert-reload/cert-poll 标 SKIP）
                                          #   启动失败/中继/401+438/生命周期/441/RAF(-X 成功、
                                          #   -x 440)/DF(-g 中继 + tcpdump 记录 DF)/IPv6 relay/
                                          #   通配回环/permission 508/486/端口 508/
@@ -146,6 +152,7 @@ bash script/lab/rstun-turn.sh            # 21 项（lean 构建：tls/dtls/cert-
 bash script/lab/rstun-turn.sh --tls      # 只跑 TLS（自动 --features full 构建；s_client 握手 + uclient -S -t 中继）
 bash script/lab/rstun-turn.sh --dtls     # 只跑 DTLS（自动 --features full；s_client -dtls1_2 + uclient -S 中继）
 bash script/lab/rstun-turn.sh --only cert-reload  # 证书热载（SIGHUP + 30s 轮询 + 坏材料保留旧证书）
+bash script/lab/rstun-turn.sh --only cert-poll    # --tls-cert-poll（0 = 仅 SIGHUP / 2s 轮询 / 无监听拒绝启动）
 bash script/lab/rstun-turn.sh --tls --dtls   # 两项都跑
 bash script/lab/rstun-turn.sh --only df      # DONT-FRAGMENT 单项（需要 tcpdump 才有线上证据，否则退化）
 bash script/lab/rstun-turn.sh --only ipv6relay  # IPv6 relay 单项（无 ::1 时 SKIP）

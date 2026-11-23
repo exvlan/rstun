@@ -364,6 +364,12 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     tls_key: Option<PathBuf>,
 
+    /// Certificate rotation poll interval in seconds (default 30; 0 = no
+    /// polling, SIGHUP only). Needs --turn-tls-listen or --turn-dtls-listen.
+    /// Windows has no SIGHUP, so 0 is refused there
+    #[arg(long, value_name = "SECONDS")]
+    tls_cert_poll: Option<u64>,
+
     /// TURN REST API shared secret (coturn `use-auth-secret`):
     /// username = `<expiry>:<label>`, password = base64(HMAC-SHA1(secret,
     /// username)). Needs --realm and --auth-secret; wins over stored users
@@ -1138,13 +1144,15 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
         || !args.turn_tls_listen.is_empty()
         || !args.turn_dtls_listen.is_empty()
         || args.tls_cert.is_some()
-        || args.tls_key.is_some();
+        || args.tls_key.is_some()
+        || args.tls_cert_poll.is_some();
     if !args.turn {
         if any_turn_flag {
             return Err(
                 "--relay-ports / --max-allocations-* / --permission-limit / \
                  --allocation-lifetime / --turn-bandwidth / --turn-tcp-relay / \
-                 --turn-tls-listen / --turn-dtls-listen / --tls-cert / --tls-key \
+                 --turn-tls-listen / --turn-dtls-listen / --tls-cert / --tls-key / \
+                 --tls-cert-poll \
                  need --turn"
                     .to_string(),
             );
@@ -1159,10 +1167,14 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
     // so is more useful than "missing certificate" — the operator needs to know
     // they are running the wrong artifact.
     #[cfg(not(feature = "tls"))]
-    if !args.turn_tls_listen.is_empty() || args.tls_cert.is_some() || args.tls_key.is_some() {
+    if !args.turn_tls_listen.is_empty()
+        || args.tls_cert.is_some()
+        || args.tls_key.is_some()
+        || args.tls_cert_poll.is_some()
+    {
         return Err(
-            "--turn-tls-listen / --tls-cert / --tls-key need a build with the `tls` feature \
-             (cargo build --features tls,dtls)"
+            "--turn-tls-listen / --tls-cert / --tls-key / --tls-cert-poll need a build with the \
+             `tls` feature (cargo build --features tls,dtls)"
                 .to_string(),
         );
     }
@@ -1195,6 +1207,15 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
             "--tls-cert / --tls-key need --turn-tls-listen or --turn-dtls-listen".to_string(),
         );
     }
+    // `--tls-cert-poll` belongs to the same secure-material group: a value with
+    // no secure listener would never take effect, and `0` without SIGHUP would
+    // leave a certificate that can never rotate. `run` calls this same helper
+    // for the interval it hands to the reloader, so the two cannot disagree.
+    cert_poll_interval(
+        args.tls_cert_poll,
+        !args.turn_tls_listen.is_empty() || !args.turn_dtls_listen.is_empty(),
+        cfg!(unix),
+    )?;
     let Some(auth) = auth else {
         return Err(
             "--turn needs long-term credentials: --realm, --auth-secret and at least one user \
@@ -1361,6 +1382,15 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
             return ExitCode::FAILURE;
         };
         let needs_dtls = !args.turn_dtls_listen.is_empty();
+        // The listeners are non-empty here (`secure` is `None` otherwise), and
+        // `build_turn` already validated the value — same helper, same rule.
+        let poll = match cert_poll_interval(args.tls_cert_poll, true, cfg!(unix)) {
+            Ok(poll) => poll,
+            Err(message) => {
+                tracing::error!(%message, "rstun: invalid TLS configuration");
+                return ExitCode::FAILURE;
+            }
+        };
         match load_secure_material(cert, key, needs_dtls) {
             Ok(loaded) => {
                 let secure_stats = Arc::new(SecureStats::default());
@@ -1371,6 +1401,7 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
                     cert: cert.clone(),
                     key: key.clone(),
                     needs_dtls,
+                    poll,
                     stats: secure_stats,
                 })
             }
@@ -1507,13 +1538,20 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
     let sweeper = admission.as_ref().and_then(limit::start_sweeper);
     // TURN 的 1s 扫描任务同样常驻、不参与 drain（与限速 sweeper 同一条规则）。
     let turn_sweeper = turn.as_ref().map(turn::Turn::start_sweeper);
-    // Certificate rotation: SIGHUP (Unix) + a fixed 30 s poll, both driving the
-    // same `reload_secure_material`. Only exists when a secure listener does,
-    // and it leaves on drain (it is not tracked as in-flight work).
+    // Certificate rotation: SIGHUP (Unix) + the `--tls-cert-poll` timer (30 s
+    // by default, off with `0`), both driving the same
+    // `reload_secure_material`. Only exists when a secure listener does, and it
+    // leaves on drain (it is not tracked as in-flight work).
     #[cfg(feature = "tls")]
-    let cert_reloader = secure
-        .as_ref()
-        .map(|setup| spawn_cert_reloader(setup.clone(), stats.clone()));
+    let cert_reloader = secure.as_ref().and_then(|setup| {
+        // `--tls-cert-poll 0` keeps the task for SIGHUP on Unix. Where there is
+        // no SIGHUP (Windows) that combination is refused at startup, so a task
+        // with neither trigger would never run: don't spawn one.
+        if setup.poll.is_none() && !cfg!(unix) {
+            return None;
+        }
+        Some(spawn_cert_reloader(setup.clone(), stats.clone()))
+    });
     let listener_count = listeners.len();
     let ops_task = ops_listener.map(|listener| {
         let state = Arc::new(ops::OpsState::new(
@@ -3265,7 +3303,8 @@ struct LoadedMaterial {
 
 /// Everything a running secure deployment needs to reload its own material:
 /// the live slot, the (unchangeable) source paths, whether DTLS material is
-/// required, and where to count.
+/// required, how often to poll for a rewrite (`None` = `--tls-cert-poll 0`,
+/// SIGHUP only), and where to count.
 #[cfg(feature = "tls")]
 #[derive(Clone)]
 struct SecureSetup {
@@ -3273,6 +3312,7 @@ struct SecureSetup {
     cert: PathBuf,
     key: PathBuf,
     needs_dtls: bool,
+    poll: Option<Duration>,
     stats: Arc<SecureStats>,
 }
 
@@ -3419,12 +3459,51 @@ fn certificate_not_after(der: &[u8]) -> Option<i64> {
     Some(certificate.validity().not_after.timestamp())
 }
 
-/// How often the two material files are stat'ed for a change (design §5).
+/// Default interval of the certificate-file poll (design §5).
 ///
 /// SIGHUP is the immediate path; polling is what makes rotation work on
 /// Windows (no `SIGHUP`) and in deployments that would rather not signal.
-#[cfg(feature = "tls")]
+/// `--tls-cert-poll 0` turns the timer off; a positive value replaces this.
 const CERT_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The interval `--tls-cert-poll` asks for, validated against what this start
+/// actually serves.
+///
+/// `Ok(None)` means "no polling task at all: SIGHUP only" — a deployment that
+/// rotates by signalling writes cert and key one file at a time, and a poll
+/// landing in that window would log a rotation failure nobody asked for.
+///
+/// `has_sighup` is a parameter rather than a `cfg!(unix)` read inside, so the
+/// Windows rule is testable on every platform: polling is the **only** trigger
+/// there, so disabling it would freeze the certificate until the next restart.
+fn cert_poll_interval(
+    requested: Option<u64>,
+    has_secure_listener: bool,
+    has_sighup: bool,
+) -> Result<Option<Duration>, String> {
+    let Some(seconds) = requested else {
+        return Ok(Some(CERT_POLL_INTERVAL));
+    };
+    if !has_secure_listener {
+        return Err(
+            "--tls-cert-poll needs --turn-tls-listen or --turn-dtls-listen: \
+             without a secure listener there is nothing to rotate"
+                .to_string(),
+        );
+    }
+    if seconds == 0 {
+        if !has_sighup {
+            return Err(
+                "--tls-cert-poll 0 is not allowed on this platform: there is no SIGHUP, \
+                 so the certificate could never rotate (use a positive interval, \
+                 e.g. --tls-cert-poll 30)"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+    Ok(Some(Duration::from_secs(seconds)))
+}
 
 /// One retry after this delay, to step over the "cert already written, key
 /// still being written" window (design §5 / D3).
@@ -3545,8 +3624,8 @@ fn swap_material(setup: &SecureSetup, loaded: LoadedMaterial) {
 #[cfg(feature = "tls")]
 const SECONDS_PER_DAY: u64 = 86_400;
 
-/// Reload on `SIGHUP` (Unix) and whenever either file's `(mtime, len)` changes
-/// on the 30 s poll (every platform). Both paths share
+/// Reload on `SIGHUP` (Unix) and, when `--tls-cert-poll` is not `0`, whenever
+/// either file's `(mtime, len)` changes on that interval. Both paths share
 /// [`reload_secure_material`], so they cannot diverge.
 #[cfg(feature = "tls")]
 fn spawn_cert_reloader(setup: SecureSetup, stats: Arc<ServerStats>) -> tokio::task::JoinHandle<()> {
@@ -3557,22 +3636,46 @@ fn spawn_cert_reloader(setup: SecureSetup, stats: Arc<ServerStats>) -> tokio::ta
     let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         Ok(signal) => Some(signal),
         Err(error) => {
-            tracing::warn!(
-                %error,
-                "rstun: cannot listen for SIGHUP; certificate reload falls back to polling"
-            );
+            if setup.poll.is_some() {
+                tracing::warn!(
+                    %error,
+                    "rstun: cannot listen for SIGHUP; certificate reload falls back to polling"
+                );
+            } else {
+                // Neither trigger left: `--tls-cert-poll 0` already removed the
+                // timer, so pointing at "polling" here would be a lie.
+                tracing::error!(
+                    %error,
+                    "rstun: cannot listen for SIGHUP and --tls-cert-poll 0 disabled polling: \
+                     the certificate will no longer be rotated (restart with a positive \
+                     --tls-cert-poll once the signal handler works)"
+                );
+            }
             None
         }
     };
+    // `None` = `--tls-cert-poll 0`: the deployment rotates by signalling, so the
+    // timer stays out of the way (a poll landing between the cert write and the
+    // key write would log a failure nobody asked for).
+    let interval = setup.poll;
     tokio::spawn(async move {
+        // One line that makes the effective trigger set observable from outside
+        // (and assertable by the lab): `poll=None` really means "SIGHUP only",
+        // anything else is the interval that will re-stat the two files.
+        tracing::info!(poll = ?interval, "rstun: certificate reloader started");
         let mut drain = stats.subscribe_drain();
         #[cfg(unix)]
         let mut hangup = hangup;
-        let mut poll = tokio::time::interval(CERT_POLL_INTERVAL);
-        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut poll = interval.map(|interval| {
+            let mut poll = tokio::time::interval(interval);
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            poll
+        });
         // `interval` fires once immediately; that would be a redundant parse of
         // material that was loaded seconds ago at startup.
-        poll.tick().await;
+        if let Some(poll) = poll.as_mut() {
+            poll.tick().await;
+        }
         let mut last_attempt = material_stamp(&setup);
         loop {
             // `true` = an operator asked explicitly (SIGHUP), `false` = poll.
@@ -3580,25 +3683,14 @@ fn spawn_cert_reloader(setup: SecureSetup, stats: Arc<ServerStats>) -> tokio::ta
             let signalled = tokio::select! {
                 biased;
                 _ = drain.changed() => break,
-                _ = async {
-                    match hangup.as_mut() {
-                        Some(signal) => {
-                            // `None` means the signal stream ended (never in
-                            // practice). Park instead of spinning this select.
-                            if signal.recv().await.is_none() {
-                                std::future::pending::<()>().await;
-                            }
-                        }
-                        None => std::future::pending::<()>().await,
-                    }
-                } => true,
-                _ = poll.tick() => false,
+                _ = cert_hangup(&mut hangup) => true,
+                _ = cert_poll_tick(&mut poll) => false,
             };
             #[cfg(not(unix))]
             let signalled = tokio::select! {
                 biased;
                 _ = drain.changed() => break,
-                _ = poll.tick() => false,
+                _ = cert_poll_tick(&mut poll) => false,
             };
 
             let stamp = material_stamp(&setup);
@@ -3617,6 +3709,35 @@ fn spawn_cert_reloader(setup: SecureSetup, stats: Arc<ServerStats>) -> tokio::ta
         }
         tracing::debug!("rstun: TURN TLS certificate reloader stopped (draining)");
     })
+}
+
+/// The poll arm of the reloader's `select!`.
+///
+/// With `--tls-cert-poll 0` the interval is `None` and this never resolves:
+/// that is how the SIGHUP path keeps working with no timer at all.
+#[cfg(feature = "tls")]
+async fn cert_poll_tick(poll: &mut Option<tokio::time::Interval>) {
+    match poll {
+        Some(poll) => {
+            poll.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// The `SIGHUP` arm of the reloader's `select!` (Unix only).
+#[cfg(all(feature = "tls", unix))]
+async fn cert_hangup(hangup: &mut Option<tokio::signal::unix::Signal>) {
+    match hangup {
+        Some(signal) => {
+            // `None` means the signal stream ended (never in practice). Park
+            // instead of spinning the select.
+            if signal.recv().await.is_none() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// `webrtc-dtls` reads a PEM bundle whose **first** block is tagged
@@ -7231,6 +7352,118 @@ mod tests {
         assert_eq!(config.bandwidth, 4096);
     }
 
+    /// `--tls-cert-poll`: default 30 s, `0` = SIGHUP only (no poll interval at
+    /// all), any positive value is taken verbatim. `0` is the "no polling task"
+    /// contract: the reloader gets `None` and its timer arm never fires.
+    #[test]
+    fn cert_poll_interval_defaults_to_30s_and_can_be_disabled() {
+        assert_eq!(
+            cert_poll_interval(None, true, true).unwrap(),
+            Some(Duration::from_secs(30)),
+            "not passed → the documented 30 s default"
+        );
+        assert_eq!(
+            cert_poll_interval(None, true, false).unwrap(),
+            Some(CERT_POLL_INTERVAL),
+            "the default is build- and platform-independent"
+        );
+        assert_eq!(
+            cert_poll_interval(Some(0), true, true).unwrap(),
+            None,
+            "0 = no polling task; SIGHUP is the only trigger"
+        );
+        assert_eq!(
+            cert_poll_interval(Some(2), true, true).unwrap(),
+            Some(Duration::from_secs(2)),
+            "a positive value is the interval, in seconds"
+        );
+    }
+
+    /// The two half configurations: a poll interval with no `turns:`/DTLS
+    /// listener would never take effect, and `0` where there is no `SIGHUP`
+    /// (Windows) would leave a certificate that can never rotate.
+    #[test]
+    fn cert_poll_needs_a_secure_listener_and_a_signal_source() {
+        for seconds in [Some(0), Some(2), Some(30)] {
+            let error = cert_poll_interval(seconds, false, true).unwrap_err();
+            assert!(
+                error.contains("--tls-cert-poll") && error.contains("--turn-tls-listen"),
+                "{error}"
+            );
+        }
+
+        let error = cert_poll_interval(Some(0), true, false).unwrap_err();
+        assert!(
+            error.contains("--tls-cert-poll") && error.contains("SIGHUP"),
+            "the error must say why 0 is refused there: {error}"
+        );
+        // Windows keeps rotating: a positive interval (and the default) works.
+        assert_eq!(
+            cert_poll_interval(Some(2), true, false).unwrap(),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            cert_poll_interval(None, true, false).unwrap(),
+            Some(CERT_POLL_INTERVAL)
+        );
+    }
+
+    /// `build_turn` is where the flag's half configurations are refused: a
+    /// value with no secure listener, and any value without `--turn`.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_cert_poll_needs_a_secure_listener() {
+        let long = long_term_auth(false);
+        for seconds in [0, 2] {
+            let args = Args {
+                turn: true,
+                tls_cert_poll: Some(seconds),
+                ..Args::default()
+            };
+            let message = build_turn(&args, Some(&long)).unwrap_err();
+            assert!(
+                message.contains("--tls-cert-poll") && message.contains("--turn-tls-listen"),
+                "poll {seconds}: {message}"
+            );
+        }
+
+        // With a secure listener the value is accepted (the paths themselves
+        // are only read at startup, so a placeholder pair is enough here).
+        let args = Args {
+            turn: true,
+            turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+            tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            tls_key: Some(PathBuf::from("/tmp/key.pem")),
+            tls_cert_poll: Some(2),
+            ..Args::default()
+        };
+        assert!(build_turn(&args, Some(&long)).is_ok());
+        let zero = Args {
+            turn: true,
+            turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+            tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            tls_key: Some(PathBuf::from("/tmp/key.pem")),
+            tls_cert_poll: Some(0),
+            ..Args::default()
+        };
+        // `0` means "SIGHUP only", so it needs a platform that has SIGHUP.
+        #[cfg(unix)]
+        assert!(build_turn(&zero, Some(&long)).is_ok(), "0 on unix is legal");
+        #[cfg(not(unix))]
+        assert!(
+            build_turn(&zero, Some(&long)).is_err(),
+            "0 without SIGHUP would freeze the certificate"
+        );
+
+        // Without `--turn` it is one more TURN-only flag.
+        let args = Args {
+            tls_cert_poll: Some(30),
+            ..Args::default()
+        };
+        let message = build_turn(&args, Some(&long)).unwrap_err();
+        assert!(message.contains("--turn"), "{message}");
+    }
+
     /// The lean build must not pretend: the flag exists (help is build-independent)
     /// but the start is refused with the feature name the operator has to build.
     #[cfg(not(feature = "tls"))]
@@ -7247,6 +7480,12 @@ mod tests {
                 turn: true,
                 tls_cert: Some(PathBuf::from("/tmp/cert.pem")),
                 tls_key: Some(PathBuf::from("/tmp/key.pem")),
+                turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
+                ..Args::default()
+            },
+            Args {
+                turn: true,
+                tls_cert_poll: Some(0),
                 turn_tls_listen: vec!["127.0.0.1:5349".parse().unwrap()],
                 ..Args::default()
             },
@@ -7442,6 +7681,7 @@ mod tests {
                 cert: cert.clone(),
                 key: key.clone(),
                 needs_dtls: false,
+                poll: Some(CERT_POLL_INTERVAL),
                 stats,
             },
             cert,

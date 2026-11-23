@@ -144,8 +144,9 @@ TURN 侧能做的都已经做了（UDP/TCP/`turns:`/DTLS 中继、REST 临时凭
   `Connect` + `ConnectionBind`，见「[TURN](turn.md)」）；**被动模式**（`ConnectionAttempt`，
   peer 主动连入 relay）仍未实现，`turnutils_uclient -T` 因此不能作为验收判据。
 - **ACME / OCSP stapling**：签发与续期交给宿主的 certbot/acme.sh 等工具；本进程不做 ACME。
-  证书本身可热加载：原地覆盖 `--tls-cert`/`--tls-key` 后 `kill -HUP`（unix）或等 30s 轮询，
-  无需重启（详见「[TURN](turn.md)」的部署注意）。
+  证书本身可热加载：原地覆盖 `--tls-cert`/`--tls-key` 后 `kill -HUP`（unix）或等文件轮询
+  （默认 30s，`--tls-cert-poll` 可调、`0` = 只认 `SIGHUP`），无需重启
+  （详见「[TURN](turn.md)」的部署注意）。
 - **多实例共享 allocation**：状态只在进程内存里（重启清零）。多实例部署靠 LB 源地址亲和；
   `--auth-secret` 与 `--rest-secret` 可以共享（nonce 与 REST 凭据都是无状态的），
   但 allocation 表不共享。

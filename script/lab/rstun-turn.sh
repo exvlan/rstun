@@ -11,13 +11,13 @@
 #   bash script/lab/rstun-turn.sh --tls --dtls     # 只跑 TLS/DTLS 项（自动 --features full 构建）
 #   bash script/lab/rstun-turn.sh --only relay     # 只跑一项
 #     （startup|relay|tcprelay|auth|lifecycle|wrong-user|raf|df|ipv6relay|wildcard|
-#       permission-limit|quota|ports|tls|dtls|cert-reload|rest|bandwidth|cleanup|frozen|coturn）
+#       permission-limit|quota|ports|tls|dtls|cert-reload|cert-poll|rest|bandwidth|cleanup|frozen|coturn）
 #   bash script/lab/rstun-turn.sh --keep           # 保留日志（默认只清进程）
 #   FROZEN_BASE=<sha> bash script/lab/rstun-turn.sh --only frozen
 #                                                  # 字节冻结对照的基线提交（默认 cad4fa2）
 #
 # 构建：默认 lean（`cargo build`，无 tls/dtls feature）。`--tls` / `--dtls` /
-# `--only tls|dtls|cert-reload|coturn` 会自动用 `cargo build --features full` 构建；`--no-build`
+# `--only tls|dtls|cert-reload|cert-poll|coturn` 会自动用 `cargo build --features full` 构建；`--no-build`
 # 时探测现有二进制是否带 feature。lean 下 tls/dtls 项记 SKIP（不是失败），
 # coturn 项的 TLS/DTLS 对照行同样跳过。
 #
@@ -67,7 +67,7 @@ FAILED=()
 SKIPPED=()
 PASSED=()
 
-ALL_ITEMS=(startup relay tcprelay auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls cert-reload rest bandwidth cleanup frozen coturn)
+ALL_ITEMS=(startup relay tcprelay auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls cert-reload cert-poll rest bandwidth cleanup frozen coturn)
 
 usage() {
   sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
@@ -103,7 +103,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [[ -n "$ONLY" ]]; then
   case "$ONLY" in
-    startup | relay | tcprelay | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | cert-reload | rest | bandwidth | cleanup | frozen | coturn) : ;;
+    startup | relay | tcprelay | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | cert-reload | cert-poll | rest | bandwidth | cleanup | frozen | coturn) : ;;
     *) echo "--only 未知项: $ONLY（可用：${ALL_ITEMS[*]}）" >&2; exit 2 ;;
   esac
 fi
@@ -261,7 +261,7 @@ probe_secure_support() {
 # 这些项需要 secure 传输 → BUILD=true 时自动加 `--features full`。
 needs_secure_build() {
   [[ ${#T2_ONLY[@]} -gt 0 ]] && return 0
-  case "$ONLY" in tls | dtls | cert-reload | coturn) return 0 ;; esac
+  case "$ONLY" in tls | dtls | cert-reload | cert-poll | coturn) return 0 ;; esac
   return 1
 }
 
@@ -925,6 +925,15 @@ make_reload_certs() {
   done
 }
 
+# What the reloader actually armed, read from its startup line:
+# `poll=None` = `--tls-cert-poll 0` (SIGHUP only), `poll=Some(2s)` = a 2 s timer.
+# tracing inserts ANSI escapes between the field name and its value, so the
+# pattern allows anything between `poll` and the expected rendering.
+reloader_poll_matches() { # logfile regex
+  grep -a "certificate reloader started" "$1" 2>/dev/null | head -n 1 |
+    grep -qE "poll.*$2"
+}
+
 # The peer certificate's SHA-256 fingerprint, as `SHA256 Fingerprint=…`.
 s_client_fingerprint() { # port [--dtls]
   local port="$1"
@@ -1084,6 +1093,114 @@ run_cert_reload() {
     ok "$name" "SIGHUP → new cert (TLS+DTLS identical), established session still answers after reload ($session1), poll → third cert, bad pair kept the live one (failed ${failed_before}→${failed_after}, ok=$ok_count), expires=${expires}s (openssl drift ${drift}s)"
   else
     fail "$name" "sighup a=[$tls_a] b=[$tls_b] dtls-b=[$dtls_b]; session=[$session_ok $session1 / $session2] (see $LOG_DIR/$name-session.log); poll c=[$tls_c]; bad kept=[$tls_bad]; failed ${failed_before:-?}→${failed_after:-?}; alive=$alive; expires=${expires:-?} drift=${drift:-?}"
+  fi
+}
+
+# ---------- 6e-0. --tls-cert-poll: 0 = SIGHUP only, N = that interval ----------
+
+run_cert_poll() {
+  local name=cert-poll
+  if [[ "$HAVE_SECURE" != true ]]; then
+    skip "$name" "lean 构建没有 tls/dtls feature（用 --tls --dtls，或 cargo build --features full）"
+    return
+  fi
+  make_reload_certs || { skip "$name" "openssl unavailable"; return; }
+
+  # A poll interval with no secure listener can never take effect: refused at
+  # startup instead of silently ignored.
+  local message code refused=ok
+  message="$("$BIN" server --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --tls-cert-poll 0 2>&1)"
+  code=$?
+  if [[ $code -eq 0 ]] || ! grep -qa -- "--tls-cert-poll" <<<"$message"; then
+    refused=failed
+  fi
+
+  # 0 = no polling task: overwriting both files with no signal must NOT reload;
+  # SIGHUP must (the task stays alive for the signal alone).
+  cp "$RELOAD_DIR/a-cert.pem" "$RELOAD_DIR/current-cert.pem"
+  cp "$RELOAD_DIR/a-key.pem" "$RELOAD_DIR/current-key.pem"
+  start_server "$name" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --health-listen "127.0.0.1:$HEALTH_PORT" \
+    --turn-tls-listen "127.0.0.1:$TLS_PORT" \
+    --tls-cert "$RELOAD_DIR/current-cert.pem" --tls-key "$RELOAD_DIR/current-key.pem" \
+    --tls-cert-poll 0
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy (see $LOG_DIR/$name.log)"
+    stop_server "$name"
+    return
+  fi
+  local pid a b unchanged silent=ok sighup=ok i
+  pid="$(tail -n 1 "$WORK/pids")"
+  a="$(s_client_fingerprint "$TLS_PORT")"
+  cp "$RELOAD_DIR/b-cert.pem" "$RELOAD_DIR/current-cert.pem"
+  cp "$RELOAD_DIR/b-key.pem" "$RELOAD_DIR/current-key.pem"
+  # The files really changed and no signal was sent: the fingerprint must stay.
+  # This window alone cannot catch a 30 s timer that was never disabled (the
+  # default tick is 30 s and its first tick is consumed at spawn) — the
+  # discriminating evidence is the startup-line assertion below (`poll=None`).
+  sleep 4
+  unchanged="$(s_client_fingerprint "$TLS_PORT")"
+  [[ -n "$a" && "$unchanged" == "$a" ]] || silent=failed
+  kill -HUP "$pid"
+  b=""
+  for i in $(seq 1 20); do
+    sleep 0.2
+    b="$(s_client_fingerprint "$TLS_PORT")"
+    [[ -n "$b" && "$b" != "$a" ]] && break
+  done
+  [[ -n "$b" && "$b" != "$a" ]] || sighup=failed
+  # `0` must really mean "no timer": the reloader's startup line says poll=None
+  # (a mutant that keeps the 30 s interval logs Some(30s) and fails here).
+  local trigger=ok
+  reloader_poll_matches "$LOG_DIR/$name.log" "None" || trigger=failed
+  stop_server "$name"
+
+  # A positive value is the poll interval: overwrite the pair with **no** signal
+  # and wait for the 2 s tick (the loop allows 8 s for the tick + handshake).
+  cp "$RELOAD_DIR/a-cert.pem" "$RELOAD_DIR/current-cert.pem"
+  cp "$RELOAD_DIR/a-key.pem" "$RELOAD_DIR/current-key.pem"
+  start_server "$name-fast" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --health-listen "127.0.0.1:$HEALTH_PORT" \
+    --turn-tls-listen "127.0.0.1:$TLS_PORT" \
+    --tls-cert "$RELOAD_DIR/current-cert.pem" --tls-key "$RELOAD_DIR/current-key.pem" \
+    --tls-cert-poll 2
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server with --tls-cert-poll 2 did not become healthy"
+    stop_server "$name-fast"
+    return
+  fi
+  local a2 c polled=ok waited=0
+  a2="$(s_client_fingerprint "$TLS_PORT")"
+  cp "$RELOAD_DIR/c-cert.pem" "$RELOAD_DIR/current-cert.pem"
+  cp "$RELOAD_DIR/c-key.pem" "$RELOAD_DIR/current-key.pem"
+  c=""
+  for i in $(seq 1 16); do
+    sleep 0.5
+    c="$(s_client_fingerprint "$TLS_PORT")"
+    if [[ -n "$c" && "$c" != "$a2" ]]; then
+      waited=$((i / 2))
+      break
+    fi
+  done
+  [[ -n "$c" && "$c" != "$a2" ]] || polled=failed
+  local armed=ok
+  reloader_poll_matches "$LOG_DIR/$name-fast.log" 'Some\(2s\)' || armed=failed
+  stop_server "$name-fast"
+
+  if [[ $refused == ok && $silent == ok && $sighup == ok && $trigger == ok &&
+    $polled == ok && $armed == ok ]]; then
+    ok "$name" "no listener + flag → refused; 0 → reloader poll=None, file change ignored for 4s, SIGHUP reloads; 2s → poll=Some(2s), reloaded within ~${waited}s"
+  else
+    fail "$name" "refused=$refused silent=$silent sighup=$sighup trigger=$trigger polled=$polled armed=$armed (a=[$a] unchanged=[$unchanged] b=[$b] a2=[$a2] c=[$c])"
   fi
 }
 
@@ -1566,6 +1683,7 @@ run_item() {
     tls) run_tls ;;
     dtls) run_dtls ;;
     cert-reload) run_cert_reload ;;
+    cert-poll) run_cert_poll ;;
     rest) run_rest ;;
     bandwidth) run_bandwidth ;;
     cleanup) run_cleanup ;;
