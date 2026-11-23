@@ -74,6 +74,8 @@ rstun server \
   轮询只看 `(mtime,len)`：若覆盖时文件大小与 mtime 都没变（例如 `cp -p`/保留时间戳），轮询
   不会感知 —— 此时用 `kill -HUP <pid>` 强制重载。
   到期时间看 `rstun_turn_tls_cert_expires_seconds`（秒，`openssl x509 -enddate` 同值）。
+  **`SIGHUP` 是稳定接口**：用 `--tls-cert-poll 0` 的部署（写文件 + 主动发信号）完全依赖它；
+  任何移除/改名/语义变化都按**破坏性变更**处理（CHANGELOG + 发版前通知）。
   没有 `--health-listen` 时**没有任何 `/metrics`**（TURN 指标族同样不可见），轮换的唯一证据是
   日志行 `TURN TLS certificate reloaded cert=…` 加上「进程未重启」（`StartedAt`/`RestartCount`）；
   要用指标核对或告警，请配 `--health-listen`（内网地址）。
