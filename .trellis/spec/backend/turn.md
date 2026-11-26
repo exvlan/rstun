@@ -116,19 +116,41 @@
   `requested_address_family_selects_the_relay_family` 中「无/匹配 RAF → 200」隐含保证。
   将来若给 TURN 加字节冻结，应按 `--turn` + 固定 transaction id 增补一组。
 
-## 5a. RFC 6062 契约（`--turn-tcp-relay`，出站）
+## 5a. RFC 6062 契约（`--turn-tcp-relay`，出站 + 被动）
 
 | 项 | 契约 |
 | --- | --- |
-| 范围 | **只做出站**：`Allocate(TCP)` + `Connect` + `ConnectionBind`。被动模式（`ConnectionAttempt` / `uclient -P`）不在范围，`turnutils_uclient -T`（隐含 `-y`）因此不能作为验收判据 |
+| 范围 | **两半都做**：出站 `Allocate(TCP)` + `Connect` + `ConnectionBind`，以及被动模式 `ConnectionAttempt`（§5.3，peer 主动连入 relay）。`turnutils_uclient -T`（隐含 `-y`）与 `-P` 因此都能完成；`-P` 的判据是 **exit=0 + 双向字节 > 0**，**不得**用 `lost packets 0`（coturn 自身 `-P` 实测丢 50%）|
 | `Allocate` TCP | 控制面必须 TCP/TLS（UDP/DTLS → `400`）；带 `DONT-FRAGMENT`/`EVEN-PORT`/`RESERVATION-TOKEN` → `400`（**与平台无关**：420 gate 对「`Allocate` + `REQUESTED-TRANSPORT=6`」把 `0x001A` 视为已知，Windows 也不得回 420；UDP Allocate + DF 在 Windows 仍按 §7.2 步骤 4 回 420）；成功 `200` + TCP `XOR-RELAYED-ADDRESS` + `XOR-MAPPED-ADDRESS` + `LIFETIME` + `SOFTWARE`，**无 `CONNECTION-ID`**；`Refresh`/`LIFETIME` 语义同 UDP |
 | 端口池 | `used_tcp_ports` 独立于 UDP 池；listener 以 `SO_REUSEPORT` 绑定（`Connect` 从该地址出站）；「出站源端口 = relay 端口」只在 `RELAY_SOURCE_PORT_BOUND`（`cfg!(unix)`）成立，Windows 回退临时源端口 —— 实现与测试共用该常量，不得另写平台判断 |
 | `Connect` | 无 allocation / 非 TCP allocation → `437`；他人 allocation → `441`；缺/非法 `XOR-PEER-ADDRESS` → `400`；禁用地址 → `403`（含 family `443`）；重复 peer（connecting/pending/bound）→ `446`；出站失败/超时（`TCP_CONNECT_TIMEOUT = 30s`）→ `447`；每 allocation 数据连接上限 16 → `508` + `tcp_quota`；成功 `200` + `CONNECTION-ID`，**不带 `SOFTWARE`**（对齐 coturn）|
-| `ConnectionBind` | 必须 stream 传输、新连接（该 5 元组无 allocation）、`CONNECTION_ID` 4 字节且指向 pending、同用户名、未过期；否则 `400` 且**发完响应再关连接**（401/438 挑战保留，不关）；成功后该连接裸字节，不再解析 STUN |
+| **`ConnectionAttempt`（§5.3，被动）** | TCP allocation 创建后 spawn **accept 任务**（句柄在 `Allocation.accept_task`，`Drop` abort；**abort 是异步的**：`release_port` 先回池、listener 在任务被调度取消时才关闭 —— 断言按「**最终** `ss -ltn` 无残留」而不是「同步关闭」，lab/单测都用轮询）；accept 失败 → 只记日志 + 短退避，不通知客户端；peer **无 live permission** → accept 后立即关闭且**不发 indication**；有 permission → **先**插表（`Pending`，`expires_at = now + TCP_BIND_TIMEOUT`）**再**发 indication；attribute 集固定 `CONNECTION-ID` + `XOR-PEER-ADDRESS` + `SOFTWARE`，**无 `MESSAGE-INTEGRITY`（indication）也无 `FINGERPRINT`**（与本服务的 `Data` indication 一致）；indication 送不出去（控制连接已死或队列满）→ 关闭该入站连接 + `tcp_send`（不占 30s 窗口）；配额满（16）→ 关连接 + `tcp_quota`（入站无请求可回 `508`）。入站与出站**共用**同一张 `CONNECTION-ID` 表、同一 16 条上限、同一 64 KiB 预绑定缓冲与同一 `sweep` 回收 |
+| `ConnectionBind` | 必须 stream 传输、新连接（该 5 元组无 allocation）、`CONNECTION_ID` 4 字节且指向 pending、同用户名、未过期；否则 `400` 且**发完响应再关连接**（401/438 挑战保留，不关）；成功后该连接裸字节，不再解析 STUN（**入站 pending 走同一路径，不改**）|
 | 生命周期 | pending 30s 未 bind → 关闭（`sweep`）；`LIFETIME=0`/allocation 过期 → 关闭全部数据连接（**控制连接保留**，与 coturn 的差异）；任一方向干净 EOF 只半关闭，错误/stop 信号关双向 |
 | 缓冲 | 预绑定 peer→client 最多 `TCP_PREBIND_BUFFER = 64 KiB`，超限关连接 + `tcp_buffer`；绑定后先刷缓冲再双向 copy |
 | 其它方法 | `CreatePermission` 正常 `200`；`ChannelBind` → `400`；`Send`/`ChannelData` 丢弃 + `tcp_send` |
-| 资源 | 数据连接是 accepted TCP 连接，占一个 `--max-inflight` 名额（写进文档） |
+| 资源 | **出站**数据连接是 `serve_tcp` 收下的 accepted TCP 连接，占一个 `--max-inflight` 名额（写进文档）；**入站**（被动）连接由该 allocation 的 relay listener 在 `turn.rs` 内 accept，**不经过 `--max-inflight`**，只受每 allocation 16 条（`tcp_quota`）与 30s 未 bind 回收约束 |
+
+### Tests Required（RFC 6062 断言点）
+
+1. 出站全流程（`connection_bind_relays_raw_bytes_both_ways`、探针 `tcp-relay`、lab `tcprelay`）。
+2. 被动正向（`inbound_peer_is_announced_with_a_connection_attempt_and_binds` + 探针
+   `tcp-relay-passive`）：indication 的 method/class、`CONNECTION-ID`、`XOR-PEER-ADDRESS` 等于
+   拨入 peer 的源地址、带 `SOFTWARE`、**无** `MESSAGE-INTEGRITY`；bind 后裸字节双向 + 预绑定字节先到。
+3. 无 permission（`inbound_peer_without_permission_is_closed_without_an_attempt`）：连接被关、
+   控制连接 300ms 内**没有**任何帧。
+4. 配额（`inbound_connection_quota_closes_extra_peers`）：第 17 条被关、`tcp_quota` 增长、无 indication。
+5. 预绑定溢出（`inbound_prebind_overflow_closes_and_counts`）：`tcp_buffer` 增长、随后 bind `400`。
+6. 30s 未 bind（`inbound_pending_connection_expires_without_a_bind`）：`sweep` 关连接、`tcp_pending` 归零。
+7. `LIFETIME=0`（`lifetime_zero_stops_the_inbound_accept_loop`）：入站连接被关、**relay 端口停止 accept**
+   （轮询到「再连被拒」为止；abort 是异步的，不要断言同步关闭，也不要用「端口可重绑」顶替 ——
+   `SO_REUSEPORT` 让重绑本来就成功）。
+8. `ClientSink::Udp` 分支（`connection_attempt_can_go_out_over_a_datagram_sink`）：TCP allocation 的
+   控制面只可能是 TCP/TLS（§5.1 步骤 2），故该分支直接从 helper 层测编码 + `send_to`。
+9. lab `tcp-relay-passive`：探针断言数 ≥14、`uclient -P` **exit=0 且双向字节增长**、
+   `uclient -T`（`-y`）`lost packets 0`、结束后 `ss -ltn` 在 relay 段无监听。
+10. **测试隔离**：`tcp_relay_config()` 必须给每个 harness 独占 relay 端口段 —— relay listener 带
+    `SO_REUSEPORT`，共用默认段时内核会把并发测试的 peer 轮转投递给别的实例（假红/竞态）。
 
 ## 5b. T2 契约（`turns:` / DTLS / REST / 带宽）
 

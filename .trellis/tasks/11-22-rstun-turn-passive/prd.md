@@ -41,7 +41,12 @@
 - [ ] `turnutils_uclient -P`：能完成 `ConnectionAttempt` → `ConnectionBind` → 数据；
       **判据不能只用 `lost packets 0`**（coturn 实测 50% 丢包），需记录双向字节数与退出码
 - [ ] 无 permission 的入站连接 → 立即关闭且**无** indication（coturn 实测行为）
-- [ ] 控制面四种 transport（UDP/TCP/TLS/DTLS）都能收到 `ConnectionAttempt`（至少 UDP + TCP 实测）
+- [ ] 控制面 **TCP 端到端实测**收到 `ConnectionAttempt`（lab `tcp-relay-passive` + 单测）；
+      **TLS 复用同一条路径**（`turns:` 也记 `ClientTransport::Tcp`、也用同一个 `Queue` sink，
+      `allocate()` 不区分两者），该队列已由 `tls` 项的 `Data indication`（in=2000/out=2000）
+      端到端覆盖；**UDP/DTLS 在协议上不可达**
+      （TCP allocation 要求 stream 控制连接，RFC 6062 §5.1 步骤 2 → UDP/DTLS 上 Allocate(TCP) 回 `400`），
+      其 `ClientSink::Udp` 分支由 helper 级单测覆盖（编码 + `send_to`）
 - [ ] 30 s 未 bind 关闭、`LIFETIME=0` 级联关闭、指标同步
 - [ ] 默认路径冻结不变；全量门禁绿
 
@@ -49,6 +54,6 @@
 
 | R | 缓解 |
 | --- | --- |
-| 反向通道（allocation → 控制连接）是新路径 | 先在 UDP + TCP 控制面实现并测试；TLS 复用 TCP sink；DTLS 沿用 session sender |
+| 反向通道（allocation → 控制连接）是新路径 | 复用既有 `ClientSink`（TCP/TLS 走 `Queue`，`allocate()` 不区分）；UDP/DTLS 协议上不可达（§5.1 步骤 2），`Udp` 分支仅 helper 级单测 |
 | `uclient -P` 判据不稳（50% 丢包） | 用字节数 + 双向连通 + 退出码组合判定，不照搬 `lost packets 0` |
 | 与出站共享 `CONNECTION-ID` 表 | 复用同一状态机，避免两套 id 空间 |

@@ -6,7 +6,7 @@
 
 | # | 事项 | 验证 |
 | --- | --- | --- |
-| 0.1 | `CONNECTION_ATTEMPT_METHOD = 0x00c`；`Allocation.sink: ClientSink`（`allocate()` 里 clone 存入）| 既有测试全绿（行为不变） |
+| 0.1 | `CONNECTION_ATTEMPT_METHOD = 0x00c`；**不**新增 `Allocation.sink` 字段：把 `ClientSink`/`state`/`key`/`username` 的 clone 交给 accept 任务（避免 `Arc<Allocation>` 循环）| 既有测试全绿（行为不变） |
 | 0.2 | `Allocation.accept_task: Option<JoinHandle<()>>`；`Drop`/`remove` abort | 单测：移除 allocation 后任务结束 |
 
 ## 阶段 1 · accept 循环

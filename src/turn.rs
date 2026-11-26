@@ -34,11 +34,14 @@
 //! the allocation's relay family: a mismatch is `443 Peer Address Family
 //! Mismatch` (§8.2 MUST), a match refreshes normally.
 //!
-//! Deliberately absent: the **inbound** half of RFC 6062 (`ConnectionAttempt`,
-//! i.e. a peer dialling the relay listener). Outbound `Connect` +
-//! `ConnectionBind` is what `turnutils_uclient -T` exercises; the passive mode
-//! needs an "allocation → control connection" reverse channel and is a later
-//! sub-item.
+//! Both halves of RFC 6062 are served behind `--turn-tcp-relay`: the outbound
+//! `Connect` + `ConnectionBind` pair, and the **inbound** half (§5.3) — a peer
+//! dialling the relay listener is accepted, checked against the permission
+//! table and announced on the control connection with a `ConnectionAttempt`
+//! indication carrying `CONNECTION-ID` + `XOR-PEER-ADDRESS`. Passive mode is
+//! what `turnutils_uclient -T` (which implies `-y`, client-to-client) needs on
+//! the side that is being dialled; the `ConnectionAttempt` is the only place
+//! this server pushes a message to the client that is not a `Data` indication.
 //!
 //! `DONT-FRAGMENT` (0x001A, §18.9) is supported where the DF bit can really be
 //! set — Linux and macOS/iOS, see [`DONT_FRAGMENT_SUPPORTED`]. `Allocate` with
@@ -121,6 +124,10 @@ pub const CONNECT_METHOD: u16 = 0x00a;
 /// pending peer data connection named by `CONNECTION-ID`; afterwards that
 /// connection carries raw application bytes only.
 pub const CONNECTION_BIND_METHOD: u16 = 0x00b;
+/// `ConnectionAttempt` (RFC 6062 §5.3, §6.1): an **indication** the server
+/// sends on the control connection when a peer dials the TCP relay listener,
+/// carrying the new `CONNECTION-ID` and the peer's `XOR-PEER-ADDRESS`.
+pub const CONNECTION_ATTEMPT_METHOD: u16 = 0x00c;
 
 /// `CHANNEL-NUMBER` (§14.1): channel (u16) + RFFU.
 pub const ATTR_CHANNEL_NUMBER: u16 = 0x000C;
@@ -570,8 +577,13 @@ enum Relay {
 /// why the listener sets `SO_REUSEPORT` — without it the kernel refuses to bind
 /// a second socket to a port that is already listening (see
 /// [`crate::tcp_relay_listener`]).
+///
+/// `Arc` because the **inbound** half (RFC 6062 §5.3) runs as its own accept
+/// task: it owns a clone of the listener for the allocation's whole life while
+/// the allocation itself keeps the address (and the `Drop` that stops that
+/// task).
 struct TcpRelay {
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
 }
 
 impl Relay {
@@ -630,6 +642,10 @@ pub struct Allocation {
     /// Aborts the relay reader when the allocation goes away. `None` for a TCP
     /// allocation: its data plane is one task per `CONNECTION-ID`, not a reader.
     relay_task: Option<JoinHandle<()>>,
+    /// Aborts the RFC 6062 **inbound** accept task (peer dialling the relay
+    /// listener). `None` for a UDP allocation, and for a TCP allocation when
+    /// `--turn-tcp-relay` could not be on (the switch is what creates it).
+    accept_task: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Allocation {
@@ -652,6 +668,11 @@ impl Drop for Allocation {
         // Stopping the reader is what lets the socket (and its port) go. A TCP
         // relay has no reader task; dropping `relay` closes its listener.
         if let Some(task) = &self.relay_task {
+            task.abort();
+        }
+        // The inbound accept task holds an `Arc` of the listener, so it must be
+        // stopped for the relay port to be released (RFC 6062 §5.3).
+        if let Some(task) = &self.accept_task {
             task.abort();
         }
     }
@@ -971,7 +992,9 @@ impl Turn {
                 continue;
             };
             used.insert(port);
-            return Some(TcpRelay { listener });
+            return Some(TcpRelay {
+                listener: Arc::new(listener),
+            });
         }
         None
     }
@@ -1732,7 +1755,8 @@ impl Turn {
             outbound: TokenBucket::new(self.config.bandwidth, now),
         }));
         // A TCP allocation has no relay reader: its data plane is one task per
-        // peer data connection (RFC 6062), started by `Connect`.
+        // peer data connection (RFC 6062), started by `Connect` (outbound) or by
+        // the accept task below (inbound, §5.3).
         let relay_task = match &relay {
             Relay::Udp(relay) => Some(spawn_relay_reader(
                 relay.clone(),
@@ -1743,6 +1767,22 @@ impl Turn {
                 self.counters.clone(),
             )),
             Relay::Tcp(_) => None,
+        };
+        // RFC 6062 §5.3: the inbound half. The task owns the listener clone, the
+        // permission table and the `ClientSink` used to announce a peer with a
+        // `ConnectionAttempt`; `Drop` aborts it with the allocation.
+        let accept_task = match &relay {
+            Relay::Tcp(relay) => Some(spawn_tcp_accept_loop(
+                relay.listener.clone(),
+                key,
+                identity.username.clone(),
+                self.software.clone(),
+                state.clone(),
+                sink.clone(),
+                self.connections.clone(),
+                self.counters.clone(),
+            )),
+            Relay::Udp(_) => None,
         };
         let allocation = Allocation {
             key,
@@ -1756,6 +1796,7 @@ impl Turn {
             df_lock: Mutex::new(()),
             state,
             relay_task,
+            accept_task,
         };
         let attributes = relay_attributes(&allocation, peer, transaction_id, granted, new_token);
         self.insert(allocation);
@@ -3099,6 +3140,189 @@ fn fresh_connection_id() -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// RFC 6062 inbound half: peer dials the relay listener (§5.3)
+// ---------------------------------------------------------------------------
+
+/// Accept peers that dial a TCP allocation's relayed transport address.
+///
+/// RFC 6062 §5.3, step by step:
+/// * accept failures say nothing to the client (log + continue — the listener
+///   stays alive, a transient `EMFILE`/`ECONNABORTED` must not end the loop);
+/// * a peer **without a live permission** is closed immediately and the client
+///   is not told (§5.3 step 3 — that is coturn's observable behaviour too);
+/// * the per-allocation cap is the same 16 as the outbound path; exceeding it
+///   closes the connection and counts `tcp_quota` (there is no request to
+///   answer with `508`);
+/// * otherwise the connection becomes a **pending** `CONNECTION-ID` entry, its
+///   task starts buffering peer bytes (§5.2 pre-bind rule), and the client is
+///   told with a `ConnectionAttempt` indication on the control connection.
+///
+/// Ordering matters: the table entry is published **before** the indication is
+/// sent, so a client that binds the instant it sees the indication finds it.
+///
+/// The task owns an `Arc` of the listener and is aborted by
+/// [`Allocation`]'s `Drop`, which is what releases the relay port §5.5.
+#[allow(clippy::too_many_arguments)]
+fn spawn_tcp_accept_loop(
+    listener: Arc<TcpListener>,
+    key: Key,
+    username: String,
+    software: String,
+    state: Arc<RwLock<AllocationState>>,
+    sink: ClientSink,
+    connections: Arc<Mutex<HashMap<u32, TcpConnection>>>,
+    counters: Arc<Counters>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // The listener's own address, for logs only (the allocation holds the
+        // same value; the task must not keep an `Arc<Allocation>`, which would
+        // make the allocation immortal and its `Drop` unreachable).
+        let relay = listener.local_addr().ok();
+        loop {
+            let (stream, peer_address) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    // §5.3 step 1: an accept failure is not reported to the
+                    // client. Back off briefly so a persistent error
+                    // (`EMFILE`) cannot spin the task.
+                    tracing::debug!(
+                        relay = ?relay,
+                        %error,
+                        "rstun: TURN relay accept failed"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+            };
+            let now = Instant::now();
+            // §5.3 step 3: no permission for this peer → accept then close,
+            // without a `ConnectionAttempt`.
+            let permitted = lock_read(&state)
+                .permissions
+                .get(&peer_address.ip())
+                .is_some_and(|deadline| *deadline > now);
+            if !permitted {
+                tracing::debug!(
+                    %peer_address,
+                    relay = ?relay,
+                    "rstun: TURN inbound peer has no permission, closing"
+                );
+                drop(stream);
+                continue;
+            }
+            let (id, stop_rx, bind_rx) = {
+                let mut table = lock_lock(&connections);
+                let live = table
+                    .values()
+                    .filter(|connection| connection.allocation == key)
+                    .count();
+                if live >= TCP_MAX_CONNECTIONS_PER_ALLOCATION {
+                    counters.rejected_tcp_quota.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        %peer_address,
+                        relay = ?relay,
+                        "rstun: TURN inbound peer refused: connection quota"
+                    );
+                    drop(table);
+                    drop(stream);
+                    continue;
+                }
+                let id = loop {
+                    let candidate = fresh_connection_id();
+                    if !table.contains_key(&candidate) {
+                        break candidate;
+                    }
+                };
+                let (stop_tx, stop_rx) = watch::channel(false);
+                let (bind_tx, bind_rx) = oneshot::channel();
+                table.insert(
+                    id,
+                    TcpConnection {
+                        allocation: key,
+                        username: username.clone(),
+                        peer: peer_address,
+                        // No dial to wait for: it is already `Pending` and the
+                        // 30 s `ConnectionBind` window starts now (§5.3 step 5).
+                        state: ConnState::Pending,
+                        expires_at: Some(now + TCP_BIND_TIMEOUT),
+                        stop: stop_tx,
+                        bind: Some(bind_tx),
+                    },
+                );
+                (id, stop_rx, bind_rx)
+            };
+            let (peer_reader, peer_writer) = tokio::io::split(stream);
+            tokio::spawn(run_tcp_connection(
+                id,
+                connections.clone(),
+                counters.clone(),
+                peer_reader,
+                peer_writer,
+                stop_rx,
+                bind_rx,
+            ));
+            // §5.3 step 4: announce it on the **control** connection.
+            let indication = connection_attempt_indication(id, peer_address, &software);
+            if !send_to_client(&sink, indication, key.client).await {
+                // The control connection is gone (or its bounded queue is full):
+                // nobody can bind this connection, so close it instead of
+                // burning the 30 s window. Indications are best-effort, like
+                // every TURN indication.
+                counters.rejected_tcp_send.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    id,
+                    %peer_address,
+                    "rstun: TURN ConnectionAttempt could not be sent, closing the inbound peer"
+                );
+                if let Some(connection) = lock_lock(&connections).remove(&id) {
+                    let _ = connection.stop.send(true);
+                }
+            }
+        }
+    })
+}
+
+/// Encode a `ConnectionAttempt` (RFC 6062 §6.1): `CONNECTION-ID` +
+/// `XOR-PEER-ADDRESS` (+ `SOFTWARE`, matching coturn's own indication).
+///
+/// It is an **indication**, so it carries no `MESSAGE-INTEGRITY` (RFC 5389
+/// §7.3.1). `FINGERPRINT` is left out exactly like this server's `Data`
+/// indication and `ChannelData` — clients that require it can be added later
+/// without changing the attribute set above.
+fn connection_attempt_indication(id: u32, peer: SocketAddr, software: &str) -> Vec<u8> {
+    let transaction_id = fresh_transaction_id();
+    let mut body = Vec::with_capacity(48);
+    protocol::push_attribute(&mut body, ATTR_CONNECTION_ID, &id.to_be_bytes());
+    protocol::push_attribute(
+        &mut body,
+        ATTR_XOR_PEER_ADDRESS,
+        &protocol::xor_mapped_address_value(peer, &transaction_id),
+    );
+    if !software.is_empty() {
+        protocol::push_attribute(&mut body, protocol::ATTR_SOFTWARE, software.as_bytes());
+    }
+    protocol::encode_message(
+        protocol::message_type(CONNECTION_ATTEMPT_METHOD, MessageClass::Indication),
+        &transaction_id,
+        &body,
+    )
+}
+
+/// Hand one already-framed payload to the client through its `ClientSink`.
+///
+/// `false` means "not delivered": a UDP send error, or a full/closed bounded
+/// queue. Callers decide what that means (relayed data is simply lost; a
+/// `ConnectionAttempt` closes the peer it can no longer be bound to).
+async fn send_to_client(sink: &ClientSink, payload: Vec<u8>, client: SocketAddr) -> bool {
+    match sink {
+        ClientSink::Udp(socket) => socket.send_to(&payload, client).await.is_ok(),
+        // Bounded queue: a client that stops reading loses datagrams
+        // (relayed data is best-effort) but cannot grow memory.
+        ClientSink::Queue(writer) => writer.try_send(payload).is_ok(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Relay reader (peer → client)
 // ---------------------------------------------------------------------------
 
@@ -3166,12 +3390,7 @@ fn spawn_relay_reader(
                 Some(channel) => channel_data_frame(channel, &buffer[..length], transport),
                 None => data_indication(source, &buffer[..length]),
             };
-            let sent = match &sink {
-                ClientSink::Udp(socket) => socket.send_to(&payload, client).await.is_ok(),
-                // Bounded queue: a client that stops reading loses datagrams
-                // (relayed data is best-effort) but cannot grow memory.
-                ClientSink::Queue(writer) => writer.try_send(payload).is_ok(),
-            };
+            let sent = send_to_client(&sink, payload, client).await;
             if sent {
                 counters
                     .bytes_out

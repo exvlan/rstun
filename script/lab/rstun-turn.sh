@@ -10,8 +10,9 @@
 #   bash script/lab/rstun-turn.sh --no-build       # 复用 target/debug/rstun（探测其 feature）
 #   bash script/lab/rstun-turn.sh --tls --dtls     # 只跑 TLS/DTLS 项（自动 --features full 构建）
 #   bash script/lab/rstun-turn.sh --only relay     # 只跑一项
-#     （startup|relay|tcprelay|auth|lifecycle|wrong-user|raf|df|ipv6relay|wildcard|
-#       permission-limit|quota|ports|tls|dtls|cert-reload|cert-poll|rest|bandwidth|cleanup|frozen|coturn）
+#     （startup|relay|tcprelay|tcp-relay-passive|auth|lifecycle|wrong-user|raf|df|
+#       ipv6relay|wildcard|permission-limit|quota|ports|tls|dtls|cert-reload|cert-poll|
+#       rest|bandwidth|cleanup|frozen|coturn）
 #   bash script/lab/rstun-turn.sh --keep           # 保留日志（默认只清进程）
 #   FROZEN_BASE=<sha> bash script/lab/rstun-turn.sh --only frozen
 #                                                  # 字节冻结对照的基线提交（默认 cad4fa2）
@@ -35,8 +36,10 @@
 # 日志：$RSTUN_TURN_DIR（默认 /tmp/opencode/rstun-turn），每项一个 .log。
 #
 # 判据提醒：本脚本用**真 socket + 真鉴权**，不用 mock。cleanup 项用
-# `--allocation-lifetime 2` 让 allocation 自然过期，再断言 `ss -lun` 在 relay
-# 端口段内无监听 —— 这就是「回收彻底」的可执行定义。
+# `--allocation-lifetime 2` 让 allocation 自然过期，再断言 `ss -lun` + `ss -ltn`
+# 在 relay 端口段内无监听 —— 这就是「回收彻底」的可执行定义。开始前先快照该段
+# （UDP+TCP）：宿主的其它服务若占着段内端口，cleanup 记 SKIP（打印端口）而不是
+# FAIL，tcprelay / tcp-relay-passive 则只把自己新增的端口算作残留。
 
 set -uo pipefail
 
@@ -67,10 +70,11 @@ FAILED=()
 SKIPPED=()
 PASSED=()
 
-ALL_ITEMS=(startup relay tcprelay auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls cert-reload cert-poll rest bandwidth cleanup frozen coturn)
+ALL_ITEMS=(startup relay tcprelay tcp-relay-passive auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls cert-reload cert-poll rest bandwidth cleanup frozen coturn)
 
 usage() {
-  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+  # The doc block is the comment header above `set -uo pipefail`.
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -103,7 +107,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [[ -n "$ONLY" ]]; then
   case "$ONLY" in
-    startup | relay | tcprelay | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | cert-reload | cert-poll | rest | bandwidth | cleanup | frozen | coturn) : ;;
+    startup | relay | tcprelay | tcp-relay-passive | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | cert-reload | cert-poll | rest | bandwidth | cleanup | frozen | coturn) : ;;
     *) echo "--only 未知项: $ONLY（可用：${ALL_ITEMS[*]}）" >&2; exit 2 ;;
   esac
 fi
@@ -177,6 +181,22 @@ relay_tcp_listeners() {
   ss -ltnH 2>/dev/null | awk '{print $4}' | awk -F: -v lo="$RELAY_LO" -v hi="$RELAY_HI" '
     { port = $NF + 0; if (port >= lo && port <= hi) print $NF }
   ' | sort -u
+}
+
+relay_sockets() {
+  # Every listening socket (UDP **and** TCP) whose local port is inside the
+  # relay range. TCP has to be included since RFC 6062: its relay is a LISTEN
+  # socket, invisible to `ss -lun`, so a UDP-only view reports false leftovers
+  # (and a false "range is clean" before a run).
+  { relay_listeners; relay_tcp_listeners; } | sort -u
+}
+
+relay_new_sockets() { # before-snapshot
+  # Relay-range sockets that appeared **after** `$1` was taken. An unrelated
+  # service squatting in the range must not be reported as this server's
+  # leftover; only what our run added is an assertion failure.
+  local before="$1"
+  comm -13 <(printf '%s\n' "${before:-}" | sort -u) <(relay_sockets)
 }
 
 turn_args() { # extra args...
@@ -345,12 +365,17 @@ run_relay() {
 # ---------- 2b. tcprelay: RFC 6062 outbound Connect + ConnectionBind ----------
 #
 # Outbound only: Allocate(TCP) → Connect → ConnectionBind → raw bytes. The
-# `turnutils_uclient -T` shortcut is **not** usable as the assertion here:
-# `-T` implies `-y` (client-to-client), and the second client's side needs a
-# `ConnectionAttempt` indication — the passive mode this task leaves out. The
-# probe performs the standard client flow (and runs identically against coturn).
+# `turnutils_uclient -T` shortcut is **not** used here: `-T` implies `-y`
+# (client-to-client), so it also exercises the inbound half on the peer side;
+# that belongs to the `tcp-relay-passive` item. The probe performs the standard
+# client flow (and runs identically against coturn).
 run_tcprelay() {
   local name=tcprelay
+  # Snapshot the range first: `SO_REUSEPORT`-bound relay listeners are TCP
+  # LISTEN sockets, so a foreign service in the range must be excluded from the
+  # leftover assertion instead of turning into a false FAIL.
+  local before
+  before="$(relay_sockets)"
   start_turn "$name" --tcp --turn-tcp-relay
   if ! wait_health "$HEALTH_PORT"; then
     fail "$name" "server did not become healthy"
@@ -376,16 +401,108 @@ run_tcprelay() {
     return
   fi
   # The TCP relay is a real listener while the allocation lives, and LIFETIME=0
-  # (part of the probe) must take it away.
+  # (part of the probe) must take it away. Only ports *we* added count.
   local leftover
-  leftover="$(relay_tcp_listeners)"
+  leftover="$(relay_new_sockets "$before")"
   if [[ -n "$leftover" ]]; then
     fail "$name" "TCP relay listener left behind: $(echo "$leftover" | tr '\n' ' ')"
   else
     ok "$name" "$assertions assertions, no TCP relay listener left in $RELAY_LO-$RELAY_HI"
   fi
   if command -v turnutils_uclient >/dev/null 2>&1; then
-    log "info: $name: uclient -T not used (it implies -y; the peer side needs ConnectionAttempt, out of scope)"
+    log "info: $name: uclient -T lives in the tcp-relay-passive item (it implies -y and needs ConnectionAttempt)"
+  fi
+  stop_server "$name"
+}
+
+# ---------- 2c. tcp-relay-passive: RFC 6062 §5.3 inbound (ConnectionAttempt) ----------
+#
+# A peer dials the TCP relay listener; the server accepts it, checks the
+# permission table and announces it on the control connection with a
+# `ConnectionAttempt` (CONNECTION-ID + XOR-PEER-ADDRESS), then the client binds a
+# fresh connection. Two independent oracles:
+#
+#   · the probe, which walks the sequence step by step and also covers the
+#     negative half (no permission → closed, no indication);
+#   · `turnutils_uclient -P`, whose judge is **exit=0 plus bytes in both
+#     directions** — not `lost packets 0`: coturn's own `-P` run loses 50% on
+#     this path, so that counter is unusable as a criterion.
+#
+# `turnutils_uclient -T` (which implies -y) is the end-to-end regression that
+# needs both halves: before the passive half it received nothing at all
+# (tot_recv_msgs=0, hang to timeout), so `lost packets 0` is meaningful here.
+run_tcp_relay_passive() {
+  local name=tcp-relay-passive
+  # Same snapshot as `tcprelay`: the leftover check must only look at the ports
+  # this run created, not at whatever else listens inside the range.
+  local before
+  before="$(relay_sockets)"
+  start_turn "$name" --tcp --turn-tcp-relay --max-allocations-per-user 32
+  if ! wait_health "$HEALTH_PORT"; then
+    fail "$name" "server did not become healthy"
+    stop_server "$name"
+    return
+  fi
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    stop_server "$name"
+    skip "$name" "turnutils_uclient not installed"
+    return
+  fi
+
+  # 1) The probe: ConnectionAttempt attributes + negative half + raw bytes.
+  if ! python3 "$PROBE" tcp-relay-passive --server "127.0.0.1:$BASE" \
+    --user "$USER_NAME" --password "$USER_PASS" --realm "$REALM" \
+    >"$LOG_DIR/$name-probe.log" 2>&1; then
+    fail "$name" "probe assertions failed (see $LOG_DIR/$name-probe.log)"
+    stop_server "$name"
+    return
+  fi
+  local assertions
+  assertions="$(grep -c '^ok:' "$LOG_DIR/$name-probe.log")"
+  # A check that silently stops running would still exit 0; pin the count.
+  if (( assertions < 14 )); then
+    fail "$name" "probe reported $assertions assertions (expected 14); see $LOG_DIR/$name-probe.log"
+    stop_server "$name"
+    return
+  fi
+
+  # 2) `uclient -P`: bytes must move both ways. The counters are cumulative, so
+  #    compare against a snapshot taken right before the run.
+  local before_in before_out after_in after_out
+  before_in="$(metric 'rstun_turn_bytes_total{direction="in"}')"
+  before_out="$(metric 'rstun_turn_bytes_total{direction="out"}')"
+  before_in="${before_in:-0}"
+  before_out="${before_out:-0}"
+  turnutils_uclient -P -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 5 -m 2 -v 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient-P.log" 2>&1
+  local passive_exit=$?
+  after_in="$(metric 'rstun_turn_bytes_total{direction="in"}')"
+  after_out="$(metric 'rstun_turn_bytes_total{direction="out"}')"
+  after_in="${after_in:-0}"
+  after_out="${after_out:-0}"
+  local passive=ok
+  if [[ $passive_exit -ne 0 ]] ||
+    (( after_in <= before_in )) || (( after_out <= before_out )); then
+    passive=failed
+  fi
+
+  # 3) `uclient -T` (implies -y): now completes with `lost packets 0`.
+  turnutils_uclient -T -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 5 -m 2 -v 127.0.0.1 \
+    >"$LOG_DIR/$name-uclient-T.log" 2>&1
+  local active_exit=$?
+  local active=ok
+  if [[ $active_exit -ne 0 ]] || ! uclient_ok "$LOG_DIR/$name-uclient-T.log"; then
+    active=failed
+  fi
+
+  # 4) The relay listeners are gone once both clients are done (only the ports
+  #    this run created — see `relay_new_sockets`).
+  local leftover
+  leftover="$(relay_new_sockets "$before")"
+  if [[ $passive == ok && $active == ok && -z "$leftover" ]]; then
+    ok "$name" "$assertions probe assertions; uclient -P exit=0 bytes in=$((after_in - before_in)) out=$((after_out - before_out)); uclient -T lost packets 0"
+  else
+    fail "$name" "probe=$assertions passive=$passive(exit=$passive_exit in=$((after_in - before_in)) out=$((after_out - before_out))) active=$active(exit=$active_exit) leftover=[$(echo "$leftover" | tr '\n' ' ')]"
   fi
   stop_server "$name"
 }
@@ -1277,10 +1394,21 @@ run_bandwidth() {
   lost="$(grep -ao "Total lost packets [0-9]*" "$LOG_DIR/$name-uclient.log" | awk '{print $4}' | head -n 1)"
   dropped_in="$(metric 'rstun_turn_bytes_dropped_total{direction="in"}')"
   # The allocation must survive the throttling: a fresh small relay still works.
-  turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 2 -m 2 -y 127.0.0.1 \
-    >"$LOG_DIR/$name-after.log" 2>&1
-  local after=ok
-  uclient_ok "$LOG_DIR/$name-after.log" || after=failed
+  # A `508` here can also mean "the host's ephemeral port range stole our relay
+  # ports" (`ip_local_port_range` often covers the relay range; the server then
+  # reports `rejected_ports` and answers 508). That is environmental, not a
+  # regression, so retry a few times on 508 only — any other failure is final.
+  local after=failed attempt
+  for attempt in 1 2 3; do
+    turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$BASE" -n 2 -m 2 -y 127.0.0.1 \
+      >"$LOG_DIR/$name-after.log" 2>&1
+    if uclient_ok "$LOG_DIR/$name-after.log"; then
+      after=ok
+      break
+    fi
+    grep -qa "error 508" "$LOG_DIR/$name-after.log" || break
+    sleep 1
+  done
   local healthy=ok
   wait_health "$HEALTH_PORT" || healthy=failed
 
@@ -1298,9 +1426,12 @@ run_bandwidth() {
 run_cleanup() {
   local name=cleanup
   local before
-  before="$(relay_listeners)"
+  # UDP **and** TCP: RFC 6062 relay listeners are TCP LISTEN sockets, so a
+  # UDP-only pre-check misses them (and an unrelated TCP service inside the
+  # range used to be reported as our leftover at the end → false FAIL).
+  before="$(relay_sockets)"
   if [[ -n "$before" ]]; then
-    skip "$name" "relay range $RELAY_LO-$RELAY_HI already has listeners: $(echo "$before" | tr '\n' ' ')"
+    skip "$name" "relay range $RELAY_LO-$RELAY_HI already has listeners (UDP/TCP): $(echo "$before" | tr '\n' ' ')"
     return
   fi
   start_turn "$name" "--allocation-lifetime" "2"
@@ -1331,13 +1462,14 @@ run_cleanup() {
     sleep 0.2
     waited=$((waited + 1))
   done
-  local leftover leftover_tcp
-  leftover="$(relay_listeners)"
-  leftover_tcp="$(relay_tcp_listeners)"
-  if [[ "$active" == "0" && -z "$leftover" && -z "$leftover_tcp" ]]; then
+  local leftover
+  # The pre-check proved the range was empty, so anything left now came from
+  # this run (UDP relay sockets and RFC 6062 TCP listeners alike).
+  leftover="$(relay_sockets)"
+  if [[ "$active" == "0" && -z "$leftover" ]]; then
     ok "$name" "created=$created, allocations=0 and no UDP/TCP relay listener in $RELAY_LO-$RELAY_HI"
   else
-    fail "$name" "created=$created allocations=$active leftover=[$(echo "$leftover $leftover_tcp" | tr '\n' ' ')]"
+    fail "$name" "created=$created allocations=$active leftover=[$(echo "$leftover" | tr '\n' ' ')]"
   fi
   stop_server "$name"
 }
@@ -1675,6 +1807,7 @@ run_item() {
     startup) run_startup ;;
     relay) run_relay ;;
     tcprelay) run_tcprelay ;;
+    tcp-relay-passive) run_tcp_relay_passive ;;
     auth) run_auth ;;
     lifecycle) run_lifecycle ;;
     wrong-user) run_wrong_user ;;

@@ -1000,6 +1000,30 @@ impl TcpClient {
         self.request(CONNECTION_BIND_METHOD, extra).await
     }
 
+    /// Signed `CreatePermission` for one peer (the XOR is keyed on this
+    /// request's transaction id, so the caller cannot build it).
+    async fn create_permission_for(&mut self, peer: SocketAddr) -> Vec<u8> {
+        let transaction_id = self.next_id();
+        let frame = self.signed_frame(
+            CREATE_PERMISSION_METHOD,
+            &transaction_id,
+            vec![(
+                ATTR_XOR_PEER_ADDRESS,
+                protocol::xor_mapped_address_value(peer, &transaction_id),
+            )],
+        );
+        self.write(&frame).await;
+        self.read_stun().await
+    }
+
+    /// `read_stun` bounded in time: a missing `ConnectionAttempt` must fail the
+    /// test instead of hanging it.
+    async fn read_stun_within(&mut self, millis: u64) -> Option<Vec<u8>> {
+        tokio::time::timeout(Duration::from_millis(millis), self.read_stun())
+            .await
+            .ok()
+    }
+
     async fn refresh(&mut self, seconds: u32) -> Vec<u8> {
         self.request(
             REFRESH_METHOD,
@@ -1208,7 +1232,7 @@ async fn allocate_rejects_tcp_transport_and_missing_requested_transport() {
     let mut client = Client::connect(harness.server).await;
     client.challenge().await;
 
-    // REQUESTED-TRANSPORT=6 (TCP allocation, RFC 6062) is out of scope → 442.
+    // REQUESTED-TRANSPORT=6 with `--turn-tcp-relay` **off** → the classic 442.
     let response = client
         .request(
             ALLOCATE_METHOD,
@@ -2200,8 +2224,22 @@ async fn start_tcp_with(config: Config, auth: auth::Auth) -> TcpHarness {
 }
 
 fn tcp_relay_config() -> Config {
+    // Every harness needs its **own** relay port window: `tcp_relay_listener`
+    // sets `SO_REUSEPORT`, so two concurrent tests that both took the lowest
+    // free port of the same range would bind the *same* port and the kernel
+    // would round-robin their peers between the two servers. (That is exactly
+    // what the default range does, since each `Turn` keeps its own pool.)
+    static NEXT_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let window = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
+    // `% 400` keeps the arithmetic inside `u16`: 20_000 + 399*100 = 59_900 is the
+    // highest window start, so window N and N+400 share a port range (harmless:
+    // a harness that far into the run reuses an early window's ports, and no
+    // test is still listening there). Without the modulus the multiply would
+    // overflow a `u16` at the 456th call (debug panic) and wrap at the 656th.
+    let lo = 20_000 + (window % 400) as u16 * 100;
     Config {
         tcp_relay: true,
+        relay_ports: (lo, lo + 99),
         ..Config::default()
     }
 }
@@ -2751,4 +2789,385 @@ async fn pre_bind_buffer_overflow_closes_the_peer_connection() {
     let mut data = TcpClient::connect(harness.server).await;
     assert_eq!(error_code(&data.connection_bind(id).await), Some(400));
     assert_eq!(harness.turn.snapshot().tcp_pending, 0);
+}
+
+// ---------------------------------------------------------------------------
+// RFC 6062 passive mode: peer dials the relay listener (§5.3)
+// ---------------------------------------------------------------------------
+
+/// Read a `ConnectionAttempt` off the control connection and return
+/// `(CONNECTION-ID, XOR-PEER-ADDRESS, has SOFTWARE)`.
+fn connection_attempt(frame: &[u8]) -> (u32, SocketAddr, bool) {
+    let message = protocol::parse(frame).expect("ConnectionAttempt parses");
+    assert_eq!(
+        protocol::message_method(message.msg_type),
+        CONNECTION_ATTEMPT_METHOD,
+        "method must be ConnectionAttempt"
+    );
+    assert_eq!(
+        protocol::message_class(message.msg_type),
+        MessageClass::Indication,
+        "ConnectionAttempt is an indication"
+    );
+    let attributes = attributes_of(frame);
+    let id = connection_id(frame).expect("CONNECTION-ID");
+    let peer = attributes
+        .iter()
+        .find(|(attr_type, _)| *attr_type == ATTR_XOR_PEER_ADDRESS)
+        .and_then(|(_, value)| protocol::decode_xor_mapped_address(value, &message.transaction_id))
+        .expect("XOR-PEER-ADDRESS");
+    let software = attributes
+        .iter()
+        .any(|(attr_type, _)| *attr_type == protocol::ATTR_SOFTWARE);
+    (id, peer, software)
+}
+
+/// Poll `predicate` for up to two seconds (tasks are asynchronous).
+async fn eventually(mut predicate: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if predicate() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    predicate()
+}
+
+#[tokio::test]
+async fn inbound_peer_is_announced_with_a_connection_attempt_and_binds() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let mut control = TcpClient::connect(harness.server).await;
+    let allocation = control.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None, "TCP Allocate");
+    let relay = relayed_address(&allocation);
+    // Permission is per IP (RFC 8656 §8), so any 127.0.0.1 port covers the peer.
+    assert_eq!(
+        error_code(
+            &control
+                .create_permission_for("127.0.0.1:9".parse().unwrap())
+                .await
+        ),
+        None,
+        "CreatePermission"
+    );
+
+    // The peer dials the relayed transport address (§5.3 step 1).
+    let mut peer = TcpStream::connect(relay).await.expect("relay accepts");
+    let seen = peer.local_addr().unwrap();
+
+    let attempt = control
+        .read_stun_within(2000)
+        .await
+        .expect("ConnectionAttempt on the control connection");
+    let (id, announced, software) = connection_attempt(&attempt);
+    assert_eq!(announced, seen, "XOR-PEER-ADDRESS is the dialling peer");
+    assert!(software, "SOFTWARE matches coturn's own indication");
+
+    // §5.2 buffering also applies to the inbound half.
+    peer.write_all(b"early").await.unwrap();
+
+    let mut data = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&data.connection_bind(id).await), None, "bind");
+
+    let mut buffered = [0_u8; 5];
+    data.read_exact(&mut buffered).await;
+    assert_eq!(&buffered, b"early", "pre-bind bytes arrive after the bind");
+
+    data.write(b"client->peer").await;
+    let mut towards_peer = [0_u8; 12];
+    peer.read_exact(&mut towards_peer).await.unwrap();
+    assert_eq!(&towards_peer, b"client->peer");
+
+    peer.write_all(b"peer->client").await.unwrap();
+    let mut towards_client = [0_u8; 12];
+    data.read_exact(&mut towards_client).await;
+    assert_eq!(&towards_client, b"peer->client");
+
+    let snapshot = harness.turn.snapshot();
+    assert_eq!(snapshot.tcp_bound, 1);
+    assert_eq!(snapshot.bytes_in, 12);
+    assert_eq!(snapshot.bytes_out, 5 + 12);
+}
+
+#[tokio::test]
+async fn connection_attempt_can_go_out_over_a_datagram_sink() {
+    // A TCP allocation can only be created on a TCP/TLS control connection
+    // (RFC 6062 §5.1 step 2 answers 400 over UDP/DTLS), so the `ClientSink::Udp`
+    // branch is not reachable from the wire. The encoder and the sink helper are
+    // the shared pieces, so exercise them directly.
+    let server = Arc::new(udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+    let peer: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+
+    let indication = connection_attempt_indication(0x1234_5678, peer, "rstun/test");
+    let sink = ClientSink::Udp(server);
+    assert!(send_to_client(&sink, indication, client_addr).await);
+
+    let frame = recv(&client, 1000).await.expect("indication arrives");
+    let (id, announced, software) = connection_attempt(&frame);
+    assert_eq!(id, 0x1234_5678);
+    assert_eq!(announced, peer);
+    assert!(software);
+
+    // A control connection that is gone (`Queue` whose writer task ended) makes
+    // the announcement undeliverable: the caller drops the inbound connection
+    // instead of leaving a pending entry nobody can bind.
+    let (sender, receiver) = mpsc::channel(1);
+    drop(receiver);
+    let closed = ClientSink::Queue(sender);
+    assert!(
+        !send_to_client(
+            &closed,
+            connection_attempt_indication(1, peer, "rstun/test"),
+            client_addr
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn inbound_peer_without_permission_is_closed_without_an_attempt() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let mut control = TcpClient::connect(harness.server).await;
+    let allocation = control.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None);
+    let relay = relayed_address(&allocation);
+
+    let mut peer = TcpStream::connect(relay).await.expect("relay accepts");
+    let mut buffer = [0_u8; 1];
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut peer, &mut buffer),
+    )
+    .await
+    .expect("accepted then closed");
+    assert!(
+        matches!(outcome, Ok(0) | Err(_)),
+        "no permission means the peer is closed with no payload"
+    );
+    assert!(
+        control.read_stun_within(300).await.is_none(),
+        "no ConnectionAttempt without a permission (§5.3 step 3)"
+    );
+    assert_eq!(harness.turn.snapshot().tcp_pending, 0);
+}
+
+#[tokio::test]
+async fn inbound_connection_quota_closes_extra_peers() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let mut control = TcpClient::connect(harness.server).await;
+    let allocation = control.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None);
+    let relay = relayed_address(&allocation);
+    assert_eq!(
+        error_code(
+            &control
+                .create_permission_for("127.0.0.1:9".parse().unwrap())
+                .await
+        ),
+        None
+    );
+
+    let mut peers = Vec::new();
+    for index in 0..TCP_MAX_CONNECTIONS_PER_ALLOCATION {
+        let peer = TcpStream::connect(relay).await.expect("relay accepts");
+        peers.push(peer);
+        let attempt = control
+            .read_stun_within(2000)
+            .await
+            .unwrap_or_else(|| panic!("ConnectionAttempt #{index}"));
+        assert!(connection_id(&attempt).is_some());
+    }
+    assert_eq!(
+        harness.turn.snapshot().tcp_pending as usize,
+        TCP_MAX_CONNECTIONS_PER_ALLOCATION
+    );
+
+    // The 17th is closed without an indication (there is no request to answer
+    // with 508 on this path) and is counted as `tcp_quota`.
+    let mut extra = TcpStream::connect(relay).await.expect("relay accepts");
+    let mut buffer = [0_u8; 1];
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut extra, &mut buffer),
+    )
+    .await
+    .expect("quota peer closed");
+    assert!(matches!(outcome, Ok(0) | Err(_)));
+    assert!(harness.turn.snapshot().rejected_tcp_quota >= 1);
+    assert!(control.read_stun_within(300).await.is_none());
+    drop(peers);
+}
+
+#[tokio::test]
+async fn inbound_prebind_overflow_closes_and_counts() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let mut control = TcpClient::connect(harness.server).await;
+    let allocation = control.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None);
+    let relay = relayed_address(&allocation);
+    assert_eq!(
+        error_code(
+            &control
+                .create_permission_for("127.0.0.1:9".parse().unwrap())
+                .await
+        ),
+        None
+    );
+
+    let mut peer = TcpStream::connect(relay).await.expect("relay accepts");
+    let attempt = control.read_stun_within(2000).await.expect("attempt");
+    let id = connection_id(&attempt).expect("CONNECTION-ID");
+
+    let flood = vec![0x5a_u8; TCP_PREBIND_BUFFER + 8 * 1024];
+    let _ = tokio::time::timeout(Duration::from_secs(2), peer.write_all(&flood)).await;
+    assert!(
+        eventually(|| harness.turn.snapshot().rejected_tcp_buffer >= 1).await,
+        "the pre-bind cap must close the inbound connection"
+    );
+    let mut data = TcpClient::connect(harness.server).await;
+    assert_eq!(error_code(&data.connection_bind(id).await), Some(400));
+    assert_eq!(harness.turn.snapshot().tcp_pending, 0);
+}
+
+#[tokio::test]
+async fn inbound_pending_connection_expires_without_a_bind() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let mut control = TcpClient::connect(harness.server).await;
+    let allocation = control.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None);
+    let relay = relayed_address(&allocation);
+    assert_eq!(
+        error_code(
+            &control
+                .create_permission_for("127.0.0.1:9".parse().unwrap())
+                .await
+        ),
+        None
+    );
+
+    let mut peer = TcpStream::connect(relay).await.expect("relay accepts");
+    assert!(control.read_stun_within(2000).await.is_some());
+    assert_eq!(harness.turn.snapshot().tcp_pending, 1);
+
+    harness
+        .turn
+        .sweep(Instant::now() + TCP_BIND_TIMEOUT + Duration::from_secs(2));
+    let mut buffer = [0_u8; 4];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut peer, &mut buffer),
+    )
+    .await
+    .expect("peer closed")
+    .expect("read");
+    assert_eq!(
+        read, 0,
+        "an unbound inbound connection is closed after 30 s"
+    );
+    assert_eq!(harness.turn.snapshot().tcp_pending, 0);
+}
+
+#[tokio::test]
+async fn lifetime_zero_stops_the_inbound_accept_loop() {
+    let harness = start_tcp(tcp_relay_config()).await;
+    let mut control = TcpClient::connect(harness.server).await;
+    let allocation = control.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None);
+    let relay = relayed_address(&allocation);
+    assert_eq!(
+        error_code(
+            &control
+                .create_permission_for("127.0.0.1:9".parse().unwrap())
+                .await
+        ),
+        None
+    );
+
+    let mut peer = TcpStream::connect(relay).await.expect("relay accepts");
+    assert!(control.read_stun_within(2000).await.is_some());
+
+    assert_eq!(error_code(&control.refresh(0).await), None);
+    assert_eq!(harness.turn.active(), 0);
+
+    // §5.5: every data connection of the allocation goes away.
+    let mut buffer = [0_u8; 4];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut peer, &mut buffer),
+    )
+    .await
+    .expect("peer closed")
+    .expect("read");
+    assert_eq!(read, 0);
+
+    // The accept task is aborted with the allocation, so the relay port stops
+    // listening: new dials are refused instead of being accepted forever.
+    let mut refused = false;
+    for _ in 0..200 {
+        match TcpStream::connect(relay).await {
+            Err(_) => {
+                refused = true;
+                break;
+            }
+            Ok(stream) => {
+                drop(stream);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    assert!(refused, "relay {relay} must stop accepting");
+}
+
+#[tokio::test]
+async fn an_undeliverable_connection_attempt_closes_the_inbound_peer() {
+    // The announcement can only fail when the control connection is gone, and
+    // that also removes the allocation — so the branch is driven directly: one
+    // accept loop with a `Queue` sink whose writer task has already ended.
+    let listener = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let relay = listener.local_addr().unwrap();
+    let now = Instant::now();
+    let state = Arc::new(RwLock::new(AllocationState {
+        expires_at: now + Duration::from_secs(60),
+        permissions: HashMap::from([(relay.ip(), now + PERMISSION_LIFETIME)]),
+        channels: HashMap::new(),
+        inbound: TokenBucket::new(0, now),
+        outbound: TokenBucket::new(0, now),
+    }));
+    let connections: Arc<Mutex<HashMap<u32, TcpConnection>>> = Arc::new(Mutex::new(HashMap::new()));
+    let counters = Arc::new(Counters::default());
+    let (sender, receiver) = mpsc::channel(1);
+    drop(receiver);
+    let key = Key {
+        client: "127.0.0.1:1234".parse().unwrap(),
+        transport: ClientTransport::Tcp,
+        server: relay,
+    };
+    let task = spawn_tcp_accept_loop(
+        listener,
+        key,
+        USER.to_string(),
+        "rstun/test".to_string(),
+        state,
+        ClientSink::Queue(sender),
+        connections.clone(),
+        counters.clone(),
+    );
+
+    let mut peer = TcpStream::connect(relay).await.expect("relay accepts");
+    let mut buffer = [0_u8; 1];
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut peer, &mut buffer),
+    )
+    .await
+    .expect("the inbound peer is closed");
+    assert!(matches!(outcome, Ok(0) | Err(_)));
+    assert_eq!(counters.rejected_tcp_send.load(Ordering::Relaxed), 1);
+    assert!(
+        lock_lock(&connections).is_empty(),
+        "an unannounced connection must not stay pending"
+    );
+    task.abort();
 }

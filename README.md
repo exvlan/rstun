@@ -21,9 +21,10 @@ RFC 8489 §9.2 的 SHA256/USERHASH，**默认关闭**）+ **可选的 RFC 8656 �
 DTLS 1.2、TURN REST 临时凭据（coturn `use-auth-secret`）、每 allocation 带宽配额、
 **证书热加载**（`SIGHUP` 或文件轮询：默认 30s，`--tls-cert-poll` 可调、`0` = 只认 `SIGHUP`；
 不重启、不中断监听）。
-RFC 6062 的**出站** TCP allocation（`--turn-tcp-relay`，默认关）也支持：`Allocate` +
-`Connect` + `ConnectionBind`，中继数据是裸 TCP 字节。**不做**：RFC 6062 的被动模式
-（`ConnectionAttempt`）、ACME/OCSP、租户/数据库/配置文件。需要这些时请用 coturn。
+RFC 6062 的 TCP allocation（`--turn-tcp-relay`，默认关）也支持，**出站与被动两种方向**：
+`Allocate` + `Connect` + `ConnectionBind` 的裸 TCP 字节中继，以及 peer 主动连入 relay 时的
+`ConnectionAttempt` 通知（`turnutils_uclient -T`/`-P` 都能完成）。**不做**：ACME/OCSP、
+租户/数据库/配置文件。需要这些时请用 coturn。
 
 **命名**：crate 与二进制都叫 `rstun`。**绝对不能改叫 `stun`** —— Debian 的 `stun-client`
 包已经占用 `/usr/bin/stun`，同名会直接撞包/覆盖。

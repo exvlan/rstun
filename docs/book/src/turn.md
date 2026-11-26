@@ -41,7 +41,7 @@ rstun server \
 | 防回环 | 拒绝：`unspecified` / `multicast` / 本进程**监听地址** / 该 allocation 自己的 relay / **loopback peer**（仅当请求到达的 socket 本身绑定在回环地址时放行，供本地开发与 `-y` 矩阵）→ `403`。`--listen 0.0.0.0` 或公网监听下回环 peer 一律拒绝（否则「peer=127.0.0.1:<监听端口>」漏检）。同一进程内**其它 allocation 的 relay 地址允许** —— `turnutils_uclient -y` / 同 NAT WebRTC 的正常路径。**已知盲区**：宿主自身公网 IP 无法在不引入接口枚举依赖的情况下判定 |
 | 回收 | allocation 过期 / `LIFETIME=0` → abort relay 读任务 → 关闭 socket → 端口归还池；测试断言过期后 `ss -lun` 在 relay 段内无监听 |
 | 观测 | `/metrics`：`rstun_turn_allocations`（gauge）、`rstun_turn_bytes_total{direction=in\|out}`、`rstun_turn_allocations_total{result=created\|expired}`、`rstun_turn_rejected_total{reason=quota\|ports\|family\|loopback\|df\|tcp_connect\|tcp_bind\|tcp_send\|tcp_buffer\|tcp_quota}`、`rstun_turn_tcp_connections{state=pending\|bound}`（gauge）；配了 `turns:`/DTLS 时另有 `rstun_turn_tls_reload_total{result=ok\|failed}` 与 `rstun_turn_tls_cert_expires_seconds`（当前 leaf 的 `notAfter − now`；负值 = 已过期，`-1` = 无法解析）。退出日志打印同一组数字。**未开 `--turn` 时这些指标不出现**；没配 TLS/DTLS 监听时两个证书指标也不出现；`tcp_*` 在没开 `--turn-tcp-relay` 时恒为 0 |
-| **RFC 6062（`--turn-tcp-relay`，默认关）** | `Allocate(REQUESTED-TRANSPORT=6)` 只在 **TCP/TLS 控制连接**上成功（UDP/DTLS → `400`），带 `DONT-FRAGMENT`/`EVEN-PORT`/`RESERVATION-TOKEN` → `400`；成功响应带 TCP `XOR-RELAYED-ADDRESS` + `XOR-MAPPED-ADDRESS` + `LIFETIME` + `SOFTWARE`，**不带 `CONNECTION-ID`**。`Connect` 从 relay 地址出站连 peer（超时 ≥30s，失败 `447`），成功回 `200` + `CONNECTION-ID`，**不带 `SOFTWARE`**（对齐 coturn）；重复 peer `446`，无 allocation/非 TCP allocation `437`，无 peer 地址 `400`，禁用地址 `403`，每 allocation 超过 16 条数据连接 `508`。`ConnectionBind` 在**新连接**上（必须是首个未成功的 TURN 请求）用同一凭据绑定，之后该连接是**裸字节**（不再解析 STUN）；错/过期/重复 ID → `400` 后关闭（coturn 只发 RST，本实现更规范）。`ChannelBind` → `400`；`Send`/`ChannelData` 丢弃并计 `tcp_send`。预绑定 peer 数据最多缓冲 64 KiB（超限关连接 + `tcp_buffer`）；pending 连接 30s 未 bind 关闭；`LIFETIME=0`/过期关闭全部数据连接（**控制连接保留**，coturn 会一起关，记为有意差异）。**被动模式（`ConnectionAttempt`，peer 主动连入 relay）本期不做**。`--turn-bandwidth` 不作用于 TCP allocation 的裸字节流（逐包丢弃会破坏字节流），只计 `rstun_turn_bytes_total` |
+| **RFC 6062（`--turn-tcp-relay`，默认关）** | `Allocate(REQUESTED-TRANSPORT=6)` 只在 **TCP/TLS 控制连接**上成功（UDP/DTLS → `400`），带 `DONT-FRAGMENT`/`EVEN-PORT`/`RESERVATION-TOKEN` → `400`；成功响应带 TCP `XOR-RELAYED-ADDRESS` + `XOR-MAPPED-ADDRESS` + `LIFETIME` + `SOFTWARE`，**不带 `CONNECTION-ID`**。`Connect` 从 relay 地址出站连 peer（超时 ≥30s，失败 `447`），成功回 `200` + `CONNECTION-ID`，**不带 `SOFTWARE`**（对齐 coturn）；重复 peer `446`，无 allocation/非 TCP allocation `437`，无 peer 地址 `400`，禁用地址 `403`，每 allocation 超过 16 条数据连接 `508`。`ConnectionBind` 在**新连接**上（必须是首个未成功的 TURN 请求）用同一凭据绑定，之后该连接是**裸字节**（不再解析 STUN）；错/过期/重复 ID → `400` 后关闭（coturn 只发 RST，本实现更规范）。**被动模式（§5.3）**：peer 主动连入 relay → accept，**无 permission 立即关闭且不发通知**；有 permission → 控制连接收 `ConnectionAttempt` indication（`CONNECTION-ID` + `XOR-PEER-ADDRESS` + `SOFTWARE`，无 `MESSAGE-INTEGRITY`/`FINGERPRINT`），客户端在新连接上 `ConnectionBind(该 id)` 即绑定；入站连接与出站共用同一张 `CONNECTION-ID` 表、同一 16 条上限（超限关连接 + `tcp_quota`）与 30s 未 bind 回收。`ChannelBind` → `400`；`Send`/`ChannelData` 丢弃并计 `tcp_send`（`ConnectionAttempt` 送不出去时也计该项）。预绑定 peer 数据最多缓冲 64 KiB（超限关连接 + `tcp_buffer`）；`LIFETIME=0`/过期关闭全部数据连接并停掉 accept 任务（**控制连接保留**，coturn 会一起关，记为有意差异）。`--turn-bandwidth` 不作用于 TCP allocation 的裸字节流（逐包丢弃会破坏字节流），只计 `rstun_turn_bytes_total` |
 
 部署注意：
 
@@ -103,9 +103,8 @@ rstun server \
   高 churn 下可能多拒绝一次 `486`，下一次扫描恢复。
 - **防回环已知盲区**：不枚举宿主接口，故「peer = 宿主自身公网 IP:端口」无法识别；
   需要该能力时应改用 coturn 或引入接口枚举（T2 评估，新增依赖需单独立项）。
-- 不支持：RFC 6062 的**被动模式**（`ConnectionAttempt`，peer 主动连入 relay）、ACME/OCSP、
-  SNI 多证书、证书**自动续期**（热加载是「重读同一路径」，续期工具写好文件后发 `SIGHUP` 或等轮询即可）。
-- **RFC 6062 部署注意**：TCP relay 端口需要放行 **TCP**（`--relay-ports` 同一段，UDP 与 TCP 各自独立占端口）；`Connect` 从 relay 地址出站依赖 `SO_REUSEPORT`（Linux/macOS），**Windows 上回退为临时源端口**（peer 看到的源端口不是 relay 端口，连接本身仍可用）。数据连接是 accepted TCP 连接，**占用一个 `--max-inflight` 名额**。
+- 不支持：ACME/OCSP、SNI 多证书、证书**自动续期**（热加载是「重读同一路径」，续期工具写好文件后发 `SIGHUP` 或等轮询即可）。
+- **RFC 6062 部署注意**：TCP relay 端口需要放行 **TCP**（`--relay-ports` 同一段，UDP 与 TCP 各自独立占端口）；`Connect` 从 relay 地址出站、被动模式下 peer 也是连到该地址，两条路径都依赖同一批端口。`Connect` 从 relay 地址出站依赖 `SO_REUSEPORT`（Linux/macOS），**Windows 上回退为临时源端口**（peer 看到的源端口不是 relay 端口，连接本身仍可用）。**出站**数据连接是 `serve_tcp` 收下的 accepted TCP 连接，每条占一个 `--max-inflight` 名额；**被动模式**入站连接由该 allocation 的 relay listener 自己 accept，不经过 `--max-inflight`，只受**每 allocation 16 条**（`tcp_quota`）与 30s 未 bind 回收约束。`ConnectionAttempt` 发在**控制连接**上：控制连接断开时 allocation 一起释放，未 bind 的入站连接也随之关闭。
 - **`DONT-FRAGMENT`（0x001A）**：在**能真的置 DF 的平台**上支持（Linux、macOS/iOS；
   上一节的 `df` 行）。五处细节值得记住：
   1. `Allocate` 带它 → relay socket 置 `IP_PMTUDISC_DO`（Linux）/ `IP_DONTFRAG=1`（macOS），
@@ -177,16 +176,20 @@ bash script/lab/rstun-turn.sh --only ipv6relay  # IPv6 relay 单项（无 ::1 �
 |      | `rstun`                                                                                                                                                                                         | coturn                                        |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
 | 定位 | 只做 STUN/TURN 的**最小服务**：Binding + **NAT 行为发现** + TURN 中继（`--turn`，强制长期凭据/REST） | 完整 STUN/TURN（中继）+ 鉴权 + 多租户 |
-| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）+ 鉴权（短期/长期，默认关闭）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`；RFC 8656 中继（UDP/TCP 客户端传输、`turns:` TLS、DTLS 1.2、REST 凭据、带宽配额）；RFC 6062 **出站** TCP allocation（`--turn-tcp-relay`，无被动模式） | RFC 5389 / 5780 全量 / TURN（含 TCP allocation 双向、ACME 等） |
+| 协议 | RFC 5389 Binding + `SOFTWARE` + `MAPPED-ADDRESS`（可选）+ `UNKNOWN-ATTRIBUTES`/420 + `FINGERPRINT`/300/500（两个开关）+ 鉴权（短期/长期，默认关闭）；RFC 5780 的 `CHANGE-REQUEST` / `RESPONSE-ORIGIN` / `OTHER-ADDRESS` / `RESPONSE-PORT` / `PADDING`；RFC 8656 中继（UDP/TCP 客户端传输、`turns:` TLS、DTLS 1.2、REST 凭据、带宽配额）；RFC 6062 TCP allocation **双向**（`--turn-tcp-relay`：出站 `Connect` + 被动 `ConnectionAttempt`），无被动入站的 `-P` 丢包差异见下 | RFC 5389 / 5780 全量 / TURN（含 TCP allocation 双向、ACME 等） |
 | 配置 | 纯命令行参数（无配置文件） | 上百行 `turnserver.conf`、数据库/鉴权后端 |
 | 鉴权 | 短期 / 长期凭据 + RFC 8489 SHA256、USERHASH；用户来自 `--auth-user` 或 `--auth-file`，**无数据库**；TURN 复用同一套长期凭据，或 `--rest-secret`（可并存，REST 优先）| 长期凭据 + 数据库/Redis/文件后端，TURN 也受保护；`use-auth-secret` 与静态用户**互斥** |
 | 依赖 | 纯 Rust，无 OpenSSL/libevent | 依赖 libevent/OpenSSL + 系统配置 |
 | 部署 | 单二进制 / 一个几十 MB 的镜像 | 发行版包 / 官方镜像 + 配置卷 |
-| 用途 | 需要「公网 STUN 映射 + NAT 行为发现」，以及**小规模**的 TURN 中继（UDP 中继 + RFC 6062 出站 TCP 中继） | 需要完整 TURN（TCP allocation 双向、多租户、ACME）的基础设施 |
+| 用途 | 需要「公网 STUN 映射 + NAT 行为发现」，以及**小规模**的 TURN 中继（UDP 中继 + RFC 6062 双向 TCP 中继） | 需要完整 TURN（TCP allocation 双向、多租户、ACME）的基础设施 |
 
-结论：**需要 RFC 6062 被动模式（`ConnectionAttempt`）、ACME 自动证书或多租户数据库时仍然用 coturn**。
-本服务的 TURN 覆盖 UDP/TCP/`turns:`/DTLS 中继、RFC 6062 出站 TCP allocation（`--turn-tcp-relay`）、
-REST 临时凭据与带宽配额，用户清单是静态文件 / 单个 flag / 一个共享 secret。
+结论：**需要 ACME 自动证书或多租户数据库时仍然用 coturn**。
+本服务的 TURN 覆盖 UDP/TCP/`turns:`/DTLS 中继、RFC 6062 TCP allocation **双向**（`--turn-tcp-relay`：
+出站 `Connect` + 被动 `ConnectionAttempt`）、REST 临时凭据与带宽配额，用户清单是静态文件 /
+单个 flag / 一个共享 secret。
+
+关于 `turnutils_uclient -P`：`-P` 的判据是**双向字节 > 0 且 exit=0**，不是 `lost packets 0` ——
+coturn 4.6.1 自己跑 `-P` 也丢 50%（同一客户端、同一流程），`-T`（隐含 `-y`）才是 `lost packets 0` 的那条。
 
 TLS/DTLS/REST 的行为已与本地 coturn **同参数对跑**（`rstun-turn.sh` 的 `coturn` 项）：
 `turnutils_uclient` 的 `-S -t`（TLS）与 `-S`（DTLS）两侧都完成中继；REST 探针输出逐行一致

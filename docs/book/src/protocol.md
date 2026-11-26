@@ -140,9 +140,10 @@ SOFTWARE、FINGERPRINT、ICE 簇、鉴权簇、420、`PADDING`、`RESPONSE-PORT`
 TURN 侧能做的都已经做了（UDP/TCP/`turns:`/DTLS 中继、REST 临时凭据、带宽配额，见
 「[TURN](turn.md)」）。真正缺的是下面这几项，且都是**刻意**不做：
 
-- **TCP allocation（RFC 6062）**：**出站**部分已实现（`--turn-tcp-relay`：`Allocate(TCP)` +
-  `Connect` + `ConnectionBind`，见「[TURN](turn.md)」）；**被动模式**（`ConnectionAttempt`，
-  peer 主动连入 relay）仍未实现，`turnutils_uclient -T` 因此不能作为验收判据。
+- **TCP allocation（RFC 6062）**：**双向**都已实现（`--turn-tcp-relay`）：出站 `Allocate(TCP)` +
+  `Connect` + `ConnectionBind`，以及被动模式（peer 主动连入 relay → 控制连接上的
+  `ConnectionAttempt`），见「[TURN](turn.md)」。`turnutils_uclient -T` 与 `-P` 都能完成；
+  `-P` 的判据用「双向字节 + exit=0」而不是 `lost packets 0`（coturn 自身 `-P` 也丢 50%）。
 - **ACME / OCSP stapling**：签发与续期交给宿主的 certbot/acme.sh 等工具；本进程不做 ACME。
   证书本身可热加载：原地覆盖 `--tls-cert`/`--tls-key` 后 `kill -HUP`（unix）或等文件轮询
   （默认 30s，`--tls-cert-poll` 可调、`0` = 只认 `SIGHUP`），无需重启

@@ -3,6 +3,29 @@
 版本线**独立于任何宿主项目**：`YY.QMM.Mmpp`（年.季度月.月日+序号），首发 `26.410.100`。
 `rstun-v*` 的 Release tag / 镜像 tag / 资产名都用这里给出的版本号。
 
+## Unreleased
+
+### TURN：RFC 6062 被动模式（`ConnectionAttempt`）
+
+- **入站半条 RFC 6062 打通**：`--turn-tcp-relay` 打开时，peer 主动连入 TCP relay 地址 → 服务器
+  accept → **无 permission 立即关闭且不通知客户端**（coturn 实测同行为）→ 有 permission 则在
+  **控制连接**上发 `ConnectionAttempt` indication（`CONNECTION-ID` + `XOR-PEER-ADDRESS` +
+  `SOFTWARE`；indication 无 `MESSAGE-INTEGRITY`，与 `Data` indication 一致地不带 `FINGERPRINT`），
+  客户端在新连接上 `ConnectionBind(该 id)` 后即裸字节双向。**开关关闭时行为逐字节不变**。
+- **复用出站状态机**：入站连接直接进 `Pending`，与 `Connect` 共用同一张 `CONNECTION-ID` 表、
+  同一 16 条/alloc 上限（超限关连接 + `tcp_quota`）、同一 64 KiB 预绑定缓冲（超限关连接 +
+  `tcp_buffer`）与同一个 30s 未 bind 回收；`LIFETIME=0`/过期关连接并 abort accept 任务（端口归还，
+  `ss -ltn` 无残留）。accept 失败只记日志并按 20ms 退避重试，不通知客户端。
+- **验收**：`turnutils_uclient -T`（隐含 `-y`，此前 `tot_recv=0` 挂到超时）现在 **exit=0 且
+  `lost packets 0`**；`turnutils_uclient -P` 判据用「exit=0 + 双向字节 > 0」（coturn 自身 `-P`
+  也丢 50%，`lost packets 0` 不可用）。lab 新增 `tcp-relay-passive` 项（探针 14 条断言 + 两个 uclient），
+  探针新增 `tcp-relay-passive` 模式可对 coturn 同参跑。
+- **测试**：新增 8 条单测（ConnectionAttempt 属性与绑定、无 permission 静默关闭、配额、
+  预绑定溢出、30s 回收、`LIFETIME=0` 停 accept、`ClientSink::Udp` 分支、
+  indication 送不出去时关掉入站连接并计 `tcp_send`）；`tcp_relay_config()`
+  改为**每条测试独占 relay 端口段** —— 之前并发测试共用默认段时，`SO_REUSEPORT` 会让内核把
+  peer 轮转投递到别的测试实例上。
+
 ## 26.410.106
 
 ### 修复：预发布版本的发布链路（dev 演练暴露）
