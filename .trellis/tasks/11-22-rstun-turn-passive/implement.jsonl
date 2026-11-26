@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/turn.md", "reason": "RFC 6062 出站契约（本任务复用同一 CONNECTION-ID 表与 bind 逻辑）"}
+{"file": ".trellis/spec/backend/protocol-errors.md", "reason": "indication 无错误响应、400/437 口径"}
+{"file": ".trellis/spec/backend/ops.md", "reason": "指标固定标签集（复用 tcp_quota/tcp_buffer）"}
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "lab 判据与冻结对照"}
+{"file": ".trellis/tasks/archive/2026-11/11-21-rstun-turn-rfc6062/research/rfc6062.md", "reason": "被动模式调研（§5：coturn 实测行为、-P 判据）"}
