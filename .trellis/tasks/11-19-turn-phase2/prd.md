@@ -29,13 +29,15 @@
 
 ## 验收（每条都需要可复现证据）
 
-- [ ] RFC 6062：`turnutils_uclient -T`（或 coturn 对照）完成 TCP allocation 与数据中继；
-      `ConnectionAttempt` 指示格式正确；`ConnectionBind` 生命周期与 §5 一致
-- [ ] `DONT-FRAGMENT`：识别且不再 420；DF 位可被 `tcpdump`/socket 选项验证；不支持平台返回文档化错误
-- [ ] `REQUESTED-ADDRESS-FAMILY`：v4/v6 relay 均可按请求分配（`XOR-RELAYED-ADDRESS` 家族正确）
-- [ ] 与 coturn 对跑：三类能力的差异逐项判定（我方/对手/RFC 理解）
-- [ ] 默认路径零差异：不启用新能力时，与当前 `main` 逐字节一致
-- [ ] 依赖不新增（或新增必须在 PR 里单独说明体积/审计影响）
+- [x] RFC 6062：出站随 `26.410.104` 发布；**被动模式**（`ConnectionAttempt`）已完成并合并
+      (`0ec6c41`，子任务 `11-22-rstun-turn-passive` 已归档)——`turnutils_uclient -T`/`-P` 均完成，
+      探针 14 断言与 coturn 4.6.1 逐行一致
+- [x] `DONT-FRAGMENT`：随 `26.410.103` 发布（unix 真置位；其它平台按 §7.2 步骤 4 保持 `420`）
+- [x] `REQUESTED-ADDRESS-FAMILY`：随 `26.410.102` 发布（族匹配 200 / 异族 `440` / `Refresh` 不匹配 `443`）
+- [x] 与 coturn 对跑：三类能力差异逐项判定（出站/被动/DF/RAF 均已录入 spec 与 lab）
+- [x] 默认路径零差异：`frozen` 3 配置 × 17 请求与 `cad4fa2` 逐字节一致
+- [x] 依赖不新增（`libc` 为 unix-only DF 所需，已在 `.103` 单独说明；lean 10 / full 15 未变）
+- [ ] **多实例共享 allocation 状态**：仍未实现（可选，取决于部署形态；当前只共享 nonce secret）
 
 ## 风险
 
@@ -50,3 +52,18 @@
 - 本任务的前置（T1/T2）已归档，设计可参考：
   `.trellis/tasks/archive/2026-11/11-19-rstun-turn-udp/design.md` 与 `…/11-19-rstun-turn-tls/design.md`。
 - 开工前需补 `design.md` + `implement.md`（复杂任务）。
+
+## 状态（2026-11-26）
+
+子任务全部完成并归档：
+
+| 子任务 | 结果 | 发布 |
+| --- | --- | --- |
+| `11-21-rstun-turn-raf` | RFC 8656 RAF（440/443/400） | `26.410.102` |
+| `11-21-rstun-turn-df-ipv6` | DF 真置位 + IPv6 relay 回归 | `26.410.103` |
+| `11-21-rstun-turn-rfc6062` | RFC 6062 出站（`Connect`/`ConnectionBind`） | `26.410.104` |
+| `11-22-rstun-turn-cert-reload` | `turns:` 证书热载（SIGHUP + 轮询） | `26.410.104` |
+| `11-22-rstun-turn-passive` | RFC 6062 被动（`ConnectionAttempt`） | **未发布**（在 `main`） |
+
+唯一未做项是需求 4「多实例共享 allocation 状态」——需求里明确标注「可选，取决于部署形态」，
+且与协议合规无关。是否要做属产品决策，未擅自开工。
