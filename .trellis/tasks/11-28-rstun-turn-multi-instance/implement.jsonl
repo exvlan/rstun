@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/11-28-rstun-turn-multi-instance/research/multi-instance-summary.md", "reason": "集成面摘要（六条事实、失败路径、接缝清单、已定取舍；全文见 multi-instance-integration.md）"}
+{"file": ".trellis/spec/backend/turn.md", "reason": "TURN 契约：Key/ClientSink/端口池/配额/RFC 6062；本任务需新增多实例条款"}
+{"file": ".trellis/spec/backend/ops.md", "reason": "指标标签集固定、health/metrics 端点契约（集群内部端点不得复用）"}
+{"file": ".trellis/spec/backend/protocol-errors.md", "reason": "错误码口径：437/441/446/500 在跨实例语义下的重述"}
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "lab 判据、frozen 基线"}

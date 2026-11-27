@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/11-28-rstun-turn-multi-instance/research/multi-instance-summary.md", "reason": "复核时逐条对照：端口结论、接缝、取舍"}
+{"file": ".trellis/tasks/11-28-rstun-turn-multi-instance/design.md", "reason": "D1–D10 与失效模式是复核基准"}
+{"file": ".trellis/spec/backend/turn.md", "reason": "落地后必须回写多实例条款与断言点"}
+{"file": ".trellis/spec/backend/quality-gates.md", "reason": "门禁清单与 frozen 对照"}
