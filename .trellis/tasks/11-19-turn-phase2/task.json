@@ -25,7 +25,8 @@
     "11-21-rstun-turn-df-ipv6",
     "11-21-rstun-turn-rfc6062",
     "11-22-rstun-turn-passive",
-    "11-22-rstun-turn-cert-reload"
+    "11-22-rstun-turn-cert-reload",
+    "11-28-rstun-turn-multi-instance"
   ],
   "parent": "11-19-rstun-complete",
   "relatedFiles": [],
