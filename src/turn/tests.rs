@@ -3959,22 +3959,38 @@ async fn cluster_passive_attempt_is_pushed_to_the_entry() {
     assert_eq!(error_code(&allocation), None, "TCP Allocate");
     let relay = relayed_address(&allocation);
     assert_eq!(pair.b.turn.active(), 1, "the owner holds the allocation");
-    assert_eq!(
-        error_code(
-            &control
-                .create_permission_for("127.0.0.1:9".parse().unwrap())
-                .await
-        ),
-        None
-    );
+    // Permission is per peer IP (the port is ignored). Install both loopback
+    // addresses: the dialling source is pinned to 127.0.0.1 below, and this is
+    // the only statement under test here (a peer without permission is covered
+    // by `inbound_peer_without_permission_is_closed_without_an_attempt`).
+    for source in ["127.0.0.1:9", "127.0.0.2:9"] {
+        assert_eq!(
+            error_code(&control.create_permission_for(source.parse().unwrap()).await),
+            None,
+            "permission for {source}"
+        );
+    }
 
-    let mut peer = tokio::net::TcpStream::connect(relay)
-        .await
-        .expect("relay accepts");
-    let attempt = control
-        .read_stun_within(2000)
-        .await
-        .expect("ConnectionAttempt reaches the entry");
+    // Pin the source address: on macOS the kernel may otherwise pick the
+    // destination's loopback alias (127.0.0.2) as the source, which would miss
+    // the permission above and make the announced address platform-dependent.
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("bind source");
+    let mut peer = socket.connect(relay).await.expect("relay accepts");
+    let attempt = match control.read_stun_within(2000).await {
+        Some(frame) => frame,
+        None => {
+            let snapshot = pair.b.turn.snapshot();
+            panic!(
+                "no ConnectionAttempt: peer_local={:?} owner_active={} owner_pending={}",
+                peer.local_addr().ok(),
+                snapshot.active,
+                snapshot.tcp_pending
+            );
+        }
+    };
     let (id, announced, _software) = connection_attempt(&attempt);
     assert_eq!(
         announced,

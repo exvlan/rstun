@@ -251,3 +251,17 @@ DSR（源地址仍是 VIP）或 NAT 型 LB 转发回程。lab 的假 LB 是 NAT 
   macOS 因此与 Linux/Windows 一样真跑这 12 条。
 - 证据：Linux 上 `turn::tests::cluster` 12 passed（真跑）；强制 skip 时 12 条均打印
   `skip <test>: 127.0.0.2 is not configured …` 并 pass；`cargo test` 305、`--all-features` 314 不变。
+
+## CI 修复：macOS 被动 ConnectionAttempt（2026-11-28）
+
+- 现象：`eb78be1` 后 `test (macos-latest)` 只剩 `cluster_passive_attempt_is_pushed_to_the_entry` 失败
+  （`no ConnectionAttempt`），Linux 稳定通过。
+- 根因（推断，平台差异）：测试对 `127.0.0.1:9` 建 permission 后用**未绑定源地址**的 socket 连
+  `127.0.0.2:<relay>`。Linux 上源地址选 `127.0.0.1`（本机实测），macOS 上 `127.0.0.2` 是 lo0 别名，
+  路由可能把源地址选成 `127.0.0.2` → permission 只覆盖 `127.0.0.1` → accept 后静默关闭 → 永远等不到
+  indication。**不是产品 bug**，是测试对源地址的隐含平台假设。
+- 改法：① `TcpSocket::new_v4()` + `bind("127.0.0.1:0")` 显式钉源地址；② permission 同时建
+  `127.0.0.1:9` 与 `127.0.0.2:9`（per-IP，两个合法）；③ `read_stun_within` 的 `None` 分支改为带
+  `peer_local` / `owner_active` / `owner_pending` 的 panic，便于下次直接定位。
+- 证据：本地连跑 20 次全绿（20/20）；`cargo test` 305 / `--all-features` 314 不变；
+  强制 skip 仍 12 passed + 12 条 `skip` 打印。
