@@ -10,9 +10,10 @@
 #   bash script/lab/rstun-turn.sh --no-build       # 复用 target/debug/rstun（探测其 feature）
 #   bash script/lab/rstun-turn.sh --tls --dtls     # 只跑 TLS/DTLS 项（自动 --features full 构建）
 #   bash script/lab/rstun-turn.sh --only relay     # 只跑一项
-#     （startup|relay|tcprelay|tcp-relay-passive|auth|lifecycle|wrong-user|raf|df|
-#       ipv6relay|wildcard|permission-limit|quota|ports|tls|dtls|cert-reload|cert-poll|
-#       rest|bandwidth|cleanup|frozen|coturn）
+#     （startup|relay|tcprelay|tcp-relay-passive|multi-instance-udp|multi-instance-tcp|
+#       multi-instance-tcp-relay|multi-instance-tls|multi-instance-dtls|auth|lifecycle|
+#       wrong-user|raf|df|ipv6relay|wildcard|permission-limit|quota|ports|tls|dtls|
+#       cert-reload|cert-poll|rest|bandwidth|cleanup|frozen|coturn）
 #   bash script/lab/rstun-turn.sh --keep           # 保留日志（默认只清进程）
 #   FROZEN_BASE=<sha> bash script/lab/rstun-turn.sh --only frozen
 #                                                  # 字节冻结对照的基线提交（默认 cad4fa2）
@@ -70,7 +71,7 @@ FAILED=()
 SKIPPED=()
 PASSED=()
 
-ALL_ITEMS=(startup relay tcprelay tcp-relay-passive auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls cert-reload cert-poll rest bandwidth cleanup frozen coturn)
+ALL_ITEMS=(startup relay tcprelay tcp-relay-passive multi-instance-udp multi-instance-tcp multi-instance-tcp-relay multi-instance-tls multi-instance-dtls auth lifecycle wrong-user raf df ipv6relay wildcard permission-limit quota ports tls dtls cert-reload cert-poll rest bandwidth cleanup frozen coturn)
 
 usage() {
   # The doc block is the comment header above `set -uo pipefail`.
@@ -82,8 +83,8 @@ while [[ $# -gt 0 ]]; do
     --port) BASE="${2:?--port 需要一个端口}"; shift ;;
     --port=*) BASE="${1#*=}" ;;
     --no-build) BUILD=false ;;
-    --tls) T2_ONLY+=(tls) ;;
-    --dtls) T2_ONLY+=(dtls) ;;
+    --tls) T2_ONLY+=(tls multi-instance-tls) ;;
+    --dtls) T2_ONLY+=(dtls multi-instance-dtls) ;;
     --only) ONLY="${2:?--only 需要一项名字}"; shift ;;
     --only=*) ONLY="${1#*=}" ;;
     --keep) : ;;
@@ -107,7 +108,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if [[ -n "$ONLY" ]]; then
   case "$ONLY" in
-    startup | relay | tcprelay | tcp-relay-passive | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | cert-reload | cert-poll | rest | bandwidth | cleanup | frozen | coturn) : ;;
+    startup | relay | tcprelay | tcp-relay-passive | multi-instance-udp | multi-instance-tcp | multi-instance-tcp-relay | multi-instance-tls | multi-instance-dtls | auth | lifecycle | wrong-user | raf | df | ipv6relay | wildcard | permission-limit | quota | ports | tls | dtls | cert-reload | cert-poll | rest | bandwidth | cleanup | frozen | coturn) : ;;
     *) echo "--only 未知项: $ONLY（可用：${ALL_ITEMS[*]}）" >&2; exit 2 ;;
   esac
 fi
@@ -167,6 +168,100 @@ wait_health() { # port [tries]
 metric() { # name
   curl -fsS "http://127.0.0.1:$HEALTH_PORT/metrics" 2>/dev/null |
     awk -v name="$1" '$1 == name {print $2; found=1} END {if (!found) print ""}'
+}
+
+metric_at() { # ip name
+  curl -fsS "http://$1:$HEALTH_PORT/metrics" 2>/dev/null |
+    awk -v name="$2" '$1 == name {print $2; found=1} END {if (!found) print ""}'
+}
+
+metric_sum() { # name
+  # Every instance reports its own view, so the cluster-wide count is the sum.
+  local sum=0 value
+  for ip in 127.0.0.1 127.0.0.2; do
+    value="$(metric_at "$ip" "$1")"
+    [[ -n "$value" ]] && sum=$((sum + value))
+  done
+  echo "$sum"
+}
+
+wait_ready_file() { # path [tries]
+  local path="$1"
+  local tries="${2:-50}"
+  local i=0
+  while (( i < tries )); do
+    [[ -s "$path" ]] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+udp_port_present() { # port
+  ss -lunH 2>/dev/null | awk -v p="$1" '{ n = split($4, a, ":"); if (a[n] == p) found = 1 } END { exit !found }'
+}
+
+relay_sockets_owned() { # pid
+  # Sockets in the relay range that belong to **our** process. The range can
+  # overlap a host service (e.g. a proxy that binds a random port inside it);
+  # the cleanup assertion must not blame that service on us.
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  {
+    ss -lunpH 2>/dev/null | awk -v pid="$pid" 'index($0, "pid=" pid ",") {print $4}'
+    ss -ltnpH 2>/dev/null | awk -v pid="$pid" 'index($0, "pid=" pid ",") {print $4}'
+  } | awk -F: -v lo="$RELAY_LO" -v hi="$RELAY_HI" '
+      { port = $NF + 0; if (port >= lo && port <= hi) print $NF }
+    ' | sort -u
+}
+
+tcp_port_present() { # port
+  ss -ltnH 2>/dev/null | awk -v p="$1" '{ n = split($4, a, ":"); if (a[n] == p) found = 1 } END { exit !found }'
+}
+
+wait_port_gone() { # proto port [tries]
+  local proto="$1"
+  local port="$2"
+  local tries="${3:-50}"
+  local i=0
+  while (( i < tries )); do
+    if [[ "$proto" == udp ]]; then
+      udp_port_present "$port" || return 0
+    else
+      tcp_port_present "$port" || return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+loopback_alias_ok() { # ip proto
+  python3 -c '
+import socket, sys
+host, kind = sys.argv[1], sys.argv[2]
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM)
+try:
+    sock.bind((host, 0))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+' "$1" "$2"
+}
+
+wait_health_at() { # ip [tries]
+  local ip="$1"
+  local tries="${2:-50}"
+  local i=0
+  while (( i < tries )); do
+    if curl -fsS "http://$ip:$HEALTH_PORT/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
 }
 
 relay_listeners() {
@@ -281,7 +376,7 @@ probe_secure_support() {
 # 这些项需要 secure 传输 → BUILD=true 时自动加 `--features full`。
 needs_secure_build() {
   [[ ${#T2_ONLY[@]} -gt 0 ]] && return 0
-  case "$ONLY" in tls | dtls | cert-reload | cert-poll | coturn) return 0 ;; esac
+  case "$ONLY" in tls | dtls | multi-instance-tls | multi-instance-dtls | cert-reload | cert-poll | coturn) return 0 ;; esac
   return 1
 }
 
@@ -1462,16 +1557,740 @@ run_cleanup() {
     sleep 0.2
     waited=$((waited + 1))
   done
-  local leftover
   # The pre-check proved the range was empty, so anything left now came from
-  # this run (UDP relay sockets and RFC 6062 TCP listeners alike).
-  leftover="$(relay_sockets)"
+  # this run (UDP relay sockets and RFC 6062 TCP listeners alike). Closing the
+  # allocation and closing the sockets are separate steps (`Allocation::drop`
+  # aborts the relay task), so poll the final `ss` state instead of racing it
+  # (spec §5a: abort is asynchronous; assert the **final** state).
+  local server_pid
+  server_pid="$(tail -n 1 "$WORK/pids" 2>/dev/null || true)"
+  local leftover=""
+  local socket_polls=0
+  while (( socket_polls < 20 )); do
+    leftover="$(relay_sockets_owned "$server_pid")"
+    [[ -z "$leftover" ]] && break
+    sleep 0.1
+    socket_polls=$((socket_polls + 1))
+  done
   if [[ "$active" == "0" && -z "$leftover" ]]; then
-    ok "$name" "created=$created, allocations=0 and no UDP/TCP relay listener in $RELAY_LO-$RELAY_HI"
+    ok "$name" "created=$created, allocations=0 and no relay listener owned by pid $server_pid (socket poll ${socket_polls}×100ms)"
   else
-    fail "$name" "created=$created allocations=$active leftover=[$(echo "$leftover" | tr '\n' ' ')]"
+    fail "$name" "created=$created allocations=$active leftover=[$(echo "$leftover" | tr '\n' ' ')] (pid $server_pid)"
   fi
   stop_server "$name"
+}
+
+# ---------- 7b. multi-instance-udp: two instances, one 5-tuple ----------
+#
+# Two instances on the same port of two loopback addresses (the deployment
+# shape the normalized key assumes). The probe drives the same client socket
+# through both: everything after the first Allocate must be forwarded to the
+# owner and answered as if the client had never moved. A fake round-robin LB
+# then puts a real turnutils_uclient through the same cluster.
+
+run_multi_instance_udp() {
+  local name=multi-instance-udp
+  local cluster_port=$((BASE + 2))
+  local lb_port=$((BASE + 5))
+  local before
+  before="$(relay_sockets)"
+
+  if ! python3 -c '
+import socket, sys
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    sock.bind(("127.0.0.2", 0))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+'; then
+    skip "$name" "127.0.0.2 is not a usable loopback alias on this host"
+    return
+  fi
+
+  start_server "$name-a" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --cluster-peer "a@127.0.0.1:$cluster_port" \
+    --cluster-peer "b@127.0.0.2:$cluster_port" \
+    --cluster-secret "$SECRET" \
+    --cluster-listen "127.0.0.1:$cluster_port" --cluster-instance-id a \
+    --health-listen "127.0.0.1:$HEALTH_PORT"
+  start_server "$name-b" --listen "127.0.0.2:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --cluster-peer "a@127.0.0.1:$cluster_port" \
+    --cluster-peer "b@127.0.0.2:$cluster_port" \
+    --cluster-secret "$SECRET" \
+    --cluster-listen "127.0.0.2:$cluster_port" --cluster-instance-id b \
+    --health-listen "127.0.0.2:$HEALTH_PORT"
+  if ! wait_health_at 127.0.0.1 || ! wait_health_at 127.0.0.2; then
+    fail "$name" "instances did not become healthy (see $LOG_DIR/$name-*.log)"
+    stop_server "$name-b"
+    stop_server "$name-a"
+    return
+  fi
+
+  # Start-up gate (M3): a clustered TCP allocation needs its own explicit
+  # TCP relay range; without it the two instances would both LISTEN on the
+  # same ports (SO_REUSEPORT) and accept each other's peers.
+  local rejected rejected_code
+  rejected="$("$BIN" server --listen "127.0.0.1:$((BASE + 6))" --turn --realm "$REALM" \
+    --auth-secret "$SECRET" --auth-user u --auth-pass p --turn-tcp-relay \
+    --cluster-listen "127.0.0.1:$((cluster_port + 10))" \
+    --cluster-peer "a@127.0.0.1:$((cluster_port + 10))" \
+    --cluster-instance-id a 2>&1)"
+  rejected_code=$?
+  if [[ $rejected_code -ne 0 ]] && grep -qa "tcp-relay-ports" <<<"$rejected"; then
+    ok "$name-tcp-relay-gate" "cluster + --turn-tcp-relay without --tcp-relay-ports refused (exit=$rejected_code)"
+  else
+    fail "$name-tcp-relay-gate" "expected a refusal mentioning --tcp-relay-ports (exit=$rejected_code)"
+  fi
+
+  if python3 "$PROBE" multi-instance \
+    --server "127.0.0.1:$BASE" --server-b "127.0.0.2:$BASE" \
+    >"$LOG_DIR/$name-probe.log" 2>&1; then
+    ok "$name" "$(grep -c '^ok:' "$LOG_DIR/$name-probe.log") cross-instance assertions"
+  else
+    fail "$name" "see $LOG_DIR/$name-probe.log"
+  fi
+
+  # The probe released its allocation through the **non-owner** at the end:
+  # both instances must be back to zero and no relay socket may remain.
+  local active=1 leftover
+  local waited=0
+  while (( waited < 30 )); do
+    active="$(metric_sum 'rstun_turn_allocations')"
+    active="${active:-1}"
+    [[ "$active" == "0" ]] && break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  leftover="$(relay_new_sockets "$before")"
+  if [[ "$active" == "0" && -z "$leftover" ]]; then
+    ok "$name-release" "LIFETIME=0 through the non-owner left no allocation or relay socket"
+  else
+    fail "$name-release" "allocations=$active leftover=[$(echo "$leftover" | tr '\n' ' ')]"
+  fi
+
+  # A real client through a round-robin LB: control and data both cross
+  # instances, and the client only ever talks to the LB address (C1 as a NAT
+  # LB provides it). Default lifetime: the run is long enough that an expiring
+  # allocation would show up as lost packets.
+  local ready="$WORK/$name-lb.ready"
+  local lb_pid=""
+  rm -f "$ready"
+  python3 "$ROOT/script/lab/rstun-turn-lb.py" --listen "127.0.0.1:$lb_port" \
+    --backend "127.0.0.1:$BASE" --backend "127.0.0.2:$BASE" \
+    --ready-file "$ready" >"$LOG_DIR/$name-lb.log" 2>&1 &
+  lb_pid=$!
+  PIDS+=("$lb_pid")
+  local waited=0
+  while [[ ! -s "$ready" ]] && (( waited < 30 )); do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if [[ ! -s "$ready" ]]; then
+    fail "$name-lb" "load balancer did not start (see $LOG_DIR/$name-lb.log)"
+  elif ! command -v turnutils_uclient >/dev/null 2>&1; then
+    skip "$name-lb" "turnutils_uclient not installed"
+  else
+    turnutils_uclient -u "$USER_NAME" -w "$USER_PASS" -p "$lb_port" -n 8 -m 3 -y 127.0.0.1 \
+      >"$LOG_DIR/$name-uclient.log" 2>&1
+    local exit_code=$?
+    local bytes_in bytes_out
+    bytes_in="$(metric_sum 'rstun_turn_bytes_total{direction="in"}')"
+    bytes_out="$(metric_sum 'rstun_turn_bytes_total{direction="out"}')"
+    if [[ $exit_code -eq 0 ]] && uclient_ok "$LOG_DIR/$name-uclient.log" &&
+      [[ -n "$bytes_in" && "$bytes_in" -gt 0 && -n "$bytes_out" && "$bytes_out" -gt 0 ]]; then
+      ok "$name-lb" "uclient through the LB exit=0, relay bytes in=$bytes_in out=$bytes_out"
+    else
+      fail "$name-lb" "uclient exit=$exit_code bytes in=$bytes_in out=$bytes_out"
+    fi
+  fi
+  if [[ -n "$lb_pid" ]]; then
+    kill -TERM "$lb_pid" 2>/dev/null
+    wait "$lb_pid" 2>/dev/null
+  fi
+
+  # The uclient allocations are left to the TTL; stopping the instances must
+  # close their relay sockets with them (no residue in the shared range).
+  stop_server "$name-b"
+  stop_server "$name-a"
+  leftover="$(relay_new_sockets "$before")"
+  if [[ -z "$leftover" ]]; then
+    ok "$name-cleanup" "no relay socket left in $RELAY_LO-$RELAY_HI after shutdown"
+  else
+    fail "$name-cleanup" "leftover=[$(echo "$leftover" | tr '\n' ' ')]"
+  fi
+}
+
+# ---------- 7c. multi-instance-tcp: TCP control connection + PUSH_CLIENT ----------
+#
+# A TCP load balancer routes each connection to one instance. The TURN control
+# connection lands on the entry, the allocation may live on the other instance:
+# control requests are forwarded, and peer→client bytes come back through the
+# entry's writer queue. Closing the connection must release the owner's relay
+# socket immediately (CLIENT_CLOSED), not after the TTL.
+
+start_mi_pair() { # name extra args... (the same extra args on both instances)
+  local name="$1"
+  shift
+  local cluster_port=$((BASE + 2))
+  start_server "$name-a" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --cluster-peer "a@127.0.0.1:$cluster_port" \
+    --cluster-peer "b@127.0.0.2:$cluster_port" \
+    --cluster-secret "$SECRET" \
+    --cluster-listen "127.0.0.1:$cluster_port" --cluster-instance-id a \
+    --health-listen "127.0.0.1:$HEALTH_PORT" "$@"
+  start_server "$name-b" --listen "127.0.0.2:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --cluster-peer "a@127.0.0.1:$cluster_port" \
+    --cluster-peer "b@127.0.0.2:$cluster_port" \
+    --cluster-secret "$SECRET" \
+    --cluster-listen "127.0.0.2:$cluster_port" --cluster-instance-id b \
+    --health-listen "127.0.0.2:$HEALTH_PORT" "$@"
+}
+
+stop_mi_pair() { # name
+  stop_server "$1-b"
+  stop_server "$1-a"
+}
+
+run_multi_instance_tcp() {
+  local name=multi-instance-tcp
+  local lb_port=$((BASE + 6))
+  local before
+  before="$(relay_sockets)"
+
+  if ! loopback_alias_ok 127.0.0.2 udp || ! loopback_alias_ok 127.0.0.2 tcp; then
+    skip "$name" "127.0.0.2 is not a usable loopback alias on this host"
+    return
+  fi
+
+  start_mi_pair "$name" --tcp
+  if ! wait_health_at 127.0.0.1 || ! wait_health_at 127.0.0.2; then
+    fail "$name" "instances did not become healthy (see $LOG_DIR/$name-*.log)"
+    stop_mi_pair "$name"
+    return
+  fi
+
+  local attempts=8 cross=0 all_ok=0 release_ok=1
+  local attempt entry owner relay address lb_log lb_ready probe_log probe_pid code waited
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    lb_log="$LOG_DIR/$name-lb-$attempt.log"
+    lb_ready="$WORK/$name-lb-$attempt.ready"
+    rm -f "$lb_ready"
+    if (( attempt % 2 )); then
+      python3 "$ROOT/script/lab/rstun-turn-tcp-lb.py" --listen "127.0.0.1:$lb_port" \
+        --backend "127.0.0.1:$BASE" --backend "127.0.0.2:$BASE" \
+        --ready-file "$lb_ready" >"$lb_log" 2>&1 &
+    else
+      python3 "$ROOT/script/lab/rstun-turn-tcp-lb.py" --listen "127.0.0.1:$lb_port" \
+        --backend "127.0.0.2:$BASE" --backend "127.0.0.1:$BASE" \
+        --ready-file "$lb_ready" >"$lb_log" 2>&1 &
+    fi
+    local lb_pid=$!
+    PIDS+=("$lb_pid")
+    if ! wait_ready_file "$lb_ready" 30; then
+      fail "$name-lb" "TCP load balancer did not start (see $lb_log)"
+      kill -TERM "$lb_pid" 2>/dev/null
+      wait "$lb_pid" 2>/dev/null
+      break
+    fi
+    probe_log="$LOG_DIR/$name-probe-$attempt.log"
+    python3 "$PROBE" tcp-control --server "127.0.0.1:$lb_port" --show-relay --hold 0.8 \
+      >"$probe_log" 2>&1 &
+    probe_pid=$!
+    waited=0
+    while ! grep -qa "info: holding" "$probe_log" 2>/dev/null && (( waited < 50 )); do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    address="$(grep -aoE 'info: relay=[0-9.]+:[0-9]+' "$probe_log" | head -1 | sed 's/info: relay=//')"
+    relay="${address##*:}"
+    owner="${address%%:*}"
+    entry="$(grep -a '^route ' "$lb_log" | head -1 | grep -oE '127\.0\.0\.[0-9]+' | tail -1)"
+    if [[ -n "$relay" ]] && udp_port_present "$relay"; then
+      :
+    else
+      fail "$name-relay" "attempt $attempt: relayed socket $address is not listening"
+      release_ok=0
+    fi
+    if [[ -n "$owner" && -n "$entry" && "$owner" != "$entry" ]]; then
+      cross=$((cross + 1))
+    fi
+    wait "$probe_pid"
+    code=$?
+    if [[ $code -eq 0 ]] && grep -qa "info: holding" "$probe_log"; then
+      all_ok=$((all_ok + 1))
+    else
+      fail "$name" "attempt $attempt: probe exit=$code (see $probe_log)"
+    fi
+    if [[ -n "$relay" ]] && ! wait_port_gone udp "$relay" 50; then
+      fail "$name-release" "attempt $attempt: relay port $relay still listening after the client closed"
+      release_ok=0
+    fi
+    kill -TERM "$lb_pid" 2>/dev/null
+    wait "$lb_pid" 2>/dev/null
+  done
+
+  if [[ $all_ok -eq $attempts ]]; then
+    ok "$name" "$attempts TCP attempts through the LB, probe ok each time"
+  fi
+  if (( cross > 0 )); then
+    ok "$name-cross" "$cross/$attempts attempts had the allocation on the other instance (forwarded control + PUSH_CLIENT)"
+  else
+    fail "$name-cross" "no attempt landed on a non-entry owner; the cross-instance path was not exercised"
+  fi
+  [[ $release_ok -eq 1 ]] && ok "$name-release" "every relayed socket disappeared when its control connection closed"
+
+  stop_mi_pair "$name"
+  local leftover
+  leftover="$(relay_new_sockets "$before")"
+  if [[ -z "$leftover" ]]; then
+    ok "$name-cleanup" "no relay socket left after shutdown"
+  else
+    fail "$name-cleanup" "leftover=[$(echo "$leftover" | tr '\n' ' ')]"
+  fi
+}
+
+# ---------- 7d. multi-instance-tcp-relay: RFC 6062 across instances ----------
+#
+# Control connection on the entry, `Allocate(TCP)`/`Connect` on the owner,
+# `ConnectionBind` arriving on the other connection and routed by its
+# CONNECTION-ID, then raw bytes over RAW_RELAY. Both instances own a disjoint
+# TCP relay range (SO_REUSEPORT would otherwise let them listen on the same
+# port).
+
+run_multi_instance_tcp_relay() {
+  local name=multi-instance-tcp-relay
+  local lb_port=$((BASE + 6))
+  local tcp_a_lo=49900 tcp_a_hi=49949 tcp_b_lo=49950 tcp_b_hi=49999
+  local before
+  before="$(relay_sockets)"
+  local before_tcp
+  before_tcp="$(ss -ltnH 2>/dev/null | awk '{print $4}' | awk -F: '$NF >= 49900 && $NF <= 49999 {print $NF}' | sort -u)"
+
+  if ! loopback_alias_ok 127.0.0.2 udp || ! loopback_alias_ok 127.0.0.2 tcp; then
+    skip "$name" "127.0.0.2 is not a usable loopback alias on this host"
+    return
+  fi
+
+  local cluster_port=$((BASE + 2))
+  start_server "$name-a" --listen "127.0.0.1:$BASE" --tcp \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" --turn-tcp-relay \
+    --tcp-relay-ports "$tcp_a_lo-$tcp_a_hi" \
+    --cluster-peer "a@127.0.0.1:$cluster_port" \
+    --cluster-peer "b@127.0.0.2:$cluster_port" \
+    --cluster-secret "$SECRET" \
+    --cluster-listen "127.0.0.1:$cluster_port" --cluster-instance-id a \
+    --health-listen "127.0.0.1:$HEALTH_PORT"
+  start_server "$name-b" --listen "127.0.0.2:$BASE" --tcp \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" --turn-tcp-relay \
+    --tcp-relay-ports "$tcp_b_lo-$tcp_b_hi" \
+    --cluster-peer "a@127.0.0.1:$cluster_port" \
+    --cluster-peer "b@127.0.0.2:$cluster_port" \
+    --cluster-secret "$SECRET" \
+    --cluster-listen "127.0.0.2:$cluster_port" --cluster-instance-id b \
+    --health-listen "127.0.0.2:$HEALTH_PORT"
+  if ! wait_health_at 127.0.0.1 || ! wait_health_at 127.0.0.2; then
+    fail "$name" "instances did not become healthy (see $LOG_DIR/$name-*.log)"
+    stop_server "$name-b"
+    stop_server "$name-a"
+    return
+  fi
+
+  # Overlapping TCP relay ranges must be refused before serving.
+  local overlap
+  overlap="$("$BIN" server --listen "127.0.0.1:$((BASE + 7))" --turn --realm "$REALM" \
+    --auth-secret "$SECRET" --auth-user u --auth-pass p --turn-tcp-relay \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    --tcp-relay-ports "$((RELAY_LO + 50))-$((RELAY_LO + 80))" \
+    --cluster-listen "127.0.0.1:$((cluster_port + 10))" \
+    --cluster-peer "a@127.0.0.1:$((cluster_port + 10))" 2>&1)"
+  if [[ $? -ne 0 ]] && grep -qa "overlaps" <<<"$overlap"; then
+    ok "$name-range" "a TCP relay range overlapping --relay-ports is refused"
+  else
+    fail "$name-range" "expected a refusal mentioning the overlap"
+  fi
+
+  local attempts=8 cross=0 all_ok=0 release_ok=1
+  local attempt entry owner index relay lb_log lb_ready probe_log code waited
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    lb_log="$LOG_DIR/$name-lb-$attempt.log"
+    lb_ready="$WORK/$name-lb-$attempt.ready"
+    rm -f "$lb_ready"
+    if (( attempt % 2 )); then
+      python3 "$ROOT/script/lab/rstun-turn-tcp-lb.py" --listen "127.0.0.1:$lb_port" \
+        --backend "127.0.0.1:$BASE" --backend "127.0.0.2:$BASE" \
+        --ready-file "$lb_ready" >"$lb_log" 2>&1 &
+    else
+      python3 "$ROOT/script/lab/rstun-turn-tcp-lb.py" --listen "127.0.0.1:$lb_port" \
+        --backend "127.0.0.2:$BASE" --backend "127.0.0.1:$BASE" \
+        --ready-file "$lb_ready" >"$lb_log" 2>&1 &
+    fi
+    local lb_pid=$!
+    PIDS+=("$lb_pid")
+    if ! wait_ready_file "$lb_ready" 30; then
+      fail "$name-lb" "TCP load balancer did not start (see $lb_log)"
+      kill -TERM "$lb_pid" 2>/dev/null
+      wait "$lb_pid" 2>/dev/null
+      break
+    fi
+    probe_log="$LOG_DIR/$name-probe-$attempt.log"
+    python3 "$PROBE" tcp-relay --server "127.0.0.1:$lb_port" --show-relay \
+      >"$probe_log" 2>&1
+    code=$?
+    relay="$(grep -aoE 'info: relay=[0-9.]+:[0-9]+' "$probe_log" | head -1 | sed 's/info: relay=//')"
+    entry="$(grep -a '^route ' "$lb_log" | head -1 | grep -oE '127\.0\.0\.[0-9]+' | tail -1)"
+    local id
+    id="$(grep -aoE 'info: connection-id=[0-9]+' "$probe_log" | head -1 | sed 's/.*=//')"
+    owner=""
+    if [[ -n "$id" ]]; then
+      index=$((id >> 24))
+      if (( index == 0 )); then owner=127.0.0.1; else owner=127.0.0.2; fi
+    fi
+    if [[ -n "$owner" && -n "$entry" && "$owner" != "$entry" ]]; then
+      cross=$((cross + 1))
+    fi
+    if [[ $code -eq 0 ]]; then
+      all_ok=$((all_ok + 1))
+    else
+      fail "$name" "attempt $attempt: probe exit=$code (see $probe_log)"
+    fi
+    if [[ -n "$relay" ]]; then
+      local relay_port="${relay##*:}"
+      if ! wait_port_gone tcp "$relay_port" 50; then
+        fail "$name-release" "attempt $attempt: TCP relay listener $relay still open"
+        release_ok=0
+      fi
+    fi
+    kill -TERM "$lb_pid" 2>/dev/null
+    wait "$lb_pid" 2>/dev/null
+  done
+
+  # Passive mode: the peer dials the owner's relay; the ConnectionAttempt is
+  # pushed back to the entry's control connection.
+  local lb_log="$LOG_DIR/$name-passive-lb.log"
+  local lb_ready="$WORK/$name-passive-lb.ready"
+  rm -f "$lb_ready"
+  python3 "$ROOT/script/lab/rstun-turn-tcp-lb.py" --listen "127.0.0.1:$lb_port" \
+    --backend "127.0.0.1:$BASE" --backend "127.0.0.2:$BASE" \
+    --ready-file "$lb_ready" >"$lb_log" 2>&1 &
+  local lb_pid=$!
+  PIDS+=("$lb_pid")
+  local passive_log="$LOG_DIR/$name-passive.log"
+  local passive_ok=0
+  if wait_ready_file "$lb_ready" 30; then
+    python3 "$PROBE" tcp-relay-passive --server "127.0.0.1:$lb_port" --show-relay \
+      >"$passive_log" 2>&1
+    code=$?
+    [[ $code -eq 0 ]] && passive_ok=1
+    local passive_id passive_owner passive_entry
+    passive_id="$(grep -aoE 'info: connection-id=[0-9]+' "$passive_log" | head -1 | sed 's/.*=//')"
+    passive_entry="$(grep -a '^route ' "$lb_log" | head -1 | grep -oE '127\.0\.0\.[0-9]+' | tail -1)"
+    passive_owner=""
+    if [[ -n "$passive_id" ]]; then
+      index=$((passive_id >> 24))
+      if (( index == 0 )); then passive_owner=127.0.0.1; else passive_owner=127.0.0.2; fi
+    fi
+    if (( passive_ok == 1 )) && [[ -n "$passive_owner" && -n "$passive_entry" && "$passive_owner" != "$passive_entry" ]]; then
+      cross=$((cross + 1))
+    fi
+  else
+    fail "$name-passive" "TCP load balancer did not start"
+  fi
+  kill -TERM "$lb_pid" 2>/dev/null
+  wait "$lb_pid" 2>/dev/null
+
+  if [[ $all_ok -eq $attempts ]]; then
+    ok "$name" "$attempts outbound RFC 6062 attempts through the LB"
+  fi
+  if (( passive_ok == 1 )); then
+    ok "$name-passive" "$(grep -c '^ok:' "$passive_log") passive assertions"
+  else
+    fail "$name-passive" "see $passive_log"
+  fi
+  if (( cross > 0 )); then
+    ok "$name-cross" "$cross cross-instance RFC 6062 runs (control and bind on different instances)"
+  else
+    fail "$name-cross" "no cross-instance bind/attempt was observed"
+  fi
+  [[ $release_ok -eq 1 ]] && ok "$name-release" "TCP relay listeners closed after LIFETIME=0"
+
+  stop_server "$name-b"
+  stop_server "$name-a"
+  local leftover leftover_tcp
+  leftover="$(relay_new_sockets "$before")"
+  leftover_tcp="$(ss -ltnH 2>/dev/null | awk '{print $4}' | awk -F: '$NF >= 49900 && $NF <= 49999 {print $NF}' | sort -u | comm -13 <(printf '%s\n' "${before_tcp:-}") -)"
+  if [[ -z "$leftover" && -z "$leftover_tcp" ]]; then
+    ok "$name-cleanup" "no UDP relay socket and no TCP relay listener left"
+  else
+    fail "$name-cleanup" "udp=[$(echo "$leftover" | tr '\n' ' ')] tcp=[$(echo "$leftover_tcp" | tr '\n' ' ')]"
+  fi
+}
+
+# ---------- 7e. multi-instance TLS / DTLS ----------
+#
+# Same cluster, but the client speaks `turns:` (TLS) or DTLS. The entry holds
+# the encrypted connection and its writer queue; peer→client bytes must be
+# pushed back to it (PUSH_CLIENT) exactly like plain TCP. The TLS proxy is a
+# byte relay; DTLS needs a **sticky** UDP balancer (a session's datagrams must
+# not be split across instances).
+
+run_mi_secure() { # name proto(tls|dtls)
+  local name="$1"
+  local proto="$2"
+  local cluster_port=$((BASE + 2))
+  local lb_port=$((BASE + 6))
+  local service_port
+  if [[ "$proto" == tls ]]; then service_port="$TLS_PORT"; else service_port="$DTLS_PORT"; fi
+  local transport_flag
+  if [[ "$proto" == tls ]]; then transport_flag="--turn-tls-listen"; else transport_flag="--turn-dtls-listen"; fi
+  local before
+  before="$(relay_sockets)"
+
+  start_server "$name-a" --listen "127.0.0.1:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    "$transport_flag" "127.0.0.1:$service_port" \
+    --tls-cert "$CERT_DIR/cert.pem" --tls-key "$CERT_DIR/key.pem" \
+    --cluster-peer "a@127.0.0.1:$cluster_port" \
+    --cluster-peer "b@127.0.0.2:$cluster_port" \
+    --cluster-secret "$SECRET" \
+    --cluster-listen "127.0.0.1:$cluster_port" --cluster-instance-id a \
+    --health-listen "127.0.0.1:$HEALTH_PORT"
+  start_server "$name-b" --listen "127.0.0.2:$BASE" \
+    --turn --realm "$REALM" --auth-secret "$SECRET" \
+    --auth-user "$USER_NAME" --auth-pass "$USER_PASS" \
+    --relay-ports "$RELAY_LO-$RELAY_HI" \
+    "$transport_flag" "127.0.0.2:$service_port" \
+    --tls-cert "$CERT_DIR/cert.pem" --tls-key "$CERT_DIR/key.pem" \
+    --cluster-peer "a@127.0.0.1:$cluster_port" \
+    --cluster-peer "b@127.0.0.2:$cluster_port" \
+    --cluster-secret "$SECRET" \
+    --cluster-listen "127.0.0.2:$cluster_port" --cluster-instance-id b \
+    --health-listen "127.0.0.2:$HEALTH_PORT"
+  if ! wait_health_at 127.0.0.1 || ! wait_health_at 127.0.0.2; then
+    fail "$name" "instances did not become healthy (see $LOG_DIR/$name-*.log)"
+    stop_server "$name-b"
+    stop_server "$name-a"
+    return
+  fi
+
+  # The balancer pins the entry to A (one backend), so every allocation that
+  # hashes to B exercises the cross-instance return path.
+  local cross=0 relay_ok=0 attempt code bytes_in bytes_out owner_b
+  # DTLS relay-address check needs to know whether **this** run had an owner-B
+  # allocation; the byte counter is cumulative across attempts.
+  local before_b after_b this_b dtls_relay_ok=0 dtls_relay_bad=0
+  for attempt in 1 2 3; do
+    local lb_log="$LOG_DIR/$name-lb.log"
+    local lb_ready="$WORK/$name-lb.ready"
+    rm -f "$lb_ready"
+    if [[ "$proto" == tls ]]; then
+      python3 "$ROOT/script/lab/rstun-turn-tcp-lb.py" --listen "127.0.0.1:$lb_port" \
+        --backend "127.0.0.1:$service_port" --ready-file "$lb_ready" \
+        >"$lb_log" 2>&1 &
+    else
+      python3 "$ROOT/script/lab/rstun-turn-lb.py" --listen "127.0.0.1:$lb_port" \
+        --sticky --backend "127.0.0.1:$service_port" --ready-file "$lb_ready" \
+        >"$lb_log" 2>&1 &
+    fi
+    local lb_pid=$!
+    PIDS+=("$lb_pid")
+    if ! wait_ready_file "$lb_ready" 30; then
+      fail "$name-lb" "load balancer did not start (see $lb_log)"
+      kill -TERM "$lb_pid" 2>/dev/null
+      wait "$lb_pid" 2>/dev/null
+      break
+    fi
+    before_b="$(metric_at 127.0.0.2 'rstun_turn_bytes_total{direction="out"}')"
+    before_b="${before_b:-0}"
+    if [[ "$proto" == tls ]]; then
+      turnutils_uclient -S -t -u "$USER_NAME" -w "$USER_PASS" -p "$lb_port" \
+        -n 5 -m 3 -y 127.0.0.1 >"$LOG_DIR/$name-uclient.log" 2>&1
+    else
+      # `-v` prints `Received relay addr: <ip>:<port>` per allocation, which is
+      # the only client-side view of XOR-RELAYED-ADDRESS.
+      turnutils_uclient -S -v -u "$USER_NAME" -w "$USER_PASS" -p "$lb_port" \
+        -n 5 -m 3 -y 127.0.0.1 >"$LOG_DIR/$name-uclient.log" 2>&1
+    fi
+    code=$?
+    bytes_in="$(metric_sum 'rstun_turn_bytes_total{direction="in"}')"
+    bytes_out="$(metric_sum 'rstun_turn_bytes_total{direction="out"}')"
+    # The owner is the only one that counts relay bytes; the entry holds A.
+    # Only this run's delta proves that an allocation landed on B.
+    after_b="$(metric_at 127.0.0.2 'rstun_turn_bytes_total{direction="out"}')"
+    after_b="${after_b:-0}"
+    this_b=$((after_b - before_b))
+    if [[ $code -eq 0 ]] && uclient_ok "$LOG_DIR/$name-uclient.log" &&
+      [[ -n "$bytes_in" && "$bytes_in" -gt 0 && -n "$bytes_out" && "$bytes_out" -gt 0 ]]; then
+      relay_ok=1
+    fi
+    if (( this_b > 0 )); then
+      cross=1
+      # S1 for DTLS: an owner-B allocation must advertise 127.0.0.2, never the
+      # host's primary 127.0.0.1.
+      if [[ "$proto" == dtls ]]; then
+        if grep -aq "Received relay addr: 127.0.0.2:" "$LOG_DIR/$name-uclient.log"; then
+          dtls_relay_ok=1
+        else
+          dtls_relay_bad=1
+        fi
+      fi
+    fi
+    kill -TERM "$lb_pid" 2>/dev/null
+    wait "$lb_pid" 2>/dev/null
+    (( relay_ok == 1 && cross == 1 )) && break
+  done
+
+  if (( relay_ok == 1 )); then
+    ok "$name" "uclient -S$([[ "$proto" == tls ]] && echo ' -t') through the LB: relay bytes in=$bytes_in out=$bytes_out"
+  else
+    fail "$name" "uclient did not complete (see $LOG_DIR/$name-uclient.log)"
+  fi
+  if (( cross == 1 )); then
+    ok "$name-cross" "allocations on the non-entry instance used the $proto return path"
+  else
+    fail "$name-cross" "no allocation landed on the other instance"
+  fi
+  if [[ "$proto" == dtls ]] && (( cross == 1 )); then
+    if (( dtls_relay_ok == 1 && dtls_relay_bad == 0 )); then
+      ok "$name-relay-ip" "owner-B DTLS relay address is on 127.0.0.2 (uclient -S -v)"
+    else
+      fail "$name-relay-ip" "owner-B run advertised no 127.0.0.2 relay address (see $LOG_DIR/$name-uclient.log)"
+    fi
+  fi
+
+  # S1: a forwarded TLS request must bind the relay on the **owner's own**
+  # listener IP (127.0.0.2), not on whatever `egress_ip` guesses for the
+  # wildcard fallback. The balancer's upstream source port decides the owner, so
+  # pick one whose normalized key hashes to B using the same ring the server
+  # uses (deterministic, no retry guessing).
+  if [[ "$proto" == tls ]]; then
+    local s1_port relay_ip relay_port owner_b
+    s1_port="$(python3 - "$TLS_PORT" <<'RING_PY'
+import struct, sys
+
+service = int(sys.argv[1])
+
+
+def fnv(bs):
+    h = 0xCBF29CE484222325
+    for b in bs:
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def point(member, replica):
+    return fnv(member.encode() + b"#" + struct.pack("!I", replica))
+
+
+ring = sorted((point(m, r), m) for m in ("a", "b") for r in range(16))
+
+
+def owner(port):
+    key = bytes([4]) + bytes([127, 0, 0, 1]) + struct.pack("!H", port)
+    key += bytes([1]) + struct.pack("!H", service)  # Tcp, TLS listen port
+    h = fnv(key)
+    for p, member in ring:
+        if p >= h:
+            return member
+    return ring[0][1]
+
+
+for port in range(45000, 45100):
+    if owner(port) == "b":
+        print(port)
+        break
+else:
+    sys.exit(1)
+RING_PY
+)"
+    if [[ -z "$s1_port" ]]; then
+      fail "$name-relay-ip" "could not find a 5-tuple whose owner is B"
+    else
+      local lb_log="$LOG_DIR/$name-s1-lb.log"
+      local lb_ready="$WORK/$name-s1-lb.ready"
+      local probe_log="$LOG_DIR/$name-s1.log"
+      rm -f "$lb_ready"
+      python3 "$ROOT/script/lab/rstun-turn-tcp-lb.py" --listen "127.0.0.1:$lb_port" \
+        --backend "127.0.0.1:$service_port" --source-port "$s1_port" \
+        --ready-file "$lb_ready" >"$lb_log" 2>&1 &
+      local lb_pid=$!
+      PIDS+=("$lb_pid")
+      if wait_ready_file "$lb_ready" 30; then
+        python3 "$PROBE" tcp-control --tls --server "127.0.0.1:$lb_port" --show-relay --hold 0.8 \
+          >"$probe_log" 2>&1 &
+        local probe_pid=$!
+        local waited=0
+        while ! grep -qa "info: holding" "$probe_log" 2>/dev/null && (( waited < 50 )); do
+          sleep 0.1
+          waited=$((waited + 1))
+        done
+        relay_ip="$(grep -aoE 'info: relay=[0-9.]+:[0-9]+' "$probe_log" | head -1 | sed 's/.*=//; s/:[0-9]*$//')"
+        relay_port="$(grep -aoE 'info: relay=[0-9.]+:[0-9]+' "$probe_log" | head -1 | sed 's/.*://')"
+        owner_b="$(metric_at 127.0.0.2 'rstun_turn_allocations')"
+        wait "$probe_pid" 2>/dev/null
+        if [[ -n "$relay_port" ]] && ! wait_port_gone udp "$relay_port" 30; then
+          fail "$name-relay-ip" "relay port $relay_port was not released"
+        elif [[ -n "$owner_b" && "$owner_b" -gt 0 && "$relay_ip" == 127.0.0.2 ]]; then
+          ok "$name-relay-ip" "XOR-RELAYED-ADDRESS IP is the owning instance's TLS listen IP (127.0.0.2)"
+        else
+          fail "$name-relay-ip" "owner-B allocation relay IP is ${relay_ip:-?} (owner_b=${owner_b:-?}); see $probe_log"
+        fi
+      else
+        fail "$name-relay-ip" "load balancer did not start with --source-port $s1_port (see $lb_log)"
+      fi
+      kill -TERM "$lb_pid" 2>/dev/null
+      wait "$lb_pid" 2>/dev/null
+    fi
+  fi
+
+  stop_server "$name-b"
+  stop_server "$name-a"
+  local leftover
+  leftover="$(relay_new_sockets "$before")"
+  if [[ -z "$leftover" ]]; then
+    ok "$name-cleanup" "no relay socket left after shutdown"
+  else
+    fail "$name-cleanup" "leftover=[$(echo "$leftover" | tr '\n' ' ')]"
+  fi
+}
+
+run_multi_instance_tls() {
+  local name=multi-instance-tls
+  if [[ "$HAVE_SECURE" != true ]]; then
+    skip "$name" "lean 构建没有 tls/dtls feature（用 --tls，或 cargo build --features full）"
+    return
+  fi
+  make_cert || { skip "$name" "openssl 不可用，无法生成证书"; return; }
+  run_mi_secure "$name" tls
+}
+
+run_multi_instance_dtls() {
+  local name=multi-instance-dtls
+  if [[ "$HAVE_SECURE" != true ]]; then
+    skip "$name" "lean 构建没有 tls/dtls feature（用 --dtls，或 cargo build --features full）"
+    return
+  fi
+  make_cert || { skip "$name" "openssl 不可用，无法生成证书"; return; }
+  run_mi_secure "$name" dtls
 }
 
 # ---------- 8. frozen: no --turn is byte-identical to HEAD ----------
@@ -1808,6 +2627,11 @@ run_item() {
     relay) run_relay ;;
     tcprelay) run_tcprelay ;;
     tcp-relay-passive) run_tcp_relay_passive ;;
+    multi-instance-udp) run_multi_instance_udp ;;
+    multi-instance-tcp) run_multi_instance_tcp ;;
+    multi-instance-tcp-relay) run_multi_instance_tcp_relay ;;
+    multi-instance-tls) run_multi_instance_tls ;;
+    multi-instance-dtls) run_multi_instance_dtls ;;
     auth) run_auth ;;
     lifecycle) run_lifecycle ;;
     wrong-user) run_wrong_user ;;

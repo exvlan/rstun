@@ -1,0 +1,135 @@
+# Two TURN instances behind one VIP (DSR / per-instance IP) with cross-instance
+# allocation ownership.
+#
+# Contract (see docs/book/src/turn.md, "多实例"):
+#   * every instance serves the SAME ports (--listen / TLS / DTLS) and is told
+#     apart by IP — here `hostNetwork` on two different nodes;
+#   * --cluster-peer lists the whole member set with those node IPs;
+#   * UDP relay ranges may be shared (bind failure partitions them), but the
+#     RFC 6062 TCP range must be per-instance and disjoint;
+#   * the cluster port (34970 here) must be reachable between the nodes.
+#
+# Replace NODE_A / NODE_B with the two node IPs (or use a headless Service and
+# stable pod IPs). The clients must send their traffic to an address that is
+# preserved on the way back: a VIP with DSR, or the instance's own IP.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rstun-a
+  labels: { app: rstun, instance: a }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: rstun, instance: a }
+  template:
+    metadata:
+      labels: { app: rstun, instance: a }
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: { kubernetes.io/hostname: NODE_A }
+      containers:
+        - name: rstun
+          image: ghcr.io/exvlan/rstun:latest
+          args:
+            - server
+            - --listen
+            - 0.0.0.0:3478
+            - --tcp
+            - --turn
+            - --realm
+            - example.org
+            - --auth-secret
+            - "$(AUTH_SECRET)"
+            - --auth-file
+            - /etc/rstun/users.txt
+            - --relay-ports
+            - 49152-65535
+            - --turn-tcp-relay
+            - --tcp-relay-ports
+            - 51000-51099
+            - --cluster-listen
+            - 0.0.0.0:34970
+            - --cluster-peer
+            - a@NODE_A:34970
+            - --cluster-peer
+            - b@NODE_B:34970
+            - --cluster-instance-id
+            - a
+            - --cluster-secret
+            - "$(CLUSTER_SECRET)"
+            - --health-listen
+            - 127.0.0.1:9100
+          env:
+            - name: AUTH_SECRET
+              valueFrom: { secretKeyRef: { name: rstun, key: auth-secret } }
+            - name: CLUSTER_SECRET
+              valueFrom: { secretKeyRef: { name: rstun, key: cluster-secret } }
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet: { path: /healthz, port: 9100 }
+            periodSeconds: 5
+      terminationGracePeriodSeconds: 20
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rstun-b
+  labels: { app: rstun, instance: b }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: rstun, instance: b }
+  template:
+    metadata:
+      labels: { app: rstun, instance: b }
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: { kubernetes.io/hostname: NODE_B }
+      containers:
+        - name: rstun
+          image: ghcr.io/exvlan/rstun:latest
+          args:
+            - server
+            - --listen
+            - 0.0.0.0:3478
+            - --tcp
+            - --turn
+            - --realm
+            - example.org
+            - --auth-secret
+            - "$(AUTH_SECRET)"
+            - --auth-file
+            - /etc/rstun/users.txt
+            - --relay-ports
+            - 49152-65535
+            - --turn-tcp-relay
+            - --tcp-relay-ports
+            - 51100-51199
+            - --cluster-listen
+            - 0.0.0.0:34970
+            - --cluster-peer
+            - a@NODE_A:34970
+            - --cluster-peer
+            - b@NODE_B:34970
+            - --cluster-instance-id
+            - b
+            - --cluster-secret
+            - "$(CLUSTER_SECRET)"
+            - --health-listen
+            - 127.0.0.1:9100
+          env:
+            - name: AUTH_SECRET
+              valueFrom: { secretKeyRef: { name: rstun, key: auth-secret } }
+            - name: CLUSTER_SECRET
+              valueFrom: { secretKeyRef: { name: rstun, key: cluster-secret } }
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet: { path: /healthz, port: 9100 }
+            periodSeconds: 5
+      terminationGracePeriodSeconds: 20

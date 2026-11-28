@@ -145,7 +145,7 @@ rstun server \
 验收：
 
 ```bash
-bash script/lab/rstun-turn.sh            # 22 项（lean 构建：tls/dtls/cert-reload/cert-poll 标 SKIP）
+bash script/lab/rstun-turn.sh            # 28 项（lean 构建：tls/dtls/cert-reload/cert-poll 标 SKIP）
                                          #   启动失败/中继/401+438/生命周期/441/RAF(-X 成功、
                                          #   -x 440)/DF(-g 中继 + tcpdump 记录 DF)/IPv6 relay/
                                          #   通配回环/permission 508/486/端口 508/
@@ -157,6 +157,55 @@ bash script/lab/rstun-turn.sh --only cert-poll    # --tls-cert-poll（0 = 仅 SI
 bash script/lab/rstun-turn.sh --tls --dtls   # 两项都跑
 bash script/lab/rstun-turn.sh --only df      # DONT-FRAGMENT 单项（需要 tcpdump 才有线上证据，否则退化）
 bash script/lab/rstun-turn.sh --only ipv6relay  # IPv6 relay 单项（无 ::1 时 SKIP）
+```
+
+## 多实例（`--cluster-listen` 等）
+
+同一批客户端可能被负载均衡器分到任意实例，但 allocation（relay socket、permission/channel 表、
+回程 sink）只存在于创建它的进程里。开启 `--cluster-listen` 后，每个实例用**静态成员表 + 一致性哈希**
+自行算出某个 5 元组的**归属实例**：
+
+- **控制面**：请求落到非归属实例时，经内部 TCP 长连转发给归属实例执行，响应原样回给客户端；
+- **数据面（UDP）**：`Send` / `ChannelData` 走同端口的 UDP 单向帧（fire-and-forget）；
+- **数据面（TCP/TLS/DTLS）**：写队列属于**入口实例**，归属实例用 `PUSH_CLIENT` 把 peer→client
+  字节定向推回该连接；入口连接结束时发 `CLIENT_CLOSED`，归属实例**立即**释放 allocation 与 relay socket；
+- **RFC 6062**：`CONNECTION-ID` 的最高字节记录归属实例下标，`ConnectionBind` 据此路由；
+  绑定成功后该连接升级为 `RAW_RELAY` 双向裸字节（归属实例把它包装成 data connection 的读写两半）。
+
+鉴权、permission 判定、带宽桶全部**只在归属实例**做。
+
+```bash
+# 实例 A（另一实例 B 用 127.0.0.2 上的同一组端口）
+rstun server --listen 127.0.0.1:3478 --turn   --realm example.org --auth-secret "$SECRET" --auth-file /etc/rstun/users.txt   --turn-tls-listen 127.0.0.1:5349 --tls-cert /etc/rstun/cert.pem --tls-key /etc/rstun/key.pem   --turn-dtls-listen 127.0.0.1:5350 --tls-cert /etc/rstun/cert.pem --tls-key /etc/rstun/key.pem   --turn-tcp-relay --tcp-relay-ports 51000-51099   --cluster-listen 127.0.0.1:34970   --cluster-peer a@127.0.0.1:34970 --cluster-peer b@127.0.0.2:34970   --cluster-instance-id a --cluster-secret "$CLUSTER_SECRET"
+```
+
+| 项 | 契约 |
+| --- | --- |
+| 归属键 | `(client_ip, client_port, transport_class, listen_port)`，`transport_class ∈ udp/tcp/dtls`；集群模式下 `Key.server` 归一化为 `0.0.0.0:<listen_port>`（UDP 看到的是绑定地址、TCP 看到的是连接本地地址，直接用会让同一客户端在每个实例上是不同的 allocation）|
+| 成员表 | `--cluster-peer <id>@<addr>` 列出**全部**成员（自己可省略，省略时按 `--cluster-instance-id` / `--cluster-listen` 补上）；成员 id 排序成环，16 个虚拟点；改成员 = **排空重建**，不做在线迁移 |
+| 启动握手 | 每条控制连接先交换 `HELLO`（协议版本、instance-id、**端口集合**、TCP relay 段、**成员表摘要**）。成员必须服务**同一组端口**，且每个实例的 `--cluster-peer` 必须**完全一致**（缺一个成员会让部分键永久换主，摘要不一致直接拒绝启动）。成员必须服务**同一组端口**（`--listen`、`--turn-tls-listen`、`--turn-dtls-listen` 各自逐端口一致），实例靠 **IP/netns** 区分；端口不一致 → **拒绝启动**（否则同一客户端会在两个入口算出不同 owner）。peer 暂不可达只告警（请求回 `500`）|
+| 内部通道 | `--cluster-listen` 同一端口上：TCP 长连（请求/响应/PUSH_CLIENT/RAW_RELAY）+ UDP（`PUSH_DATA`）。帧 = `u32 len ‖ u8 type ‖ u16 flags ‖ u8 reserved ‖ u32 session ‖ payload`，`--cluster-secret` 时带截断 HMAC-SHA256（`flags & 0x01`），未签名帧一律拒绝 |
+| 错误语义 | 归属实例不可达 / 500ms 内无响应 → **`500 Server Error`**（**不回 `437`**，也不静默丢）。客户端重试要用**新的本地端口**：归属只由 5 元组决定，同一 5 元组重试仍会命中同一个死实例 |
+| `EVEN-PORT` | 第一份 allocation 保留下一个奇数端口；`RESERVATION-TOKEN` 的第二份 allocation 若哈希到别的实例，优先用**同一端口号**（在该实例自己的 relay IP 上），被占用时改用该实例的空闲奇数端口。返回 `508` 会让 coturn `uclient` 直接退出，而跨实例的端口相邻本来就无从保证（客户端从响应读地址）|
+| 端口 | 每实例的 `--listen` / TLS / DTLS **端口相同、IP 不同**；**UDP relay 段可共用**（bind 失败自动分区）；**TCP relay 段必须分片**：`--tcp-relay-ports` 在集群 + `--turn-tcp-relay` 时**必填**，且与 `--relay-ports` 及其它成员的段不重叠（TCP relay listener 用 `SO_REUSEPORT`，重叠会让两个实例抢同一个 peer）|
+| RFC 6062 | 出站 `Connect` 在归属实例；`ConnectionBind` 落到任意实例都按 id 路由到归属实例；被动 `ConnectionAttempt` 经 `PUSH_CLIENT` 回入口；半关闭按方向传播（客户端 EOF 只关 peer 写半边，peer EOF 只关客户端写半边），allocation 删除/错误才关双向 |
+| 部署前提 | 回程源地址必须被客户端接受：每实例独立公网 IP，或共享 VIP + DSR（客户端把请求发到 VIP）。NAT 型 LB（客户端只认 LB 地址）要求 LB 同时转发回程（lab 的假 LB 即此形态）|
+| 默认关闭 | 不写 `--cluster-listen` 时零新任务、零新键，行为与旧版本逐字节一致（`frozen` 3×17）|
+
+> 成员表一致性**只校验 id**（成员数 + 排序 id 摘要）：`--cluster-peer` 的**地址写错/漂移不会 fail-fast**，
+> 会落到既有的「归属实例不可达 → `500`」——换地址时请同时重启所有成员并核对 `--cluster-peer`。
+> 集群里请使用**具体的** `--listen` IP：`0.0.0.0` 时 relay 地址仍按路由反推（与单实例通配行为一致），
+> 同机多实例会拿到同一主机主 IP，`XOR-RELAYED-ADDRESS` 就不再是归属实例自己的地址。
+
+观测只靠日志字段（`cluster=forward peer_instance=<id>`、`session=<n>`）：`/metrics` 的标签集合不变
+（每实例仍是本进程视角，全局上限 = N × 单实例配置）。验收（lean 下 TLS/DTLS 项 SKIP）：
+
+```bash
+bash script/lab/rstun-turn.sh --only multi-instance-udp         # 两实例同一 5 元组：控制面 + PUSH_DATA
+bash script/lab/rstun-turn.sh --only multi-instance-tcp         # TCP 控制连接 + PUSH_CLIENT + 断连即释放
+bash script/lab/rstun-turn.sh --only multi-instance-tcp-relay   # RFC 6062 出站 + 被动，两实例端口段不重叠
+bash script/lab/rstun-turn.sh --only multi-instance-tls         # turns: 经 TCP LB（需要 full 构建）
+bash script/lab/rstun-turn.sh --only multi-instance-dtls        # DTLS 经 sticky UDP LB（需要 full 构建）
 ```
 
 ## 浏览器验收（`turns:`，人工）

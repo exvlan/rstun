@@ -193,6 +193,13 @@ impl Client {
         self.key = auth::long_term_key(KeyAlgorithm::Md5, user, REALM, password);
     }
 
+    /// Point subsequent requests at another instance without touching the
+    /// socket: the client's source port (and therefore its normalized 5-tuple)
+    /// stays the same, only the instance it sends to changes.
+    fn set_server(&mut self, server: SocketAddr) {
+        self.server = server;
+    }
+
     fn next_id(&mut self) -> TransactionId {
         self.sequence = self.sequence.wrapping_add(1);
         transaction_id(self.sequence)
@@ -875,6 +882,10 @@ struct TcpClient {
 impl TcpClient {
     async fn connect(server: SocketAddr) -> Self {
         let stream = tokio::net::TcpStream::connect(server).await.unwrap();
+        Self::from_stream(stream)
+    }
+
+    fn from_stream(stream: tokio::net::TcpStream) -> Self {
         Self {
             stream,
             nonce: String::new(),
@@ -1925,6 +1936,7 @@ fn tcp_allocate_dont_fragment_is_400_even_where_df_is_unsupported() {
         ClientTransport::Tcp,
         &context,
         Some(&sender),
+        None,
         &identity,
     ) {
         Decision::Respond(response) => {
@@ -2193,6 +2205,7 @@ async fn broadcast_and_v4_mapped_peers_are_refused() {
 struct TcpHarness {
     server: SocketAddr,
     turn: Arc<Turn>,
+    context: Arc<ServerContext>,
 }
 
 async fn start_tcp(config: Config) -> TcpHarness {
@@ -2200,14 +2213,22 @@ async fn start_tcp(config: Config) -> TcpHarness {
 }
 
 async fn start_tcp_with(config: Config, auth: auth::Auth) -> TcpHarness {
-    let listener = crate::tcp_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+    start_tcp_on("127.0.0.1:0", config, auth).await
+}
+
+async fn start_tcp_on(bind: &str, config: Config, auth: auth::Auth) -> TcpHarness {
+    let listener = crate::tcp_listener(bind.parse().unwrap()).unwrap();
     let server = listener.local_addr().unwrap();
+    // Production `--turn` always has a UDP `--listen` on the same port; the
+    // owner resolves its relay address from that table, so the harness mirrors
+    // it instead of leaving `context.udp` empty.
+    let udp = Arc::new(udp_socket(server).expect("UDP listener on the same port"));
     let turn = Arc::new(Turn::new(config, "rstun/test"));
     let stats = Arc::new(ServerStats::default());
     stats.set_turn(turn.clone());
     let context = Arc::new(ServerContext {
         plan: None,
-        udp: Vec::new(),
+        udp: vec![(server, udp)],
         mapped_address: false,
         admission: None,
         fingerprint: None,
@@ -2216,11 +2237,15 @@ async fn start_tcp_with(config: Config, auth: auth::Auth) -> TcpHarness {
     });
     tokio::spawn(crate::serve_tcp(
         listener,
-        context,
+        context.clone(),
         Arc::from("rstun/test"),
-        stats,
+        stats.clone(),
     ));
-    TcpHarness { server, turn }
+    TcpHarness {
+        server,
+        turn,
+        context,
+    }
 }
 
 fn tcp_relay_config() -> Config {
@@ -2240,6 +2265,7 @@ fn tcp_relay_config() -> Config {
     Config {
         tcp_relay: true,
         relay_ports: (lo, lo + 99),
+        tcp_relay_ports: (lo, lo + 99),
         ..Config::default()
     }
 }
@@ -3153,6 +3179,7 @@ async fn an_undeliverable_connection_attempt_closes_the_inbound_peer() {
         ClientSink::Queue(sender),
         connections.clone(),
         counters.clone(),
+        None,
     );
 
     let mut peer = TcpStream::connect(relay).await.expect("relay accepts");
@@ -3170,4 +3197,926 @@ async fn an_undeliverable_connection_attempt_closes_the_inbound_peer() {
         "an unannounced connection must not stay pending"
     );
     task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-instance (M1): two real `serve_udp` loops + two cluster nodes
+// ---------------------------------------------------------------------------
+
+/// Two instances on the **same port** of two loopback addresses, which is the
+/// deployment shape the normalized key assumes (design D2/D3): same
+/// `listen_port`, different instance IP.
+struct ClusterPair {
+    a: Harness,
+    b: Harness,
+    cluster_a: Arc<cluster::Cluster>,
+    cluster_b: Arc<cluster::Cluster>,
+    /// The pair binds the same port on two addresses; serialise the tests so
+    /// two of them cannot race for that port.
+    _serial: tokio::sync::OwnedMutexGuard<()>,
+}
+
+fn cluster_test_lock() -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+        std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+impl ClusterPair {
+    fn owner_id(&self, client: SocketAddr) -> String {
+        let key = cluster::NodeKey::new(client, cluster::TransportClass::Udp, self.a.server);
+        self.cluster_a
+            .owner_for(&key)
+            .expect("membership is configured")
+            .id
+    }
+
+    fn owner_and_entry(&self, owner_ip: IpAddr) -> (&Harness, &Harness) {
+        if owner_ip == self.a.server.ip() {
+            (&self.a, &self.b)
+        } else {
+            (&self.b, &self.a)
+        }
+    }
+}
+
+/// A loopback port that is free on both `127.0.0.1` and `127.0.0.2`.
+fn shared_loopback_port() -> u16 {
+    for _ in 0..64 {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let first = std::net::UdpSocket::bind(("127.0.0.1", port));
+        let second = std::net::UdpSocket::bind(("127.0.0.2", port));
+        if first.is_ok() && second.is_ok() {
+            return port;
+        }
+    }
+    panic!("no loopback port free on both 127.0.0.1 and 127.0.0.2");
+}
+
+fn test_cluster_config(
+    instance_id: &str,
+    listen: &str,
+    secret: Option<&[u8]>,
+    listen_port: u16,
+) -> cluster::Config {
+    let listen: SocketAddr = listen.parse().expect("cluster address");
+    cluster::Config {
+        instance_id: instance_id.to_string(),
+        listen,
+        peers: vec![cluster::Member {
+            id: instance_id.to_string(),
+            addr: listen,
+        }],
+        secret: secret.map(<[u8]>::to_vec),
+        listen_port,
+        tls_port: None,
+        dtls_port: None,
+        tcp_relay_ports: None,
+        tls_listen: Vec::new(),
+        dtls_listen: Vec::new(),
+    }
+}
+
+async fn start_cluster_pair(config: Config) -> ClusterPair {
+    start_cluster_pair_with(config, None).await
+}
+
+async fn start_cluster_pair_with(config: Config, secret: Option<&[u8]>) -> ClusterPair {
+    let serial = cluster_test_lock().lock_owned().await;
+    let port = shared_loopback_port();
+    let a = start_on(&format!("127.0.0.1:{port}"), config, long_term_auth()).await;
+    let b = start_on(&format!("127.0.0.2:{port}"), config, long_term_auth()).await;
+    let (cluster_a, listener_a) =
+        cluster::Cluster::bind(test_cluster_config("a", "127.0.0.1:0", secret, port))
+            .await
+            .expect("bind cluster a");
+    let (cluster_b, listener_b) =
+        cluster::Cluster::bind(test_cluster_config("b", "127.0.0.2:0", secret, port))
+            .await
+            .expect("bind cluster b");
+    let members = vec![
+        cluster::Member {
+            id: "a".to_string(),
+            addr: cluster_a.listen(),
+        },
+        cluster::Member {
+            id: "b".to_string(),
+            addr: cluster_b.listen(),
+        },
+    ];
+    cluster_a.set_peers(members.clone()).expect("members a");
+    cluster_b.set_peers(members).expect("members b");
+    a.turn.set_cluster(cluster_a.clone());
+    b.turn.set_cluster(cluster_b.clone());
+    cluster_a.start(Arc::downgrade(&a.turn), a.context.clone(), listener_a);
+    cluster_b.start(Arc::downgrade(&b.turn), b.context.clone(), listener_b);
+    cluster_a
+        .handshake()
+        .await
+        .expect("matching members pass the HELLO check");
+    cluster_b
+        .handshake()
+        .await
+        .expect("matching members pass the HELLO check");
+    ClusterPair {
+        a,
+        b,
+        cluster_a,
+        cluster_b,
+        _serial: serial,
+    }
+}
+
+async fn bind_channel(
+    client: &mut Client,
+    server: SocketAddr,
+    channel: u16,
+    peer: SocketAddr,
+) -> Vec<u8> {
+    let transaction_id = client.next_id();
+    let mut value = channel.to_be_bytes().to_vec();
+    value.extend_from_slice(&[0, 0]);
+    let mut attributes = vec![(ATTR_CHANNEL_NUMBER, value)];
+    attributes.push((
+        ATTR_XOR_PEER_ADDRESS,
+        protocol::xor_mapped_address_value(peer, &transaction_id),
+    ));
+    attributes.push((protocol::ATTR_USERNAME, client.user.as_bytes().to_vec()));
+    attributes.push((protocol::ATTR_REALM, REALM.as_bytes().to_vec()));
+    attributes.push((protocol::ATTR_NONCE, client.nonce.as_bytes().to_vec()));
+    let frame = client.sign(request(CHANNEL_BIND_METHOD, &transaction_id, &attributes));
+    send(&client.socket, &frame, server).await;
+    recv(&client.socket, 1000).await.expect("ChannelBind")
+}
+
+/// Design D2/D3: with a cluster attached, the 5-tuple key no longer contains
+/// the instance's own address — only the listen port. Without one, the raw
+/// address is kept so nothing about single-instance behaviour changes.
+#[tokio::test]
+async fn a_cluster_key_ignores_the_server_address() {
+    let client: SocketAddr = "198.51.100.9:40000".parse().unwrap();
+    let wildcard: SocketAddr = "0.0.0.0:3478".parse().unwrap();
+    let concrete: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+
+    let turn = Turn::new(Config::default(), "rstun/test");
+    let (cluster, _listener) =
+        cluster::Cluster::bind(test_cluster_config("t", "127.0.0.1:0", None, 3478))
+            .await
+            .expect("bind");
+    turn.set_cluster(cluster);
+    let from_wildcard = turn.key_for(client, ClientTransport::Udp, wildcard);
+    let from_concrete = turn.key_for(client, ClientTransport::Udp, concrete);
+    assert_eq!(from_wildcard, from_concrete);
+    assert_eq!(from_wildcard.server, cluster::normalized_server(3478));
+
+    let plain = Turn::new(Config::default(), "rstun/test");
+    assert_eq!(
+        plain.key_for(client, ClientTransport::Udp, concrete).server,
+        concrete,
+        "without a cluster the key keeps the address it was given"
+    );
+}
+
+/// R1: after `Allocate` on one instance, `Refresh` / `CreatePermission` /
+/// `ChannelBind` on the other all answer `200` for the same allocation.
+#[tokio::test]
+async fn cluster_control_requests_reach_the_owner_from_any_instance() {
+    let pair = start_cluster_pair(Config::default()).await;
+    let mut client = Client::connect(pair.a.server).await;
+    assert_eq!(error_code(&client.challenge().await), Some(401));
+
+    let allocated = client.allocate().await;
+    assert_eq!(error_code(&allocated), None);
+    let relay = relayed_address(&allocated);
+
+    // Same socket, other instance.
+    client.set_server(pair.b.server);
+    let refreshed = client.request(REFRESH_METHOD, vec![]).await;
+    assert_eq!(
+        error_code(&refreshed),
+        None,
+        "Refresh through the non-owner must be 200, not 437"
+    );
+    assert_eq!(lifetime_of(&refreshed), 600);
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let permitted = client.create_permission(&[peer_addr]).await;
+    assert_eq!(
+        error_code(&permitted),
+        None,
+        "CreatePermission through the non-owner must be 200"
+    );
+
+    let bound = bind_channel(&mut client, pair.b.server, CHANNEL_MIN + 2, peer_addr).await;
+    assert_eq!(
+        error_code(&bound),
+        None,
+        "ChannelBind through the non-owner must be 200"
+    );
+
+    // Exactly one allocation in the whole cluster, and it is the owner's relay.
+    assert_eq!(pair.a.turn.active() + pair.b.turn.active(), 1);
+    let (owner, entry) = pair.owner_and_entry(relay.ip());
+    assert_eq!(owner.turn.active(), 1);
+    assert_eq!(entry.turn.active(), 0);
+}
+
+/// R1: a retransmitted `Allocate` (same transaction id) must find the existing
+/// allocation and return the same relay address even when it lands on another
+/// instance; a new transaction id must be `437`, never a second allocation.
+#[tokio::test]
+async fn cluster_retransmitted_allocate_converges_to_one_allocation() {
+    let pair = start_cluster_pair(Config::default()).await;
+    let mut client = Client::connect(pair.a.server).await;
+    client.challenge().await;
+
+    let transaction_id = client.next_id();
+    let first = client.allocate_with_tid(&transaction_id, 300).await;
+    assert_eq!(error_code(&first), None);
+    let relay = relayed_address(&first);
+
+    client.set_server(pair.b.server);
+    let retransmit = client.allocate_with_tid(&transaction_id, 300).await;
+    assert_eq!(error_code(&retransmit), None);
+    assert_eq!(
+        relayed_address(&retransmit),
+        relay,
+        "the retransmission must return the allocation's relay address"
+    );
+
+    let new_id = client.next_id();
+    let second = client.allocate_with_tid(&new_id, 300).await;
+    assert_eq!(
+        error_code(&second),
+        Some(437),
+        "a new transaction id must not create a second allocation"
+    );
+    assert_eq!(pair.a.turn.active() + pair.b.turn.active(), 1);
+}
+
+/// R2: `Send` and `ChannelData` received by the entry are relayed by the owner
+/// (permission checks and the relay socket stay there), and the peer's reply
+/// comes back from the owner.
+#[tokio::test]
+async fn cluster_send_and_channel_data_are_relayed_from_a_non_owner() {
+    let pair = start_cluster_pair(Config::default()).await;
+    let mut client = Client::connect(pair.a.server).await;
+    client.challenge().await;
+    let allocated = client.allocate().await;
+    assert_eq!(error_code(&allocated), None);
+    let relay = relayed_address(&allocated);
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    client.set_server(pair.b.server);
+    assert_eq!(
+        error_code(&client.create_permission(&[peer_addr]).await),
+        None
+    );
+
+    // Send indication through the non-owner.
+    let transaction_id = client.next_id();
+    let indication = send_indication(&transaction_id, peer_addr, b"via-entry-send");
+    send(&client.socket, &indication, pair.b.server).await;
+    assert_eq!(
+        recv(&peer, 1500).await.as_deref(),
+        Some(&b"via-entry-send"[..]),
+        "a Send forwarded by the entry must reach the peer"
+    );
+
+    // ChannelBind (through the non-owner), then ChannelData through it.
+    let channel = CHANNEL_MIN + 3;
+    assert_eq!(
+        error_code(&bind_channel(&mut client, pair.b.server, channel, peer_addr).await),
+        None
+    );
+    send(
+        &client.socket,
+        &channel_data(channel, b"via-entry-channel"),
+        pair.b.server,
+    )
+    .await;
+    assert_eq!(
+        recv(&peer, 1500).await.as_deref(),
+        Some(&b"via-entry-channel"[..]),
+        "ChannelData forwarded by the entry must reach the peer"
+    );
+
+    // Peer → client still uses the owner's relay socket and its client sink.
+    send(&peer, b"back", relay).await;
+    let frame = recv(&client.socket, 1500)
+        .await
+        .expect("payload from the owner");
+    assert_eq!(u16::from_be_bytes([frame[0], frame[1]]), channel);
+    assert_eq!(&frame[4..], b"back");
+
+    // The bytes are counted by the owner only (the entry never relays them).
+    let (owner, entry) = pair.owner_and_entry(relay.ip());
+    let owner_counts = owner.turn.snapshot();
+    assert!(owner_counts.bytes_in >= (b"via-entry-send".len() + b"via-entry-channel".len()) as u64);
+    assert!(owner_counts.bytes_out >= b"back".len() as u64);
+    assert_eq!(entry.turn.snapshot().bytes_in, 0);
+}
+
+/// R6 / design D7: an unreachable owner is an explicit `500`, not `437` (which
+/// would make the client rebuild its allocation) and not silence.
+#[tokio::test]
+async fn cluster_unreachable_owner_answers_500() {
+    let pair = start_cluster_pair(Config::default()).await;
+    let mut client = Client::connect(pair.a.server).await;
+    client.challenge().await;
+
+    let client_address = client.socket.local_addr().unwrap();
+    let owner_id = pair.owner_id(client_address);
+    let (entry_server, owner_server) = if owner_id == "a" {
+        (pair.b.server, pair.a.server)
+    } else {
+        (pair.a.server, pair.b.server)
+    };
+
+    client.set_server(owner_server);
+    assert_eq!(error_code(&client.allocate().await), None);
+
+    // Stop the owner's cluster tasks (its control listener, links and push
+    // reader). Its UDP listener keeps running, so this is exactly "the entry
+    // cannot reach the owner", not "the process died".
+    if owner_id == "a" {
+        pair.cluster_a.shutdown();
+    } else {
+        pair.cluster_b.shutdown();
+    }
+    client.set_server(entry_server);
+    let response = client.request(REFRESH_METHOD, vec![]).await;
+    assert_eq!(
+        error_code(&response),
+        Some(500),
+        "an unreachable owner must be an explicit 500 Server Error"
+    );
+
+    // A timeout must not release (or recreate) the allocation.
+    let owner = if owner_id == "a" { &pair.a } else { &pair.b };
+    assert_eq!(owner.turn.active(), 1);
+    assert_eq!(pair.a.turn.active() + pair.b.turn.active(), 1);
+}
+
+/// M0: non-TURN frames are never forwarded. A Binding request is answered by
+/// the instance that received it, even with a cluster configured.
+#[tokio::test]
+async fn cluster_does_not_forward_non_turn_frames() {
+    let pair = start_cluster_pair(Config::default()).await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let frame = request(0x0001, &transaction_id(77), &[]);
+    send(&socket, &frame, pair.a.server).await;
+    let mut buffer = vec![0_u8; 1024];
+    let (length, source) =
+        tokio::time::timeout(Duration::from_millis(1000), socket.recv_from(&mut buffer))
+            .await
+            .expect("Binding answer")
+            .expect("recv");
+    assert_eq!(
+        source, pair.a.server,
+        "the receiving instance answers itself"
+    );
+    // Any STUN answer proves the frame stayed local: a forwarded frame would
+    // come back as "no response" (Binding is not a TURN method for the owner).
+    // The long-term auth in this harness makes it a 401 here.
+    let message = protocol::parse(&buffer[..length]).expect("Binding response");
+    assert!(matches!(
+        protocol::message_class(message.msg_type),
+        MessageClass::SuccessResponse | MessageClass::ErrorResponse
+    ));
+    assert_eq!(pair.a.turn.active() + pair.b.turn.active(), 0);
+}
+
+/// `--cluster-secret`: the same flows work with every internal frame signed.
+#[tokio::test]
+async fn cluster_with_a_secret_relays_across_instances() {
+    let pair = start_cluster_pair_with(Config::default(), Some(b"cluster-test-secret")).await;
+    let mut client = Client::connect(pair.a.server).await;
+    client.challenge().await;
+    let allocated = client.allocate().await;
+    assert_eq!(error_code(&allocated), None);
+    let relay = relayed_address(&allocated);
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    client.set_server(pair.b.server);
+    assert_eq!(
+        error_code(&client.create_permission(&[peer_addr]).await),
+        None
+    );
+
+    let transaction_id = client.next_id();
+    let indication = send_indication(&transaction_id, peer_addr, b"signed-cluster");
+    send(&client.socket, &indication, pair.b.server).await;
+    assert_eq!(
+        recv(&peer, 1500).await.as_deref(),
+        Some(&b"signed-cluster"[..])
+    );
+
+    client.request(REFRESH_METHOD, vec![]).await;
+    assert_eq!(pair.a.turn.active() + pair.b.turn.active(), 1);
+    assert_eq!(relay.ip(), pair.owner_and_entry(relay.ip()).0.server.ip());
+}
+
+// ---------------------------------------------------------------------------
+// Multi-instance M2: stream control plane + PUSH_CLIENT return path
+// ---------------------------------------------------------------------------
+
+struct TcpClusterPair {
+    a: TcpHarness,
+    b: TcpHarness,
+    cluster_a: Arc<cluster::Cluster>,
+    _cluster_b: Arc<cluster::Cluster>,
+    _serial: tokio::sync::OwnedMutexGuard<()>,
+}
+
+fn shared_loopback_tcp_port() -> u16 {
+    for _ in 0..64 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let free = ["127.0.0.1", "127.0.0.2"].iter().all(|host| {
+            let tcp = std::net::TcpListener::bind((*host, port));
+            let udp = std::net::UdpSocket::bind((*host, port));
+            tcp.is_ok() && udp.is_ok()
+        });
+        if free {
+            return port;
+        }
+    }
+    panic!("no loopback port free (TCP+UDP) on both 127.0.0.1 and 127.0.0.2");
+}
+
+async fn start_tcp_cluster_pair(config: Config) -> TcpClusterPair {
+    start_tcp_cluster_pair_each(config, config).await
+}
+
+fn tcp_cluster_config(id: &str, listen: &str, port: u16, turn_config: &Config) -> cluster::Config {
+    cluster::Config {
+        tcp_relay_ports: turn_config.tcp_relay.then_some(turn_config.tcp_relay_ports),
+        ..test_cluster_config(id, listen, None, port)
+    }
+}
+
+async fn start_tcp_cluster_pair_each(config_a: Config, config_b: Config) -> TcpClusterPair {
+    let serial = cluster_test_lock().lock_owned().await;
+    let port = shared_loopback_tcp_port();
+    let a = start_tcp_on(&format!("127.0.0.1:{port}"), config_a, long_term_auth()).await;
+    let b = start_tcp_on(&format!("127.0.0.2:{port}"), config_b, long_term_auth()).await;
+    let (cluster_a, listener_a) =
+        cluster::Cluster::bind(tcp_cluster_config("a", "127.0.0.1:0", port, &config_a))
+            .await
+            .expect("bind cluster a");
+    let (cluster_b, listener_b) =
+        cluster::Cluster::bind(tcp_cluster_config("b", "127.0.0.2:0", port, &config_b))
+            .await
+            .expect("bind cluster b");
+    let members = vec![
+        cluster::Member {
+            id: "a".to_string(),
+            addr: cluster_a.listen(),
+        },
+        cluster::Member {
+            id: "b".to_string(),
+            addr: cluster_b.listen(),
+        },
+    ];
+    cluster_a.set_peers(members.clone()).expect("members a");
+    cluster_b.set_peers(members).expect("members b");
+    a.turn.set_cluster(cluster_a.clone());
+    b.turn.set_cluster(cluster_b.clone());
+    cluster_a.start(Arc::downgrade(&a.turn), a.context.clone(), listener_a);
+    cluster_b.start(Arc::downgrade(&b.turn), b.context.clone(), listener_b);
+    cluster_a.handshake().await.expect("cluster a HELLO");
+    cluster_b.handshake().await.expect("cluster b HELLO");
+    TcpClusterPair {
+        a,
+        b,
+        cluster_a,
+        _cluster_b: cluster_b,
+        _serial: serial,
+    }
+}
+
+/// Open a TCP connection to `server` from a local port whose normalized key is
+/// owned by `owner_id`, so the test exercises forwarding deterministically.
+async fn tcp_client_for_owner(
+    server: SocketAddr,
+    owner_id: &str,
+    cluster: &Arc<cluster::Cluster>,
+) -> TcpClient {
+    for _ in 0..64 {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let stream = socket.connect(server).await.expect("connect");
+        let local = stream.local_addr().expect("local");
+        let key = cluster::NodeKey::new(local, cluster::TransportClass::Tcp, server);
+        if cluster
+            .owner_for(&key)
+            .is_some_and(|member| member.id == owner_id)
+        {
+            return TcpClient::from_stream(stream);
+        }
+    }
+    panic!("no ephemeral port mapped to owner {owner_id}");
+}
+
+/// R1/R3 for streams: a TCP control connection on the entry creates the
+/// allocation on the **owner**; `Refresh`/`CreatePermission` are forwarded, and
+/// peer→client bytes come back through the entry's writer queue.
+#[tokio::test]
+async fn cluster_stream_control_forwards_and_pushes_bytes_back() {
+    let pair = start_tcp_cluster_pair(Config::default()).await;
+    let mut client = tcp_client_for_owner(pair.a.server, "b", &pair.cluster_a).await;
+
+    let allocation = client.allocate_with(TRANSPORT_UDP).await;
+    assert_eq!(error_code(&allocation), None, "Allocate through the entry");
+    let relay = relayed_address(&allocation);
+    assert_eq!(pair.b.turn.active(), 1, "the owner holds the allocation");
+    assert_eq!(pair.a.turn.active(), 0, "the entry holds nothing");
+
+    // Forwarded control: Refresh and CreatePermission go to B and answer 200.
+    let refreshed = client.request(REFRESH_METHOD, vec![]).await;
+    assert_eq!(error_code(&refreshed), None, "Refresh via the entry");
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let permitted = client.create_permission_for(peer_addr).await;
+    assert_eq!(
+        error_code(&permitted),
+        None,
+        "CreatePermission via the entry"
+    );
+
+    // Peer → relay (on B) → PUSH_CLIENT → A's writer queue → client.
+    send(&peer, b"stream-back", relay).await;
+    let indication = client.read_stun().await;
+    let attributes = attributes_of(&indication);
+    let data = attributes
+        .iter()
+        .find(|(attr_type, _)| *attr_type == ATTR_DATA)
+        .expect("DATA")
+        .1
+        .clone();
+    assert_eq!(data, b"stream-back");
+    assert!(
+        pair.b.turn.snapshot().bytes_out >= b"stream-back".len() as u64,
+        "the owner counted the outbound bytes"
+    );
+}
+
+/// R4: when the entry's connection ends, the owner releases the allocation and
+/// its relay socket immediately (no TTL wait).
+#[tokio::test]
+async fn cluster_stream_close_releases_the_owner_allocation() {
+    let pair = start_tcp_cluster_pair(Config::default()).await;
+    let mut client = tcp_client_for_owner(pair.a.server, "b", &pair.cluster_a).await;
+    let allocation = client.allocate_with(TRANSPORT_UDP).await;
+    assert_eq!(error_code(&allocation), None);
+    let relay = relayed_address(&allocation);
+    assert_eq!(pair.b.turn.active(), 1);
+
+    drop(client);
+    let mut released = false;
+    for _ in 0..100 {
+        if pair.a.turn.active() + pair.b.turn.active() == 0 {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(released, "CLIENT_CLOSED must release the owner allocation");
+    // The owner's relay socket is back in the pool: it can be bound again.
+    assert!(
+        crate::udp_socket(relay).is_ok(),
+        "relay socket {relay} must be free after the client disconnects"
+    );
+}
+
+/// Step 0: a member serving a different `--listen` port is refused at startup
+/// (the ownership key contains the port, so the cluster would split clients).
+#[tokio::test]
+async fn cluster_hello_rejects_a_different_listen_port() {
+    let _serial = cluster_test_lock().lock_owned().await;
+    let (cluster_a, listener_a) =
+        cluster::Cluster::bind(test_cluster_config("a", "127.0.0.1:0", None, 3478))
+            .await
+            .expect("bind a");
+    let (cluster_b, listener_b) =
+        cluster::Cluster::bind(test_cluster_config("b", "127.0.0.2:0", None, 3479))
+            .await
+            .expect("bind b");
+    let members = vec![
+        cluster::Member {
+            id: "a".to_string(),
+            addr: cluster_a.listen(),
+        },
+        cluster::Member {
+            id: "b".to_string(),
+            addr: cluster_b.listen(),
+        },
+    ];
+    cluster_a.set_peers(members.clone()).unwrap();
+    cluster_b.set_peers(members).unwrap();
+    let turn_a = Arc::new(Turn::new(Config::default(), "rstun/test"));
+    let turn_b = Arc::new(Turn::new(Config::default(), "rstun/test"));
+    let context_a = Arc::new(ServerContext::default());
+    let context_b = Arc::new(ServerContext::default());
+    cluster_a.start(Arc::downgrade(&turn_a), context_a.clone(), listener_a);
+    cluster_b.start(Arc::downgrade(&turn_b), context_b.clone(), listener_b);
+    let error = cluster_a
+        .handshake()
+        .await
+        .expect_err("a port mismatch must refuse the cluster");
+    assert!(error.contains("same --listen port"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-instance M3: RFC 6062 over the cluster (outbound + passive)
+// ---------------------------------------------------------------------------
+
+/// Outbound: `Allocate(TCP)`/`Connect` run on the owner while the control
+/// connection lives on the entry; `ConnectionBind` arrives on yet another
+/// connection, is routed by its `CONNECTION-ID` to the owner, and both sides
+/// then exchange raw bytes through `RAW_RELAY`.
+#[tokio::test]
+async fn cluster_raw_relay_binds_and_carries_bytes_both_ways() {
+    let pair = start_tcp_cluster_pair_each(tcp_relay_config(), tcp_relay_config()).await;
+    let mut control = tcp_client_for_owner(pair.a.server, "b", &pair.cluster_a).await;
+    let (listener, peer_addr) = peer_listener().await;
+    let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+    let (relay, id) = allocate_and_connect(&mut control, peer_addr).await;
+    assert_eq!(relay.ip(), pair.b.server.ip(), "the relay is the owner's");
+    let (mut peer, _seen) = accept.await.expect("peer accepted");
+
+    let mut data = TcpClient::connect(pair.a.server).await;
+    let bound = data.connection_bind(id).await;
+    assert_eq!(
+        error_code(&bound),
+        None,
+        "ConnectionBind routed to the owner"
+    );
+
+    data.write(b"client-to-peer").await;
+    let mut towards_peer = vec![0_u8; b"client-to-peer".len()];
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut towards_peer),
+    )
+    .await
+    .expect("peer bytes arrive")
+    .expect("read");
+    assert_eq!(&towards_peer, b"client-to-peer");
+
+    tokio::io::AsyncWriteExt::write_all(&mut peer, b"peer-to-client")
+        .await
+        .unwrap();
+    let mut towards_client = vec![0_u8; b"peer-to-client".len()];
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut data.stream, &mut towards_client),
+    )
+    .await
+    .expect("client bytes arrive")
+    .expect("read");
+    assert_eq!(&towards_client, b"peer-to-client");
+
+    // A clean peer EOF half-closes the client (not a full close).
+    tokio::io::AsyncWriteExt::shutdown(&mut peer).await.unwrap();
+    let mut tail = [0_u8; 1];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut data.stream, &mut tail),
+    )
+    .await
+    .expect("client read ends")
+    .expect("read");
+    assert_eq!(read, 0, "peer EOF is forwarded as a half-close");
+}
+
+/// Passive: the peer dials the owner's relay listener; the
+/// `ConnectionAttempt` is pushed back to the entry's control connection, and a
+/// `ConnectionBind` on another connection joins the raw relay.
+#[tokio::test]
+async fn cluster_passive_attempt_is_pushed_to_the_entry() {
+    let pair = start_tcp_cluster_pair_each(tcp_relay_config(), tcp_relay_config()).await;
+    let mut control = tcp_client_for_owner(pair.a.server, "b", &pair.cluster_a).await;
+    let allocation = control.allocate_tcp().await;
+    assert_eq!(error_code(&allocation), None, "TCP Allocate");
+    let relay = relayed_address(&allocation);
+    assert_eq!(pair.b.turn.active(), 1, "the owner holds the allocation");
+    assert_eq!(
+        error_code(
+            &control
+                .create_permission_for("127.0.0.1:9".parse().unwrap())
+                .await
+        ),
+        None
+    );
+
+    let mut peer = tokio::net::TcpStream::connect(relay)
+        .await
+        .expect("relay accepts");
+    let attempt = control
+        .read_stun_within(2000)
+        .await
+        .expect("ConnectionAttempt reaches the entry");
+    let (id, announced, _software) = connection_attempt(&attempt);
+    assert_eq!(
+        announced,
+        peer.local_addr().unwrap(),
+        "XOR-PEER-ADDRESS is the dialling peer"
+    );
+
+    let mut data = TcpClient::connect(pair.a.server).await;
+    assert_eq!(
+        error_code(&data.connection_bind(id).await),
+        None,
+        "ConnectionBind routed to the owner by CONNECTION-ID"
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut peer, b"inbound-bytes")
+        .await
+        .unwrap();
+    let mut towards_client = vec![0_u8; b"inbound-bytes".len()];
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut data.stream, &mut towards_client),
+    )
+    .await
+    .expect("client bytes arrive")
+    .expect("read");
+    assert_eq!(&towards_client, b"inbound-bytes");
+}
+
+// ---------------------------------------------------------------------------
+// B2: concurrent Allocate for one 5-tuple must not create two allocations
+// ---------------------------------------------------------------------------
+
+/// Two control connections can deliver `Allocate` for the same 5-tuple at the
+/// same time (the cluster forwards them on separate tasks). Exactly one may win;
+/// the other gets `437` and its relay port must go back to the pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_allocate_for_one_five_tuple_yields_one_allocation() {
+    use std::sync::Barrier;
+
+    static NEXT_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let window = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
+    let lo = 30_000 + (window % 200) as u16 * 100;
+    let config = Config {
+        relay_ports: (lo, lo + 99),
+        tcp_relay_ports: (lo, lo + 99),
+        ..Config::default()
+    };
+    let turn = Arc::new(Turn::new(config, "rstun/test"));
+    let socket = Arc::new(udp_socket("127.0.0.1:0".parse().unwrap()).unwrap());
+    let local = socket.local_addr().unwrap();
+    let context = Arc::new(ServerContext {
+        udp: vec![(local, socket)],
+        ..ServerContext::default()
+    });
+    let identity = Identity {
+        username: USER.to_string(),
+        keys: vec![(
+            KeyAlgorithm::Md5,
+            auth::long_term_key(KeyAlgorithm::Md5, USER, REALM, PASS),
+        )],
+    };
+    let handle = tokio::runtime::Handle::current();
+
+    for round in 0..120_u16 {
+        let client: SocketAddr = format!("127.0.0.1:{}", 20_000 + round).parse().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for sequence in 0..2_u8 {
+                let turn = turn.clone();
+                let barrier = barrier.clone();
+                let identity = identity.clone();
+                let handle = handle.clone();
+                let context = context.clone();
+                handles.push(scope.spawn(move || {
+                    let transaction_id = transaction_id(100 + sequence);
+                    let frame = request(
+                        ALLOCATE_METHOD,
+                        &transaction_id,
+                        &[
+                            (ATTR_REQUESTED_TRANSPORT, vec![TRANSPORT_UDP, 0, 0, 0]),
+                            (ATTR_LIFETIME, 300_u32.to_be_bytes().to_vec()),
+                        ],
+                    );
+                    let message = protocol::parse(&frame).expect("parse");
+                    // `allocate` spawns the relay reader; run inside the runtime.
+                    let _entered = handle.enter();
+                    barrier.wait();
+                    turn.allocate(
+                        &message,
+                        client,
+                        local,
+                        ClientTransport::Udp,
+                        &context,
+                        None,
+                        None,
+                        &identity,
+                    )
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("allocate thread"))
+                .collect::<Vec<_>>()
+        });
+
+        let mut success = None;
+        let mut mismatches = 0;
+        for decision in results {
+            match decision {
+                Decision::Respond(response) => match error_code(&response) {
+                    None => success = Some(response),
+                    Some(437) => mismatches += 1,
+                    Some(other) => panic!("unexpected error {other} in round {round}"),
+                },
+                other => panic!("unexpected decision {other:?}"),
+            }
+        }
+        let success = success.unwrap_or_else(|| panic!("round {round}: no successful Allocate"));
+        assert_eq!(
+            mismatches, 1,
+            "round {round}: the loser must answer exactly one 437"
+        );
+
+        let key = turn.key_for(client, ClientTransport::Udp, local);
+        let stored = turn
+            .get(&key, std::time::Instant::now())
+            .expect("one live allocation");
+        assert_eq!(
+            relayed_address(&success),
+            stored.relay_addr(),
+            "round {round}: the 200 must name the surviving allocation's relay"
+        );
+        assert_eq!(turn.active(), 1, "round {round}: exactly one allocation");
+        turn.remove(&key).expect("remove the round's allocation");
+    }
+    println!("B2 concurrency: 120 rounds, one 200 + one 437 each, double-200 = 0");
+}
+
+/// B3: a `--cluster-peer` list that differs by one member must fail the
+/// handshake: the missing key would silently move to another owner.
+#[tokio::test]
+async fn cluster_hello_rejects_a_member_list_mismatch() {
+    let _serial = cluster_test_lock().lock_owned().await;
+    let (cluster_a, listener_a) =
+        cluster::Cluster::bind(test_cluster_config("a", "127.0.0.1:0", None, 3478))
+            .await
+            .expect("bind a");
+    let (cluster_b, listener_b) = cluster::Cluster::bind(cluster::Config {
+        instance_id: "b".to_string(),
+        listen: "127.0.0.2:0".parse().unwrap(),
+        peers: vec![cluster::Member {
+            id: "b".to_string(),
+            addr: "127.0.0.2:0".parse().unwrap(),
+        }],
+        secret: None,
+        listen_port: 3478,
+        tls_port: None,
+        dtls_port: None,
+        tcp_relay_ports: None,
+        tls_listen: Vec::new(),
+        dtls_listen: Vec::new(),
+    })
+    .await
+    .expect("bind b");
+    cluster_a
+        .set_peers(vec![
+            cluster::Member {
+                id: "a".to_string(),
+                addr: cluster_a.listen(),
+            },
+            cluster::Member {
+                id: "b".to_string(),
+                addr: cluster_b.listen(),
+            },
+        ])
+        .unwrap();
+    cluster_b
+        .set_peers(vec![cluster::Member {
+            id: "b".to_string(),
+            addr: cluster_b.listen(),
+        }])
+        .unwrap();
+    let turn_a = Arc::new(Turn::new(Config::default(), "rstun/test"));
+    let turn_b = Arc::new(Turn::new(Config::default(), "rstun/test"));
+    let context_a = Arc::new(ServerContext::default());
+    let context_b = Arc::new(ServerContext::default());
+    cluster_a.start(Arc::downgrade(&turn_a), context_a, listener_a);
+    cluster_b.start(Arc::downgrade(&turn_b), context_b, listener_b);
+    let error = cluster_a
+        .handshake()
+        .await
+        .expect_err("a member-list mismatch must refuse the cluster");
+    assert!(error.contains("--cluster-peer"), "{error}");
 }

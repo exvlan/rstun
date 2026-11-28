@@ -44,6 +44,7 @@ import hashlib
 import hmac
 import os
 import socket
+import ssl
 import struct
 import sys
 import time
@@ -530,10 +531,20 @@ class TcpRelayProbe(Probe):
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__(args)
+        self.tls = bool(getattr(args, "tls", False))
+        self.host = args.host
         self.socket.close()
         self.socket = socket.socket(self.af, socket.SOCK_STREAM)
         self.socket.settimeout(args.timeout)
         self.socket.connect(self.server)
+        if self.tls:
+            self.socket = self._wrap_tls(self.socket)
+
+    def _wrap_tls(self, sock: socket.socket) -> "ssl.SSLSocket":
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context.wrap_socket(sock, server_hostname=self.host)
 
     def exchange(self, frame: bytes) -> bytes:
         self.socket.sendall(frame)
@@ -544,6 +555,8 @@ class TcpRelayProbe(Probe):
         self.socket = socket.socket(self.af, socket.SOCK_STREAM)
         self.socket.settimeout(self.timeout)
         self.socket.connect(self.server)
+        if self.tls:
+            self.socket = self._wrap_tls(self.socket)
         self.nonce = ""
 
     def challenge(self) -> None:
@@ -605,6 +618,168 @@ def _connection_id(attributes: list[tuple[int, bytes]]) -> int | None:
         if attr_type == ATTR_CONNECTION_ID and len(value) == 4:
             return struct.unpack("!I", value)[0]
     return None
+
+
+def _tcp_exchange(probe: TcpRelayProbe, frame: bytes) -> bytes:
+    probe.socket.sendall(frame)
+    return _read_frame(probe.socket)
+
+
+def _tcp_request(
+    probe: TcpRelayProbe,
+    method: int,
+    attributes: list[bytes],
+    *,
+    authenticate: bool = True,
+) -> tuple[int, list[tuple[int, bytes]], bytes]:
+    transaction = probe._transaction()
+    probe._last_transaction = transaction
+    frame = probe.build_request(
+        method, transaction, attributes, authenticate=authenticate
+    )
+    reply = _tcp_exchange(probe, frame)
+    probe._last_reply = reply
+    return probe._parse(reply, transaction)
+
+
+def _tcp_client_payload(probe: TcpRelayProbe) -> tuple[bytes | None, str | None]:
+    """Read one server→client frame over TCP: ChannelData or a Data indication."""
+    prefix = _recv_exact(probe.socket, 4)
+    first = prefix[0]
+    if first & 0xC0 == 0x40:  # ChannelData (§12.5: 4-byte aligned)
+        length = struct.unpack("!H", prefix[2:4])[0]
+        padded = length + (4 - length % 4) % 4
+        return _recv_exact(probe.socket, padded)[:length], "ChannelData"
+    rest = _recv_exact(probe.socket, HEADER_LEN - 4)
+    header = prefix + rest
+    msg_type, length = struct.unpack("!HH", header[:4])
+    body = _recv_exact(probe.socket, length)
+    transaction = header[8:20]
+    data = None
+    offset = 0
+    while offset < len(body):
+        attr_type, attr_length = struct.unpack("!HH", body[offset : offset + 4])
+        value = body[offset + 4 : offset + 4 + attr_length]
+        if attr_type == ATTR_DATA:
+            data = value
+        offset += 4 + attr_length + ((4 - attr_length % 4) % 4)
+    if msg_type & 0x0110 != 0x0010:
+        return None, None
+    _ = transaction
+    return data, "DataIndication"
+
+
+def canonical_tcp_control(probe: TcpRelayProbe, hold: float) -> None:
+    """A standard UDP-relay TURN allocation carried over a **TCP** control
+    connection (this is what `turnutils_uclient -t` does).
+
+    In the multi-instance lab the connection reaches the entry through a TCP
+    load balancer, so every request after `Allocate` can be forwarded to a
+    different instance; peer→client bytes must come back through the entry's
+    writer queue (`PUSH_CLIENT`).
+    """
+    probe.challenge()
+    allocation = _tcp_request(
+        probe,
+        METHOD_ALLOCATE,
+        [
+            probe._attribute(ATTR_REQUESTED_TRANSPORT, bytes([TRANSPORT_UDP, 0, 0, 0])),
+            probe._attribute(ATTR_LIFETIME, struct.pack("!I", 60)),
+        ],
+    )
+    relayed = probe.check_allocate(
+        probe._last_reply, probe._last_transaction, "tcp-control-allocate"
+    )
+    if relayed is None:
+        return
+
+    # A Refresh on the same TCP connection: the entry may forward it.
+    _, attributes, _ = _tcp_request(probe, METHOD_REFRESH, [])
+    code = probe._error_code(attributes)
+    probe.check("tcp-control-refresh", code is None, f"code={code}")
+
+    peer = socket.socket(probe.af, socket.SOCK_DGRAM)
+    peer.bind(probe.bind)
+    peer.settimeout(1.0)
+    peer_address = peer.getsockname()
+    transaction = probe._transaction()
+    _, attributes, _ = _tcp_request(
+        probe,
+        METHOD_CREATE_PERMISSION,
+        [probe._attribute(ATTR_XOR_PEER_ADDRESS, probe._xor_address(peer_address, transaction))],
+    )
+    probe.check(
+        "tcp-control-create-permission",
+        probe._error_code(attributes) is None,
+        f"code={probe._error_code(attributes)}",
+    )
+    transaction = probe._transaction()
+    _, attributes, _ = _tcp_request(
+        probe,
+        METHOD_CHANNEL_BIND,
+        [
+            probe._attribute(ATTR_CHANNEL_NUMBER, struct.pack("!H", CHANNEL) + b"\0\0"),
+            probe._attribute(ATTR_XOR_PEER_ADDRESS, probe._xor_address(peer_address, transaction)),
+        ],
+    )
+    probe.check(
+        "tcp-control-channel-bind",
+        probe._error_code(attributes) is None,
+        f"code={probe._error_code(attributes)}",
+    )
+
+    # Send indication over TCP → UDP peer.
+    transaction = probe._transaction()
+    indication = probe._encode(
+        METHOD_SEND,
+        CLASS_INDICATION,
+        transaction,
+        [
+            probe._attribute(ATTR_XOR_PEER_ADDRESS, probe._xor_address(peer_address, transaction)),
+            probe._attribute(ATTR_DATA, b"tcp-send"),
+        ],
+    )
+    probe.socket.sendall(indication)
+    try:
+        received = peer.recvfrom(65535)[0]
+    except socket.timeout:
+        received = None
+    probe.check(
+        "tcp-control-send-bytes",
+        received == b"tcp-send",
+        f"bytes={len(received) if received else 0}",
+    )
+
+    # Peer → relay → client, delivered over the TCP control connection.
+    peer.sendto(b"tcp-back", relayed)
+    data, kind = _tcp_client_payload(probe)
+    probe.check(
+        "tcp-control-peer-to-client",
+        data == b"tcp-back",
+        f"kind={kind} bytes={len(data) if data else 0}",
+    )
+
+    # ChannelData over TCP (4-byte header + payload + padding).
+    payload = b"tcp-channel"
+    frame = struct.pack("!HH", CHANNEL, len(payload)) + payload
+    frame += b"\0" * ((4 - len(payload) % 4) % 4)
+    probe.socket.sendall(frame)
+    try:
+        received = peer.recvfrom(65535)[0]
+    except socket.timeout:
+        received = None
+    probe.check(
+        "tcp-control-channel-bytes",
+        received == b"tcp-channel",
+        f"bytes={len(received) if received else 0}",
+    )
+    peer.close()
+
+    if probe.show_relay:
+        print(f"info: relay={relayed[0]}:{relayed[1]}")
+    if hold > 0:
+        print("info: holding", flush=True)
+        time.sleep(hold)
 
 
 def canonical_tcp_relay(probe: TcpRelayProbe) -> None:
@@ -683,6 +858,8 @@ def canonical_tcp_relay(probe: TcpRelayProbe) -> None:
     if connection_id is None:
         peer.close()
         return
+    if probe.show_relay:
+        print(f"info: connection-id={connection_id}")
     connection, seen = peer.accept()
     connection.settimeout(probe.timeout)
     # §5.2: the peer data connection must originate from the relayed address.
@@ -895,6 +1072,8 @@ def canonical_tcp_relay_passive(probe: TcpRelayProbe) -> None:
     if connection_id is None:
         peer.close()
         return
+    if probe.show_relay:
+        print(f"info: connection-id={connection_id}")
 
     # `ConnectionBind` on a fresh connection, then raw bytes (RFC 6062 §3).
     data = socket.socket(probe.af, socket.SOCK_STREAM)
@@ -1068,6 +1247,99 @@ def canonical_relay(probe: Probe) -> None:
         f"received={received!r}",
     )
     peer.close()
+
+
+def canonical_multi_instance(probe: Probe, server_b: tuple[str, int]) -> None:
+    """Cross-instance ownership: the same 5-tuple driven through two instances.
+
+    Every step after the first `Allocate` is sent to the *other* instance, so a
+    regression to "each instance owns its own copy" shows up as 437 / a second
+    relay address / a silent data-plane drop.
+    """
+    server_a = probe.server
+
+    # 1. Allocate on instance A.
+    probe.challenge()
+    transaction = probe._transaction()
+    allocate = probe.allocate_frame(transaction)
+    relayed = probe.check_allocate(
+        probe.exchange(allocate), transaction, "multi-allocate-on-a"
+    )
+    if relayed is None:
+        return
+
+    # 2. The byte-identical retransmission through instance B is idempotent and
+    #    returns the same relay address (not a second allocation).
+    probe.server = server_b
+    retransmitted = probe.check_allocate(
+        probe.exchange(allocate), transaction, "multi-retransmit-on-b"
+    )
+    probe.check(
+        "multi-retransmit-same-relay",
+        retransmitted == relayed,
+        f"a={relayed} b={retransmitted}",
+    )
+
+    # 3. A new transaction id on the same 5-tuple is 437, never a new relay.
+    transaction = probe._transaction()
+    reply = probe.exchange(probe.allocate_frame(transaction))
+    _, attributes, _ = probe._parse(reply, transaction)
+    code = probe._error_code(attributes)
+    probe.check("multi-new-transaction-is-437", code == 437, f"code={code}")
+
+    # 4. Refresh through B: 200 with the server default lifetime.
+    probe.refresh_without_lifetime()
+
+    # 5. CreatePermission + ChannelBind through B.
+    peer = socket.socket(probe.af, socket.SOCK_DGRAM)
+    peer.bind(probe.bind)
+    peer.settimeout(1.0)
+    peer_address = peer.getsockname()
+    probe.create_permission(peer_address)
+    probe.channel_bind(peer_address)
+
+    # 6. Send / ChannelData through B reach the peer.
+    probe.send_to_peer(peer_address, b"multi-send")
+    try:
+        received = peer.recvfrom(65535)[0]
+    except socket.timeout:
+        received = None
+    probe.check(
+        "multi-send-via-entry",
+        received == b"multi-send",
+        f"bytes={len(received) if received else 0}",
+    )
+
+    probe.send_channel_data(b"multi-channel")
+    try:
+        received = peer.recvfrom(65535)[0]
+    except socket.timeout:
+        received = None
+    probe.check(
+        "multi-channel-via-entry",
+        received == b"multi-channel",
+        f"bytes={len(received) if received else 0}",
+    )
+
+    # 7. Peer → relay → client is answered by the owner instance.
+    peer.sendto(b"multi-back", relayed)
+    data, kind = probe.recv_indication()
+    probe.check(
+        "multi-peer-to-client",
+        data == b"multi-back",
+        f"kind={kind} bytes={len(data) if data else 0}",
+    )
+    peer.close()
+
+    # 8. Release through B; the same 5-tuple is unknown on A afterwards.
+    probe.refresh(0)
+    probe.server = server_a
+    probe.expect_error(
+        "multi-refresh-after-release",
+        METHOD_REFRESH,
+        [probe._attribute(ATTR_LIFETIME, struct.pack("!I", 300))],
+        437,
+    )
 
 
 def canonical_wrong_user(
@@ -1330,9 +1602,15 @@ def main() -> int:
             "rest",
             "tcp-relay",
             "tcp-relay-passive",
+            "multi-instance",
+            "tcp-control",
         ),
     )
     parser.add_argument("--server", required=True, help="host:port of the TURN server")
+    parser.add_argument(
+        "--server-b", default="",
+        help="host:port of the second instance (multi-instance mode)",
+    )
     parser.add_argument("--user", default="turnuser")
     parser.add_argument("--password", default="turnpass")
     parser.add_argument("--realm", default="example.org")
@@ -1360,6 +1638,14 @@ def main() -> int:
         help="client/peer address family (inet6 binds ::1 and asserts an IPv6 relay)",
     )
     parser.add_argument(
+        "--tls", action="store_true",
+        help="wrap the TCP connection in TLS (tcp-control against turns:)",
+    )
+    parser.add_argument(
+        "--hold", type=float, default=0.0,
+        help="seconds to keep the connection open after the flow (tcp-control)",
+    )
+    parser.add_argument(
         "--show-relay", action="store_true",
         help="print the relayed transport address (its port changes per run)",
     )
@@ -1378,9 +1664,25 @@ def main() -> int:
     args.host = host
     args.port = int(port)
 
+    def _split_server(text: str) -> tuple[str, int]:
+        if text.startswith("["):
+            host, _, rest = text[1:].partition("]")
+            port = rest[1:] if rest.startswith(":") else ""
+        else:
+            host, _, port = text.rpartition(":")
+        return host, int(port)
+
+    server_b = None
+    if args.server_b:
+        host_b, port_b = _split_server(args.server_b)
+        if not host_b or not port_b:
+            print(f"invalid --server-b {args.server_b!r}", file=sys.stderr)
+            return 2
+        server_b = (host_b, port_b)
+
     probe = (
         TcpRelayProbe(args)
-        if args.mode in ("tcp-relay", "tcp-relay-passive")
+        if args.mode in ("tcp-relay", "tcp-relay-passive", "tcp-control")
         else Probe(args)
     )
     try:
@@ -1405,6 +1707,13 @@ def main() -> int:
             canonical_tcp_relay(probe)
         elif args.mode == "tcp-relay-passive":
             canonical_tcp_relay_passive(probe)
+        elif args.mode == "tcp-control":
+            canonical_tcp_control(probe, args.hold)
+        elif args.mode == "multi-instance":
+            if server_b is None:
+                print("FAIL: multi-instance mode needs --server-b")
+                return 1
+            canonical_multi_instance(probe, server_b)
         else:
             probe.challenge()
             probe.key = b"definitely-not-the-password"

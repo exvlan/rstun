@@ -69,6 +69,8 @@ use tokio::{
 };
 
 mod auth;
+/// 多实例：allocation 归属（一致性哈希）与跨实例转发（M1：UDP 客户端）。
+mod cluster;
 mod crc32;
 pub mod limit;
 /// 运维面：可选的 `/healthz` + `/metrics`、drain 信号、`RSTUN_*` 映射。
@@ -389,6 +391,35 @@ struct Args {
     /// byte-frozen path is untouched
     #[arg(long)]
     turn_tcp_relay: bool,
+
+    /// TURN RFC 6062 **TCP** relay port range (`LO-HI`, default: same as
+    /// --relay-ports). In a cluster this is required and must be disjoint from
+    /// --relay-ports and from the other members' ranges (each instance owns a
+    /// segment; the TCP listener uses SO_REUSEPORT, so an overlap would let two
+    /// instances accept the same peer)
+    #[arg(long, value_name = "LO-HI")]
+    tcp_relay_ports: Option<String>,
+
+    /// multi-instance TURN: bind the internal control/data channel here (TCP,
+    /// plus UDP on the same port). Every instance must agree on the member list.
+    /// Needs --turn; without it nothing changes
+    #[arg(long, value_name = "ADDR")]
+    cluster_listen: Option<SocketAddr>,
+
+    /// multi-instance TURN member, repeatable: `id@addr` naming that instance's
+    /// --cluster-listen address. List the whole cluster on every instance
+    #[arg(long, value_name = "ID@ADDR")]
+    cluster_peer: Vec<String>,
+
+    /// multi-instance TURN: HMAC-SHA256 secret shared by every member. Required
+    /// when --cluster-listen / --cluster-peer use a public address
+    #[arg(long, value_name = "SECRET")]
+    cluster_secret: Option<String>,
+
+    /// multi-instance TURN: this instance's id (default: the
+    /// --cluster-listen address). Must match the id other members list for it
+    #[arg(long, value_name = "ID")]
+    cluster_instance_id: Option<String>,
 }
 
 /// What an invalid `FINGERPRINT` gets (`--fingerprint-action`).
@@ -702,6 +733,9 @@ enum Decision {
     /// **client data connection** identified by `id`. Only reachable on a
     /// TCP/TLS TURN connection with `--turn-tcp-relay`.
     Bind { response: Vec<u8>, id: u32 },
+    /// Multi-instance `ConnectionBind`: the pending peer data connection lives
+    /// on `owner`; write `response`, then relay raw bytes over the cluster.
+    BoundRemote { response: Vec<u8>, owner: String },
 }
 
 /// Which transport a message arrived on; RFC 5780 `CHANGE-REQUEST` is UDP-only.
@@ -1143,6 +1177,7 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
         || args.allocation_lifetime.is_some()
         || args.turn_bandwidth.is_some()
         || args.turn_tcp_relay
+        || args.tcp_relay_ports.is_some()
         || !args.turn_tls_listen.is_empty()
         || !args.turn_dtls_listen.is_empty()
         || args.tls_cert.is_some()
@@ -1154,7 +1189,7 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
                 "--relay-ports / --max-allocations-* / --permission-limit / \
                  --allocation-lifetime / --turn-bandwidth / --turn-tcp-relay / \
                  --turn-tls-listen / --turn-dtls-listen / --tls-cert / --tls-key / \
-                 --tls-cert-poll \
+                 --tls-cert-poll / --tcp-relay-ports \
                  need --turn"
                     .to_string(),
             );
@@ -1236,6 +1271,10 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
     if let Some(text) = &args.relay_ports {
         config.relay_ports = turn::parse_port_range(text)?;
     }
+    // B1: `--tcp-relay-ports` defaults to the UDP range, not to the built-in
+    // 49152-65535. Without this a deployment that moves `--relay-ports` into a
+    // firewall window silently kept opening TCP relay ports outside it.
+    config.tcp_relay_ports = config.relay_ports;
     if let Some(count) = args.max_allocations_per_user {
         config.max_allocations_per_user = count;
     }
@@ -1252,8 +1291,155 @@ fn build_turn(args: &Args, auth: Option<&auth::Auth>) -> Result<Option<turn::Con
         config.bandwidth = bandwidth;
     }
     config.tcp_relay = args.turn_tcp_relay;
+    if let Some(text) = &args.tcp_relay_ports {
+        config.tcp_relay_ports = turn::parse_port_range(text)?;
+    }
     config.validate()?;
     Ok(Some(config))
+}
+
+/// Turn the multi-instance flags into a validated cluster configuration.
+///
+/// Absent `--cluster-listen` means "single instance": every path stays exactly
+/// as it was. A configured cluster is refused unless the shape this stage can
+/// actually serve is in place — TURN on, UDP clients only, no RFC 6062 — because
+/// a half-routed cluster (a method that silently answers `437`) is worse than a
+/// refused start (design D10 / PRD C5).
+fn build_cluster(args: &Args) -> Result<Option<cluster::Config>, String> {
+    let any = args.cluster_listen.is_some()
+        || !args.cluster_peer.is_empty()
+        || args.cluster_secret.is_some()
+        || args.cluster_instance_id.is_some();
+    if !any {
+        return Ok(None);
+    }
+    let Some(listen) = args.cluster_listen else {
+        return Err(
+            "--cluster-peer / --cluster-secret / --cluster-instance-id need --cluster-listen"
+                .to_string(),
+        );
+    };
+    if !args.turn {
+        return Err("--cluster-listen needs --turn (it routes TURN allocations)".to_string());
+    }
+    if args.cluster_peer.is_empty() {
+        return Err(
+            "--cluster-listen needs at least one --cluster-peer <id>@<addr> (the full member \
+             list, this instance included)"
+                .to_string(),
+        );
+    }
+    let instance_id = match &args.cluster_instance_id {
+        Some(id) if id.is_empty() => {
+            return Err("--cluster-instance-id must not be empty".to_string());
+        }
+        Some(id) => id.clone(),
+        // The listen address is unique per instance, so it is a safe default
+        // and needs no extra flag on homogeneous deployments.
+        None => listen.to_string(),
+    };
+    let mut peers = Vec::with_capacity(args.cluster_peer.len());
+    for spec in &args.cluster_peer {
+        let Some((id, addr)) = spec.split_once('@') else {
+            return Err(format!("--cluster-peer expects ID@ADDR (got {spec:?})"));
+        };
+        if id.is_empty() {
+            return Err(format!("--cluster-peer {spec:?}: the id must not be empty"));
+        }
+        let addr: SocketAddr = addr
+            .parse()
+            .map_err(|_| format!("--cluster-peer {spec:?}: invalid address {addr:?}"))?;
+        peers.push(cluster::Member {
+            id: id.to_string(),
+            addr,
+        });
+    }
+    // Every member must serve the same ports: the ownership key contains the
+    // port the request arrived on, so differing ports split one client into two
+    // allocations. Instances are distinguished by IP/netns (design C2).
+    let plain_ports: Vec<u16> = args
+        .listen
+        .iter()
+        .chain(args.listen_v6.iter())
+        .map(SocketAddr::port)
+        .collect();
+    let listen_port = one_cluster_port(&plain_ports, "--listen / --listen-v6")?.unwrap_or(3478);
+    let tls_port = one_cluster_port(
+        &args
+            .turn_tls_listen
+            .iter()
+            .map(SocketAddr::port)
+            .collect::<Vec<_>>(),
+        "--turn-tls-listen",
+    )?;
+    let dtls_port = one_cluster_port(
+        &args
+            .turn_dtls_listen
+            .iter()
+            .map(SocketAddr::port)
+            .collect::<Vec<_>>(),
+        "--turn-dtls-listen",
+    )?;
+    // RFC 6062 needs one explicit, disjoint TCP range per instance.
+    let tcp_relay_ports = match (&args.tcp_relay_ports, args.turn_tcp_relay) {
+        (Some(text), true) => Some(turn::parse_port_range(text)?),
+        (Some(_), false) => {
+            return Err("--tcp-relay-ports needs --turn-tcp-relay".to_string());
+        }
+        (None, true) => {
+            return Err(
+                "--turn-tcp-relay in a cluster needs an explicit --tcp-relay-ports: every \
+                 instance owns its own disjoint TCP relay range"
+                    .to_string(),
+            );
+        }
+        (None, false) => None,
+    };
+    if let Some((tcp_lo, tcp_hi)) = tcp_relay_ports {
+        let (udp_lo, udp_hi) = args
+            .relay_ports
+            .as_deref()
+            .map(turn::parse_port_range)
+            .transpose()?
+            .unwrap_or(turn::DEFAULT_RELAY_PORTS);
+        if tcp_lo <= udp_hi && udp_lo <= tcp_hi {
+            return Err(format!(
+                "--tcp-relay-ports {tcp_lo}-{tcp_hi} overlaps --relay-ports {udp_lo}-{udp_hi}; \
+                 a cluster needs a separate TCP relay range"
+            ));
+        }
+    }
+    let config = cluster::Config {
+        instance_id,
+        listen,
+        peers,
+        secret: args.cluster_secret.clone().map(String::into_bytes),
+        listen_port,
+        tls_port,
+        dtls_port,
+        tcp_relay_ports,
+        tls_listen: args.turn_tls_listen.clone(),
+        dtls_listen: args.turn_dtls_listen.clone(),
+    };
+    config.validate()?;
+    Ok(Some(config))
+}
+
+/// All addresses of one listener kind must share one port in a cluster.
+fn one_cluster_port(ports: &[u16], what: &str) -> Result<Option<u16>, String> {
+    let Some(first) = ports.first().copied() else {
+        return Ok(None);
+    };
+    if ports.iter().any(|port| *port != first) {
+        return Err(format!(
+            "cluster mode needs one {what} port for every address (found {ports:?}); \
+             use distinct IPs, not distinct ports"
+        ));
+    }
+    if first == 0 {
+        return Err(format!("{what} must not use port 0 in a cluster"));
+    }
+    Ok(Some(first))
 }
 
 /// Run the STUN Binding server until Ctrl-C (Unix: also SIGTERM).
@@ -1368,6 +1554,14 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
         // `OnceLock` only accepts the first value; startup is the only writer.
         stats.set_turn(turn.clone());
     }
+    // 多实例：同为启动期校验。未写 `--cluster-*` 时 `None`，下面不建任务、不改任何键。
+    let cluster_config = match build_cluster(&args) {
+        Ok(config) => config,
+        Err(message) => {
+            tracing::error!(%message, "rstun: invalid multi-instance configuration");
+            return ExitCode::FAILURE;
+        }
+    };
     // TLS/DTLS material is read **before** anything is served: a bad path or an
     // unusable pair must never degrade into "plaintext on the turns port".
     // Absent in a lean build (`default = []`): `build_turn` already refused the
@@ -1426,6 +1620,41 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
     });
     let mut tasks = Vec::new();
     let mut listeners = Vec::new();
+
+    // 多实例控制面：先绑定（要么全起、要么不起），再把归属句柄交给 `Turn`。
+    // 绑定失败是启动失败，不是「少一个实例继续跑」。
+    let cluster = match cluster_config {
+        None => None,
+        Some(config) => {
+            let Some(turn) = &turn else {
+                // `build_cluster` already refused this; keep the invariant local.
+                tracing::error!("rstun: --cluster-listen needs --turn");
+                return ExitCode::FAILURE;
+            };
+            let (node, listener) = match cluster::Cluster::bind(config).await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    tracing::error!(%error, "rstun: failed to bind --cluster-listen");
+                    return ExitCode::FAILURE;
+                }
+            };
+            node.start(Arc::downgrade(turn), context.clone(), listener);
+            turn.set_cluster(node.clone());
+            // Fail fast on a misconfigured member: HELLO carries the ports the
+            // ownership key depends on. An unreachable peer only warns.
+            if let Err(message) = node.handshake().await {
+                tracing::error!(%message, "rstun: invalid multi-instance configuration");
+                return ExitCode::FAILURE;
+            }
+            tracing::info!(
+                instance = node.instance_id(),
+                listen = %node.listen(),
+                members = ?node.members().iter().map(|member| (&member.id, member.addr)).collect::<Vec<_>>(),
+                "rstun: TURN multi-instance ownership enabled"
+            );
+            Some(node)
+        }
+    };
 
     // 运维端点：只有给了 `--health-listen` 才绑定（默认零新增）。先绑再起任何任务：
     // 与 STUN socket 同样的「要么全起、要么全不起」，不要起了一半还说自己健康。
@@ -1698,6 +1927,11 @@ async fn run(args: Args, applied_env: Vec<String>) -> ExitCode {
     }
     if let Some(task) = turn_sweeper {
         task.abort();
+    }
+    if let Some(cluster) = &cluster {
+        // Accept loop, per-peer links and the UDP push reader hold `Arc`s of
+        // the cluster; stopping them here also drops the control listener.
+        cluster.shutdown();
     }
     #[cfg(feature = "tls")]
     if let Some(task) = cert_reloader {
@@ -2704,7 +2938,7 @@ async fn respond_to_datagram(
         }
         // A data connection only exists on a TCP/TLS TURN connection; a
         // datagram never reaches `ConnectionBind`.
-        Ok(Decision::Bind { .. }) => {
+        Ok(Decision::Bind { .. }) | Ok(Decision::BoundRemote { .. }) => {
             stats.count_error(Transport::Udp);
             tracing::error!(%local, %peer, "rstun: ConnectionBind on a datagram transport");
         }
@@ -2906,7 +3140,7 @@ async fn serve_tcp_connection(
                 tracing::debug!(%peer, reason, "rstun: ignored message")
             }
             // Not reachable without `--turn` (this is the pre-TURN loop).
-            Ok(Decision::Bind { .. }) => {
+            Ok(Decision::Bind { .. }) | Ok(Decision::BoundRemote { .. }) => {
                 stats.count_error(Transport::Tcp);
                 tracing::error!(%peer, "rstun: ConnectionBind without TURN");
             }
@@ -2967,6 +3201,110 @@ async fn serve_tcp_turn(
     .await
 }
 
+/// Register one stream/DTLS connection on the cluster, returning its session
+/// (0 when the cluster is off).
+fn register_session(turn: &turn::Turn, writer: &tokio::sync::mpsc::Sender<Vec<u8>>) -> u32 {
+    turn.cluster()
+        .map(|cluster| cluster.register_session(writer.clone()))
+        .unwrap_or(0)
+}
+
+fn unregister_session(turn: &turn::Turn, session: u32) {
+    if session != 0
+        && let Some(cluster) = turn.cluster()
+    {
+        cluster.unregister_session(session);
+    }
+}
+
+/// After a clustered `ConnectionBind`: relay raw bytes between the client
+/// connection and the owner. The owner wraps the other end into the pending
+/// peer data connection's `DataConnection` (multi-instance M3).
+#[allow(clippy::too_many_arguments)]
+async fn raw_relay_loop<R>(
+    mut reader: R,
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    writer_task: tokio::task::JoinHandle<()>,
+    mut close: tokio::sync::watch::Receiver<u8>,
+    cluster: Arc<cluster::Cluster>,
+    owner: cluster::Member,
+    session: u32,
+    mut drain: tokio::sync::watch::Receiver<bool>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut chunk = vec![0_u8; 16384];
+    let mut client_open = true;
+    let mut server_open = true;
+    let mut sender = Some(sender);
+    // The close may have been recorded before this loop subscribed (the owner
+    // can send RAW_CLOSED right after BOUND); `watch` only signals *changes*.
+    match *close.borrow() {
+        cluster::RAW_CLOSE_PEER_TO_CLIENT => {
+            server_open = false;
+            drop(sender.take());
+        }
+        cluster::RAW_CLOSE_ABORT => {
+            cluster.raw_closed(&owner, session, cluster::RAW_CLOSE_ABORT);
+            client_open = false;
+            server_open = false;
+        }
+        _ => {}
+    }
+    loop {
+        if !client_open && !server_open {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = drain.changed() => {
+                cluster.raw_closed(&owner, session, cluster::RAW_CLOSE_ABORT);
+                break;
+            }
+            changed = close.changed(), if server_open => {
+                if changed.is_err() {
+                    server_open = false;
+                } else {
+                    match *close.borrow() {
+                        cluster::RAW_CLOSE_PEER_TO_CLIENT => {
+                            // The peer finished writing: shut the client's
+                            // write half, keep reading its bytes.
+                            server_open = false;
+                            cluster.unregister_session(session);
+                            drop(sender.take());
+                        }
+                        cluster::RAW_CLOSE_ABORT => {
+                            cluster.raw_closed(&owner, session, cluster::RAW_CLOSE_ABORT);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            read = reader.read(&mut chunk), if client_open => {
+                match read {
+                    Ok(0) => {
+                        client_open = false;
+                        cluster.raw_closed(&owner, session, cluster::RAW_CLOSE_CLIENT_TO_PEER);
+                    }
+                    Ok(length) => {
+                        if !cluster.send_raw(&owner, session, &chunk[..length]).await {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        cluster.raw_closed(&owner, session, cluster::RAW_CLOSE_ABORT);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    drop(sender);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer_task).await;
+    cluster.unregister_session(session);
+}
+
 /// How a TURN-over-stream loop ended.
 enum StreamOutcome {
     /// Control connection finished (EOF, drain, malformed frame, error): the
@@ -2975,6 +3313,9 @@ enum StreamOutcome {
     /// `ConnectionBind` succeeded: answer first, then hand the stream over as
     /// the client data connection `id` (RFC 6062 §5.4).
     Bound { response: Vec<u8>, id: u32 },
+    /// `ConnectionBind` succeeded on the owner instance: answer, then relay raw
+    /// bytes to `owner` over the cluster (multi-instance M3).
+    BoundRemote { response: Vec<u8>, owner: String },
     /// A `ConnectionBind` was refused: flush the error response, then close
     /// (coturn closes so hard the client only sees a RST; answering the `400`
     /// is strictly better and is an explicit, documented difference).
@@ -3015,6 +3356,9 @@ where
         }
         let _ = writer.shutdown().await;
     });
+    // Register before the first request so an owner's PUSH_CLIENT can find
+    // this connection's queue (multi-instance M2).
+    let session = register_session(&turn, &sender);
     let outcome = match stream_turn_loop(
         &mut reader,
         peer,
@@ -3026,6 +3370,7 @@ where
         stats,
         &sender,
         &mut drain,
+        session,
     )
     .await
     {
@@ -3033,7 +3378,8 @@ where
         Err(error) => {
             // Same cleanup as a closed control connection: without the writer
             // task the allocation could only leak its relay socket until TTL.
-            turn.release_connection(peer, local, transport);
+            turn.release_connection(peer, local, transport, session);
+            unregister_session(&turn, session);
             drop(sender);
             writer_task.abort();
             return Err(error);
@@ -3041,7 +3387,8 @@ where
     };
     match outcome {
         StreamOutcome::ControlClosed => {
-            turn.release_connection(peer, local, transport);
+            turn.release_connection(peer, local, transport, session);
+            unregister_session(&turn, session);
             drop(sender);
             writer_task.abort();
             Ok(())
@@ -3049,12 +3396,49 @@ where
         StreamOutcome::RejectAfterResponse => {
             // Flush the queued 400 before closing: dropping the last sender
             // ends the writer task after it has written everything.
-            turn.release_connection(peer, local, transport);
+            turn.release_connection(peer, local, transport, session);
+            unregister_session(&turn, session);
             drop(sender);
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer_task).await;
             Ok(())
         }
+        StreamOutcome::BoundRemote { response, owner } => {
+            // The cluster dispatcher already queued the bind response on this
+            // connection (before any RAW_RELAY), so `response` is empty here.
+            if !response.is_empty() && sender.try_send(response).is_err() {
+                unregister_session(&turn, session);
+                return Ok(());
+            }
+            stats.count_answered(Transport::Tcp);
+            let Some(cluster) = turn.cluster().cloned() else {
+                unregister_session(&turn, session);
+                return Ok(());
+            };
+            let Some(owner) = cluster.member_by_id(&owner) else {
+                unregister_session(&turn, session);
+                return Ok(());
+            };
+            let Some(close) = cluster.session_close(session) else {
+                unregister_session(&turn, session);
+                return Ok(());
+            };
+            raw_relay_loop(
+                reader,
+                sender,
+                writer_task,
+                close,
+                cluster,
+                owner,
+                session,
+                drain,
+            )
+            .await;
+            Ok(())
+        }
         StreamOutcome::Bound { response, id } => {
+            // This connection becomes the raw data connection: it has no
+            // allocation of its own, so its entry-side session ends here.
+            unregister_session(&turn, session);
             // The bind response is queued first, so it precedes any buffered
             // peer bytes in the same FIFO writer queue.
             if sender.try_send(response).is_err() {
@@ -3073,6 +3457,7 @@ where
                 // A data connection is an accepted TCP connection: it keeps
                 // holding its `--max-inflight` slot for its whole life.
                 _permit: inflight,
+                abort: None,
             };
             match turn.take_bind(id) {
                 Some(bind) => {
@@ -3101,6 +3486,7 @@ async fn stream_turn_loop<R>(
     stats: &ServerStats,
     sender: &tokio::sync::mpsc::Sender<Vec<u8>>,
     drain: &mut tokio::sync::watch::Receiver<bool>,
+    session: u32,
 ) -> std::io::Result<StreamOutcome>
 where
     R: tokio::io::AsyncRead + Unpin + ?Sized,
@@ -3134,7 +3520,8 @@ where
                     return Ok(StreamOutcome::ControlClosed);
                 }
             }
-            turn.handle_channel_data(channel, &data, peer, local, transport, context);
+            turn.handle_channel_data(channel, &data, peer, local, transport, context, session)
+                .await;
             stats.count_ignored(Transport::Tcp);
             continue;
         }
@@ -3180,7 +3567,15 @@ where
 
         let in_flight = stats.enter();
         let decision = match turn
-            .handle(&frame, peer, local, transport, context, Some(sender))
+            .handle_stream(
+                &frame,
+                peer,
+                local,
+                transport,
+                context,
+                Some(sender),
+                session,
+            )
             .await
         {
             Some(decision) => decision,
@@ -3202,6 +3597,16 @@ where
                     return Ok(StreamOutcome::ControlClosed);
                 }
                 return Ok(StreamOutcome::Bound { response, id });
+            }
+            Ok(Decision::BoundRemote { response, owner }) => {
+                // Empty means the dispatcher already queued the bind response
+                // on this connection (before any RAW_RELAY).
+                if !response.is_empty() && !response_is_encodable(&response) {
+                    stats.count_error(Transport::Tcp);
+                    tracing::error!(%peer, "rstun: response violates STUN wire invariants");
+                    return Ok(StreamOutcome::ControlClosed);
+                }
+                return Ok(StreamOutcome::BoundRemote { response, owner });
             }
             Ok(Decision::Respond(response)) => {
                 // Keep the ordinary long-term challenge dance alive: an
@@ -4011,6 +4416,7 @@ async fn serve_turn_dtls_connection(
         }
     });
 
+    let session = register_session(&turn, &sender);
     let mut drain = stats.subscribe_drain();
     let mut buffer = vec![0_u8; UDP_RECV_BUFFER];
     loop {
@@ -4040,13 +4446,14 @@ async fn serve_turn_dtls_connection(
         stats.count_received(Transport::Udp);
         let datagram = &buffer[..length];
         let decision = match turn
-            .handle(
+            .handle_stream(
                 datagram,
                 peer,
                 local,
                 turn::ClientTransport::Dtls,
                 &context,
                 Some(&sender),
+                session,
             )
             .await
         {
@@ -4085,7 +4492,7 @@ async fn serve_turn_dtls_connection(
                 stats.count_ignored(Transport::Udp);
                 tracing::debug!(%peer, reason, "rstun: ignored message")
             }
-            Ok(Decision::Bind { .. }) => {
+            Ok(Decision::Bind { .. }) | Ok(Decision::BoundRemote { .. }) => {
                 // A DTLS session is not a stream: `ConnectionBind` is refused
                 // with 400 before it could ever get here.
                 stats.count_error(Transport::Udp);
@@ -4098,7 +4505,8 @@ async fn serve_turn_dtls_connection(
         }
     }
 
-    turn.release_connection(peer, local, turn::ClientTransport::Dtls);
+    turn.release_connection(peer, local, turn::ClientTransport::Dtls, session);
+    unregister_session(&turn, session);
     drop(sender);
     writer_task.abort();
     let _ = conn.close().await;
@@ -4553,7 +4961,9 @@ mod tests {
             }
             Decision::Ignore(reason) => panic!("expected an error response, got ignore: {reason}"),
             Decision::RespondFrom { .. } => panic!("error responses never change socket"),
-            Decision::Bind { .. } => panic!("plain Binding never binds a data connection"),
+            Decision::Bind { .. } | Decision::BoundRemote { .. } => {
+                panic!("plain Binding never binds a data connection")
+            }
         }
     }
 
@@ -7255,6 +7665,35 @@ mod tests {
         assert!(build_turn(&args, Some(&long)).is_err());
     }
 
+    /// B1: without `--tcp-relay-ports`, the TCP relay range must follow
+    /// `--relay-ports` (not the built-in 49152-65535). Otherwise a deployment
+    /// that moved the UDP range into a firewall window would still open TCP
+    /// relay listeners outside it.
+    #[test]
+    fn tcp_relay_ports_default_to_the_udp_range() {
+        let long = long_term_auth(false);
+        let args = Args {
+            turn: true,
+            turn_tcp_relay: true,
+            relay_ports: Some("50000-50100".to_string()),
+            ..Args::default()
+        };
+        let config = build_turn(&args, Some(&long)).unwrap().expect("enabled");
+        assert_eq!(config.relay_ports, (50000, 50100));
+        assert_eq!(config.tcp_relay_ports, config.relay_ports);
+
+        // An explicit range still wins.
+        let args = Args {
+            turn: true,
+            turn_tcp_relay: true,
+            relay_ports: Some("50000-50100".to_string()),
+            tcp_relay_ports: Some("50200-50300".to_string()),
+            ..Args::default()
+        };
+        let config = build_turn(&args, Some(&long)).unwrap().expect("enabled");
+        assert_eq!(config.tcp_relay_ports, (50200, 50300));
+    }
+
     #[test]
     fn turn_t2_flags_are_validated_before_serving() {
         let long = long_term_auth(false);
@@ -8873,5 +9312,57 @@ mod tests {
         let (response, _) = udp_exchange(&client, address, &signed).await;
         assert_binding_success(&response, TEST_TRANSACTION, client.local_addr().unwrap());
         assert_eq!(stats.counters(), (2, 2, 0));
+    }
+}
+
+#[cfg(test)]
+mod cluster_config_tests {
+    use super::*;
+
+    fn base() -> Args {
+        Args {
+            turn: true,
+            listen: vec!["127.0.0.1:3478".parse().unwrap()],
+            cluster_listen: Some("127.0.0.1:34970".parse().unwrap()),
+            cluster_peer: vec!["a@127.0.0.1:34970".to_string()],
+            cluster_instance_id: Some("a".to_string()),
+            ..Args::default()
+        }
+    }
+
+    #[test]
+    fn cluster_requires_one_listen_port_and_disjoint_tcp_ranges() {
+        let config = build_cluster(&base()).expect("valid").expect("enabled");
+        assert_eq!(config.listen_port, 3478);
+        assert_eq!(config.tls_port, None);
+        assert_eq!(config.tcp_relay_ports, None);
+
+        // Two --listen addresses with different ports would hash one client to
+        // two owners: refused with an actionable message.
+        let mut args = base();
+        args.listen.push("127.0.0.2:3479".parse().unwrap());
+        let error = build_cluster(&args).expect_err("port mismatch");
+        assert!(error.contains("one --listen"), "{error}");
+
+        // RFC 6062 in a cluster needs its own explicit TCP range.
+        let mut args = base();
+        args.turn_tcp_relay = true;
+        let error = build_cluster(&args).expect_err("missing tcp range");
+        assert!(error.contains("--tcp-relay-ports"), "{error}");
+
+        // ... which must not overlap the UDP relay range.
+        let mut args = base();
+        args.turn_tcp_relay = true;
+        args.relay_ports = Some("50000-50100".to_string());
+        args.tcp_relay_ports = Some("50050-50150".to_string());
+        let error = build_cluster(&args).expect_err("overlap");
+        assert!(error.contains("overlaps"), "{error}");
+
+        let mut args = base();
+        args.turn_tcp_relay = true;
+        args.relay_ports = Some("50000-50099".to_string());
+        args.tcp_relay_ports = Some("50100-50199".to_string());
+        let config = build_cluster(&args).expect("valid").expect("enabled");
+        assert_eq!(config.tcp_relay_ports, Some((50100, 50199)));
     }
 }

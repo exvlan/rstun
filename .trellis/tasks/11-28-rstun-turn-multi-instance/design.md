@@ -22,7 +22,7 @@
 | D2 | **归一化键** `(client_ip, client_port, transport_class, listen_port)`，`transport_class ∈ {udp, dtls, tcp}`（TLS 归 tcp） | 抹平 `Key.server` 两种语义；同一客户端在同一 listen 端口上跨实例一致 | 直接用 `Key`（同机不同端口时失效） |
 | D3 | **集群模式下 `Key.server` 规范化**为 `0.0.0.0:<listen_port>` | 归属实例只做表键，不往该地址发包；让同一 5 元组在任意实例上得到同一个 `Key` | 用入口实例的真实地址（逐实例不同 → 键漂移） |
 | D4 | **新开内部监听** `--cluster-listen <addr>` + 静态对端 `--cluster-peer <id>@<addr>`（可多次） | ops 端点的契约是「GET /healthz, GET /metrics，一连接一请求、拒绝请求体」（`ops.rs:1015`、`ops.md`），塞双向推送会破坏它 | 复用 `--health-listen` |
-| D5 | **内部协议手写**：`u32 len ‖ u8 type ‖ u16 flags ‖ u32 session ‖ payload`，可选 `--cluster-secret`（HMAC-SHA256 over header+payload） | 与 `ops.rs` 极简 HTTP 同风格，不引依赖（R8）；有 secret 时拒绝未签名帧 | gRPC / protobuf / QUIC |
+| D5 | **内部协议手写**：12 字节头 `u32 len ‖ u8 type ‖ u16 flags ‖ u8 reserved ‖ u32 session ‖ payload`，可选 `--cluster-secret`（HMAC-SHA256 over header+payload） | 与 `ops.rs` 极简 HTTP 同风格，不引依赖（R8）；有 secret 时拒绝未签名帧 | gRPC / protobuf / QUIC |
 | D6 | **端口策略**：UDP 共用同段（依赖 bind 失败自动分区）；**TCP 必须分片** | 实测：UDP 第二个进程 bind 失败即跳过；TCP 因 REUSEPORT 一定绑上 | 全部共用（TCP 错投递）；全部分片（UDP 需人工规划，无收益） |
 | D7 | **归属不可达 → `500`（Server Error）**，不猜、不回 `437` | `437` 会让客户端以为 allocation 没了而重建（制造第二份 allocation）；`500` 可重试 | 回 437；静默丢 |
 | D8 | **不引入外部存储**；共享状态存储方案（C）整体放弃 | C 也消不掉转发（socket 不可迁移），却引入可用性单点、时钟偏差、权限缓存一致性风险 | Redis/etcd |
@@ -118,9 +118,9 @@ client ──TCP──► E（持有该连接与写队列 mpsc）
 
 | 项 | 规则 |
 | --- | --- |
-| `--listen` | 每实例不同端口（或不同 IP/netns） |
+| `--listen` | **成员间端口相同、IP（或 netns）不同**；启动 `HELLO` 校验，端口不一致拒绝启动（归属键含 listen_port，端口漂移会把一个客户端拆成两份 allocation）。TLS/DTLS 端口同理 |
 | `--relay-ports`（UDP） | 可相同；实例靠 bind 失败自动分区 |
-| TCP relay 段 | **必须**不同（`--turn-tcp-relay` 时启动校验：cluster 模式要求显式 `--tcp-relay-ports`，且与 `--relay-ports` 不重叠） |
+| TCP relay 段 | **必须**不同（`--turn-tcp-relay` 时启动校验：cluster 模式要求显式 `--tcp-relay-ports`，且与 `--relay-ports` 不重叠；HELLO 再校验成员间段不重叠） |
 | `--cluster-listen` | 每实例一个；`--cluster-peer id@addr` 列全部成员（含自己可省略） |
 | 成员稳定性 | 启动时按 `id` 排序成环；成员表变更 → 全部实例重启（C3） |
 
@@ -133,12 +133,17 @@ client ──TCP──► E（持有该连接与写队列 mpsc）
 --cluster-instance-id <id>         本实例 id（缺省从 --cluster-listen 派生）
 ```
 
+> `--cluster-peer` 的**地址**不参与 fail-fast：`HELLO` 只校验成员 **id** 集合（成员数 + 排序 id 摘要）。
+> 地址漂移/写错会落到 §6 的「owner 不可达 → `500`」；换地址请同时重启所有成员并核对成员表。
+> 集群内请用**具体**的 `--listen` IP：`0.0.0.0` 时 `egress_ip` 退回路由反推（与单实例通配一致），
+> 同机多实例会算出同一主机 IP，relay 不再绑定在归属实例自己的地址上。
+
 ## 6. 错误与失效
 
 | 场景 | 行为 |
 | --- | --- |
-| 归属实例不可达（连接失败 / 超时 200ms） | 回 `500 Server Error`（D7），计 `cluster_unreachable_total` |
-| 内部帧超时（请求 500ms 未回） | 同上；客户端重传会重试 |
+| 归属实例不可达（连接失败 / 超时 200ms） | 回 `500 Server Error`（D7）。客户端重试要用**新的本地端口**：归属只由 5 元组决定，同一 5 元组重试仍会命中同一个死实例 |
+| 内部帧超时（请求 500ms 未回） | 同上；同一 5 元组的重传仍命中同一 owner，需新本地端口才能换主 |
 | 对端返回无法解析的字节 | 记 warn + `500`，不回垃圾给客户端 |
 | 成员表缺某实例 | 该实例的键无归属 → `500`（不静默丢） |
 | 边界：`session` 复用/串号 | 每次请求新 `session`，A 侧表按到达顺序消费；超时条目 1s 回收 |

@@ -16,8 +16,10 @@
 | [`rstun-interop.sh`](./rstun-interop.sh) | 互操作矩阵单入口：8 个项，可单项跑也可一次跑完 |
 | [`rstun-interop-probe.py`](./rstun-interop-probe.py) | 只用 python3 标准库的协议探针（逐条 `ok:` / `FAIL:` 断言） |
 | [`rstun-abuse.sh`](./rstun-abuse.sh) | 抗滥用对照：关/开限速、单源洪水、28/40 字节反射尝试、allow/deny、TCP 洪水 |
-| [`rstun-turn.sh`](./rstun-turn.sh) | TURN 验收（17 项）：中继 / 生命周期 / 441 / 508 / 486 / **TLS / DTLS** / **REST 凭据** / **带宽配额** / 回收 / 字节冻结 / coturn 对照。默认 lean 构建（tls/dtls 项 SKIP）；`--tls`/`--dtls` 自动 `--features full` 构建 |
-| [`rstun-turn-probe.py`](./rstun-turn-probe.py) | 有状态 TURN 客户端（标准库）：`lifecycle` / `relay` / `auth` / `wrong-user` / `loopback` / `permission-limit` / `rest`，同一步骤可对 coturn 与 rstun 各跑一次再 diff |
+| [`rstun-turn.sh`](./rstun-turn.sh) | TURN 验收（28 项）：中继 / 生命周期 / 441 / 508 / 486 / **多实例（`--cluster-*`：UDP / TCP / TLS / DTLS / RFC 6062 各一项，两实例 + 假 LB）** / **TLS / DTLS** / **REST 凭据** / **带宽配额** / 回收 / 字节冻结 / coturn 对照。默认 lean 构建（tls/dtls 项 SKIP）；`--tls`/`--dtls` 自动 `--features full` 构建 |
+| [`rstun-turn-probe.py`](./rstun-turn-probe.py) | 有状态 TURN 客户端（标准库）：`lifecycle` / `relay` / `auth` / `wrong-user` / `loopback` / `permission-limit` / `rest` / `multi-instance` / `tcp-control` / `tcp-relay` / `tcp-relay-passive`，同一步骤可对 coturn 与 rstun 各跑一次再 diff |
+| [`rstun-turn-lb.py`](./rstun-turn-lb.py) | 多实例 lab 的假 UDP LB：逐包轮转（`--sticky` 时按客户端固定后端，DTLS 用）、每客户端一个上游 socket（后端看到稳定的 5 元组），回程经 LB 转发 |
+| [`rstun-turn-tcp-lb.py`](./rstun-turn-tcp-lb.py) | 多实例 lab 的假 TCP LB：逐连接轮转、双向字节转发（TLS 字节透明），每条路由写一行 `route … -> backend` |
 | [`rstun-load.sh`](./rstun-load.sh) | 黑盒压测：UDP 吞吐/延迟分位（单源与 127.0.0.x 多源）、TCP 连接洪水与首字节、**限速开/关对照**、`--json`。数字见 [`docs/perf.md`](../../docs/perf.md) |
 | [`rstun-chaos.sh`](./rstun-chaos.sh) | 混沌用例 C1–C6：`tc netem` 丢包 / 乱序重复 / 大 datagram（可选强制 MTU 分片）/ TCP 半包 / 半开连接 / TURN 中继丢包 + 配额。无 root 或 `tc` 时 SKIP 并说明 |
 
@@ -38,13 +40,20 @@ bash script/lab/rstun-interop.sh full          # all + fuzz(600s) + ci
 TURN 验收（自起自停；TLS/DTLS 用 `openssl` 自签证书，REST 用探针 + `uclient -W`）：
 
 ```bash
-bash script/lab/rstun-turn.sh              # 全部 17 项（lean 构建；tls/dtls 记 SKIP 并说明）
+bash script/lab/rstun-turn.sh              # 全部 28 项（lean 构建；tls/dtls 记 SKIP 并说明）
 bash script/lab/rstun-turn.sh --tls        # 只跑 TLS（自动 --features full 构建；s_client + uclient -S -t）
 bash script/lab/rstun-turn.sh --dtls       # 只跑 DTLS（自动 --features full；s_client -dtls1_2 + uclient -S）
 bash script/lab/rstun-turn.sh --only rest  # REST：有效 / 过期 401 / 错 secret 401 / label 含 ':'
+bash script/lab/rstun-turn.sh --only multi-instance-udp # 两实例同一 5 元组：控制面转发 + 数据面 + LIFETIME=0 回收 + 真 uclient 走假 LB
+bash script/lab/rstun-turn.sh --only multi-instance-tcp # TCP 控制连接 + PUSH_CLIENT + 断连即释放
+bash script/lab/rstun-turn.sh --only multi-instance-tcp-relay # RFC 6062 出站 + 被动，跨实例 bind
+bash script/lab/rstun-turn.sh --only multi-instance-tls # turns: 经 TCP LB（需要 full）
+bash script/lab/rstun-turn.sh --only multi-instance-dtls # DTLS 经 sticky UDP LB（需要 full）
 bash script/lab/rstun-turn.sh --only coturn # 与本地 turnserver 同参数对跑（含 TLS/DTLS/REST）
-#   项名：startup|relay|auth|lifecycle|wrong-user|wildcard|permission-limit|quota|ports|
-#         tls|dtls|rest|bandwidth|cleanup|frozen|coturn
+#   项名：startup|relay|tcprelay|tcp-relay-passive|multi-instance-udp|multi-instance-tcp|
+#         multi-instance-tcp-relay|multi-instance-tls|multi-instance-dtls|auth|lifecycle|
+#         wrong-user|raf|df|ipv6relay|wildcard|permission-limit|quota|ports|tls|dtls|
+#         cert-reload|cert-poll|rest|bandwidth|cleanup|frozen|coturn
 ```
 
 抗滥用对照（自起自停、退出码可判定、每组一个日志）：

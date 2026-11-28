@@ -1114,6 +1114,11 @@ const ENV_FLAGS: &[(&str, EnvKind)] = &[
     ("tls_cert_poll", EnvKind::Value),
     ("rest_secret", EnvKind::Value),
     ("turn_bandwidth", EnvKind::Value),
+    ("tcp_relay_ports", EnvKind::Value),
+    ("cluster_listen", EnvKind::Value),
+    ("cluster_peer", EnvKind::List),
+    ("cluster_secret", EnvKind::Value),
+    ("cluster_instance_id", EnvKind::Value),
 ];
 
 /// `RSTUN_<FLAG>`: uppercase, `-` → `_`.
@@ -1280,6 +1285,11 @@ fn overlay(args: &mut Args, from_env: &mut Args, matches: &ArgMatches) {
         tls_cert_poll,
         rest_secret,
         turn_bandwidth,
+        tcp_relay_ports,
+        cluster_listen,
+        cluster_peer,
+        cluster_secret,
+        cluster_instance_id,
     );
 }
 

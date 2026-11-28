@@ -207,6 +207,44 @@
    （`tls_reload_metrics_appear_only_with_secure_material`、`turn_metrics_appear_only_when_enabled`）；
    `cargo check --target x86_64-pc-windows-msvc`（`cfg(unix)` 隔离 SIGHUP）。
 
+## 5c. 多实例契约（`--cluster-listen` 等，M1–M3）
+
+> 来源：2026-11-28 `rstun-turn-multi-instance`。M1 UDP → M2 TCP/TLS/DTLS → M3 RFC 6062 已全部落地；
+> 任何改动归属键、内部帧、会话联动或 `--cluster-*` 配置的提交都必须满足本节。
+
+| 项 | 契约 |
+| --- | --- |
+| 归属键 | `(client_ip, client_port, transport_class, listen_port)`；`transport_class ∈ udp/tcp/dtls`（TLS 归 tcp）；IPv4-mapped IPv6 先归一；**集群模式**下 `Key.server = 0.0.0.0:<listen_port>`，非集群保持原值 |
+| 成员环 | 成员按 id 排序 + 16 个虚拟点，`FNV-1a`（**不得**用 `RandomState`：跨进程必须一致）；`owner_for` 纯函数；改成员 = 排空重建（不做在线迁移）|
+| 启动握手 | 每条控制连接先交换 `HELLO`（**协议版本 2**，版本不符即断连并报 `version N is not supported (expected 2)`）+ instance-id + `--listen`/TLS/DTLS 端口 + 本实例 TCP relay 段 + **成员表摘要**。**成员必须服务同一组端口**（靠 IP/netns 区分实例），TCP relay 段必须**互不重叠**，每个实例的 `--cluster-peer` 必须**完全一致**（摘要 + 成员数）；任一项不一致 → **拒绝启动**；peer 不可达仅告警。连接的首帧必须是 `HELLO`，否则断连 |
+| 内部帧 | 12 字节头 `len(4)|type(1)|flags(2)|reserved(1)|session(4)`；`flags & 0x01` = HMAC-SHA256 截断 16B（覆盖 header + payload，尾随）；有 secret 时**未签名帧拒绝**；`len > 1 MiB` / 未知 type / 未知 flag 一律断连。类型：`REQUEST/RESPONSE/PUSH_DATA/PUSH_CLIENT/CLIENT_CLOSED/RAW_RELAY/PING/PONG/HELLO/BOUND/RAW_CLOSED` |
+| 承载 | `--cluster-listen` **同端口**：TCP 长连（请求/响应/推送/裸字节）+ UDP（`PUSH_DATA`）。每对端一条 TCP，断线重连；控制请求 **500 ms** 超时 |
+| 转发面 | 只有 TURN 帧转发：`ChannelData` / `Send` indication / 四个 request 方法 / `Connect` / `ConnectionBind`。**非 TURN 帧必须原样返回 `None`**。`ConnectionBind` **只按 `CONNECTION-ID` 的实例下标路由**，绝不回退到 5 元组键 |
+| 执行 | 鉴权、permission/channel 判定、带宽桶**只在 owner**；owner 用请求验证通过的 key `seal`，入口只回写字节、不解析。relay 绑定地址按**传输类别**从 owner 自己的监听表解析（UDP/TCP = `--listen`，TLS = `--turn-tls-listen`，DTLS = `--turn-dtls-listen`），同机多 IP 同端口时 `XOR-RELAYED-ADDRESS` 必须是归属实例自己的 IP |
+| 会话（M2） | 每个 stream/DTLS 连接在入口注册 `session`；`REQUEST`/`PUSH_DATA` 载荷带 `session(4)`；owner 的 `ClientSink::Remote` 用 `PUSH_CLIENT{session}` 回推 peer→client 字节（有界 `try_send`）；入口连接结束发 `CLIENT_CLOSED{session}`，owner **立即** `remove` allocation + relay socket（不等 TTL），并清理会话/裸中继状态 |
+| 裸中继（M3） | `ConnectionBind` 在 owner 成功后，owner 先写 `BOUND`（载荷前缀 = 入口连接 session），再交接 `DataConnection`；入口把该连接切到 `RAW_RELAY{session}` 双向裸字节；`RAW_CLOSED{0/1/2}` 传播半关闭/中止。half-close：客户端 EOF 只关 peer 写半边，peer EOF 只关客户端写半边，错误/`LIFETIME=0`/allocation 删除才关双向 |
+| 错误 | 归属实例不可达 / 超时 → **`500 Server Error`**（不签名：入口没有验证过的 key）；**不回 437、不静默丢**；客户端重试需用**新的本地端口**（同一 5 元组仍命中同一 owner）；日志 `cluster=forward peer_instance=<id>`、`session=<n>` |
+| `EVEN-PORT` | token = `port(2) \| issuer_index(1) \| unique(5)`；issuer 走预留表（一次性 + 30 s）；**另一个实例**优先用同端口（自己的 relay IP），被占用则用该实例的空闲奇数端口。返回 `508`（§7.2 step 8）会让 coturn `uclient` 在端口对跨实例时直接退出 |
+| 端口 | 每实例 `--listen`/TLS/DTLS **端口相同、IP 不同**；UDP relay 段可共用（bind 失败自动分区）；**`--turn-tcp-relay` 在集群中必须显式 `--tcp-relay-ports`**，且与 `--relay-ports` 及其它成员不重叠（TCP relay listener 用 `SO_REUSEPORT`）|
+| 启动校验 | 无 `--turn` / 无 `--cluster-peer` / 公网**或通配**（`0.0.0.0`、`::`）`--cluster-listen` 或 peer 无 `--cluster-secret` / 成员 > 255 / 同一实例的多个监听地址端口不一致 / TCP relay 段重叠或缺失 / 成员表不一致 → **拒绝启动** |
+| 指标 | **不新增指标名/标签**（`ops.md` 固定集合）；每实例 `/metrics` 仍是本进程视角，全局上限 = N × 单实例 |
+| 并发创建 | 同一 5 元组的 `Allocate` 在「查表 → 绑端口 → 插入」之间用 per-key 占位串行化；并发落败者回 `437`（同一 tid 的后续重传由查表路径幂等回 `200`），**不得出现两个 200 / 两个 relay 地址**；`insert` 对存活条目再做一次防御性拒绝并归还新端口 |
+| 发送方校验 | 入口处理 `PUSH_CLIENT` / `RAW_RELAY` / `RAW_CLOSED` / `BOUND` 时校验发送实例 == 该 session 记录的 owner，不匹配丢弃 + warn |
+| 默认 | 不写 `--cluster-*`：`Turn.cluster = None`，键不归一化，零任务、零监听；`frozen` 3×17 与 `cad4fa2` 逐字节一致 |
+
+**Tests Required**：两实例（不同 IP、同端口）上的 `Refresh`/`CreatePermission`/`ChannelBind` = `200`；
+同 tid 重传返回同一 relay、新 tid → `437` 且全集群只有一份 allocation；经非 owner 的 `Send`/`ChannelData`
+到达 peer；owner 不可达 → `500`；非 TURN 帧留在入口；`--cluster-secret` 全链路；TCP 控制连接
+（`cluster_stream_control_forwards_and_pushes_bytes_back`）的 peer→client 经 `PUSH_CLIENT`；
+断连即释放（`cluster_stream_close_releases_the_owner_allocation`）；`HELLO` 端口不一致拒绝；
+RFC 6062 出站（`cluster_raw_relay_binds_and_carries_bytes_both_ways`）与被动
+（`cluster_passive_attempt_is_pushed_to_the_entry`）；B2（`concurrent_allocate_for_one_five_tuple_yields_one_allocation`，120 轮双 200=0）；B3（`cluster_hello_rejects_a_member_list_mismatch`）；B4（`a_wildcard_cluster_listener_needs_a_secret`、`a_push_client_from_the_wrong_instance_is_dropped`）；S1（`owner_local_resolves_each_transport_listener` + lab `multi-instance-tls-relay-ip`）；N2（`a_full_raw_relay_queue_aborts_the_session`、`a_full_owner_raw_queue_aborts_the_relay`）；lab `multi-instance-{udp,tcp,tcp-relay,tls,dtls}`。
+
+**已知部署前提（C1）**：`turnutils_uclient` 的 UDP socket 是 `connect` 过的（`ss -uanp` 显示 `ESTAB`），
+只接受来自它发送目标的响应。因此「客户端 → 共享 VIP」的部署必须让回程源地址稳定：每实例独立公网 IP
+（客户端直接发往该实例）、DSR（源地址仍是 VIP），或 NAT 型 LB 转发回程。探针（未 `connect`）覆盖
+owner 直发路径；lab 的假 LB 覆盖 NAT 形态。
+
 ## 6. Wrong vs Correct
 
 #### Wrong

@@ -216,6 +216,29 @@ Options:
           control connection. Off by default: without it a TCP Allocate is still `442` and the
           byte-frozen path is untouched
 
+      --tcp-relay-ports <LO-HI>
+          TURN RFC 6062 **TCP** relay port range (`LO-HI`, default: same as --relay-ports). In a
+          cluster this is required and must be disjoint from --relay-ports and from the other
+          members' ranges (each instance owns a segment; the TCP listener uses SO_REUSEPORT, so an
+          overlap would let two instances accept the same peer)
+
+      --cluster-listen <ADDR>
+          multi-instance TURN: bind the internal control/data channel here (TCP, plus UDP on the
+          same port). Every instance must agree on the member list. Needs --turn; without it nothing
+          changes
+
+      --cluster-peer <ID@ADDR>
+          multi-instance TURN member, repeatable: `id@addr` naming that instance's --cluster-listen
+          address. List the whole cluster on every instance
+
+      --cluster-secret <SECRET>
+          multi-instance TURN: HMAC-SHA256 secret shared by every member. Required when
+          --cluster-listen / --cluster-peer use a public address
+
+      --cluster-instance-id <ID>
+          multi-instance TURN: this instance's id (default: the --cluster-listen address). Must
+          match the id other members list for it
+
   -h, --help
           Print help (see a summary with '-h')
 ```

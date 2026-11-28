@@ -27,10 +27,31 @@
 | `docker/compose.yaml` | 单服务 Compose，`network_mode: host`，健康检查用 bash `/dev/tcp`（镜像里没有 curl/python） | `docker compose -f contrib/docker/compose.yaml config` |
 | `k8s/deployment.yaml` | `hostNetwork` + UDP/TCP 3478 + `readinessProbe → /healthz` + 只读根文件系统 | `kubectl apply --dry-run=client -f contrib/k8s/` |
 | `k8s/service.yaml` | `LoadBalancer` + `externalTrafficPolicy: Local` | 同上 |
+| `k8s/multi-instance.yaml` | 两实例（`hostNetwork`、同端口不同节点）+ 跨实例 TURN 归属（`--cluster-*`、每实例 TCP relay 段） | `kubectl apply --dry-run=client -f contrib/k8s/` |
 | `helm/` | 最小 chart（`listen` / `rfc5780` / `health` / `abuse` / `drainTimeoutSeconds` 在 values 里），**无第三方 chart 依赖** | `helm lint contrib/helm` + `helm template contrib/helm` |
 | `deb/nfpm.yaml` | `.deb` 打包配置（binary → `/usr/local/bin`、unit → `/lib/systemd/system`、文档 → `/usr/share/doc/rstun`），由 `script/ci/build-deb.sh` 渲染后调用 | `bash script/ci/build-deb.sh`（内含 `dpkg -c` + `systemd-analyze verify`） |
 | `deb/rstun.service` | **装完就能起来**的默认 unit（通配 3478 + `--tcp`），与上面的运维样例不同 | `systemd-analyze verify` |
 | `homebrew/rstun.rb` | Homebrew formula **模板**（发布时由 `script/ci/gen-brew.sh` 填版本 + sha256，推到 `exvlan/homebrew-rstun` tap） | `ruby -c` |
+
+## 多实例（`--cluster-listen`）
+
+多个实例分担同一批客户端时，TURN allocation 仍然只存在于创建它的进程里；`--cluster-*` 让任意
+实例都能算出某个 5 元组的归属并转发（控制面走 TCP 长连，peer→client 字节按连接回推）。
+部署约束（细节见 [`docs/book/src/turn.md`](../docs/book/src/turn.md) 的「多实例」）：
+
+- **每个实例的 `--listen` / TLS / DTLS 端口必须相同**，实例靠 **IP（或 netns）** 区分；
+  同一实例上的多个监听地址也必须共用端口（启动时 `HELLO` 校验，端口不一致直接拒绝启动）。
+- `--cluster-peer` 在**每个实例**上写同一份完整成员表；`--cluster-secret` 相同。
+- **UDP relay 段可共用**（第二个进程 bind 失败会自动跳过）；**TCP relay 段必须分片**：
+  集群 + `--turn-tcp-relay` 时 `--tcp-relay-ports` 必填，且与 `--relay-ports` 及其它成员不重叠。
+- 客户端发往的地址在回程必须保持稳定：**每实例独立公网 IP**、或 **共享 VIP + DSR**、
+  或 NAT 型 LB（回程也经 LB）。否则真实客户端（`turnutils_uclient` 的 UDP socket 是 `connect` 的）
+  会丢弃来自归属实例直发的 `Data`。
+- 成员表变更 = 排空重建（在途 allocation 不会迁移）。
+
+k8s 示例：[`k8s/multi-instance.yaml`](./k8s/multi-instance.yaml)。Docker 用两个容器、各自不同的
+`--listen` IP（或 host 网络下的不同宿主 IP）加同一份 `--cluster-peer`；Helm 为每个实例单独
+`helm install` 一份并覆盖 `listen`/`clusterPeer`/`argument` 段。
 
 ## 包管理器（只发 lean）
 

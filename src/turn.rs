@@ -89,7 +89,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -98,6 +98,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::auth::{self, Identity};
+use crate::cluster::{self, Cluster};
 use crate::protocol::{self, MessageClass, TransactionId};
 use crate::{Decision, ServerContext};
 
@@ -287,6 +288,10 @@ const _: () = assert!(RELAY_SOURCE_PORT_BOUND == cfg!(unix));
 pub struct Config {
     /// Inclusive relay port range (`--relay-ports LO-HI`).
     pub relay_ports: (u16, u16),
+    /// Inclusive **TCP** relay port range (`--tcp-relay-ports LO-HI`). Defaults
+    /// to `relay_ports`; in a cluster every instance needs its own disjoint
+    /// range because the TCP listener sets `SO_REUSEPORT`.
+    pub tcp_relay_ports: (u16, u16),
     pub max_allocations_per_user: usize,
     pub max_allocations_per_ip: usize,
     pub permission_limit: usize,
@@ -310,6 +315,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             relay_ports: DEFAULT_RELAY_PORTS,
+            tcp_relay_ports: DEFAULT_RELAY_PORTS,
             max_allocations_per_user: DEFAULT_MAX_ALLOCATIONS_PER_USER,
             max_allocations_per_ip: DEFAULT_MAX_ALLOCATIONS_PER_IP,
             permission_limit: DEFAULT_PERMISSION_LIMIT,
@@ -331,6 +337,12 @@ impl Config {
         if lo > hi {
             return Err(format!(
                 "--relay-ports LO-HI needs LO <= HI (got {lo}-{hi})"
+            ));
+        }
+        let (tcp_lo, tcp_hi) = self.tcp_relay_ports;
+        if tcp_lo == 0 || tcp_lo > tcp_hi {
+            return Err(format!(
+                "--tcp-relay-ports LO-HI needs 0 < LO <= HI (got {tcp_lo}-{tcp_hi})"
             ));
         }
         if self.max_allocations_per_user == 0 {
@@ -489,6 +501,14 @@ enum ClientSink {
     /// queue (ChannelData / Data indication already framed for the transport).
     /// Bounded: `try_send` drops on overflow instead of growing memory.
     Queue(mpsc::Sender<Vec<u8>>),
+    /// The client connection lives on another instance (multi-instance M2):
+    /// peer→client bytes go back over the cluster's `PUSH_CLIENT`, and the
+    /// entry writes them into that connection's bounded queue.
+    Remote {
+        cluster: Arc<Cluster>,
+        peer: String,
+        session: u32,
+    },
 }
 
 impl std::fmt::Debug for ClientSink {
@@ -496,8 +516,20 @@ impl std::fmt::Debug for ClientSink {
         match self {
             Self::Udp(_) => f.write_str("Udp"),
             Self::Queue(_) => f.write_str("Queue"),
+            Self::Remote { session, .. } => write!(f, "Remote({session})"),
         }
     }
+}
+
+/// The entry-side connection a forwarded request came from (multi-instance).
+///
+/// The owner stores it in the allocation so [`ClientSink::Remote`] can push
+/// peer→client bytes back to that exact connection, and so `CLIENT_CLOSED`
+/// finds the allocation immediately instead of waiting for the TTL.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteSink {
+    pub peer: String,
+    pub session: u32,
 }
 
 /// One channel binding (RFC 8656 §11).
@@ -629,6 +661,11 @@ pub struct Allocation {
     /// socket has the DF bit on for its whole life. A `Send` indication then
     /// needs no per-datagram toggle.
     dont_fragment: bool,
+    /// Entry-side client-connection session (multi-instance); `0` when the
+    /// allocation is local. Used to release it on `CLIENT_CLOSED`.
+    session: u32,
+    /// The instance that accepted that connection (empty when local).
+    session_peer: String,
     /// Serialises the per-datagram DF toggle **between `Send` indications that
     /// ask for DF** (§11.2). Only touched when `dont_fragment` is false (an
     /// allocation created with DF never toggles) and only by DF-carrying
@@ -658,6 +695,8 @@ impl std::fmt::Debug for Allocation {
             .field("lifetime", &self.lifetime)
             .field("client", &self.client)
             .field("dont_fragment", &self.dont_fragment)
+            .field("session", &self.session)
+            .field("session_peer", &self.session_peer)
             .field("tcp", &self.relay.is_tcp())
             .finish_non_exhaustive()
     }
@@ -716,6 +755,10 @@ pub(crate) struct DataConnection {
     /// Keeps the accepted-connection slot (`--max-inflight`) alive for the life
     /// of the data connection. Dropped when the relay task ends.
     pub(crate) _permit: Option<crate::limit::Permit>,
+    /// Multi-instance raw relay: set when the task tears the connection down
+    /// for a reason other than a clean half-close, so the entry closes the
+    /// client connection instead of only half-closing it.
+    pub(crate) abort: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// One RFC 6062 peer data connection, keyed by `CONNECTION-ID`.
@@ -782,10 +825,30 @@ pub struct Turn {
     used_tcp_ports: Mutex<HashSet<u16>>,
     /// `EVEN-PORT` (R=1) reservations: token → (odd port, deadline).
     reservations: Mutex<HashMap<[u8; 8], Reservation>>,
+    /// 5-tuples whose `Allocate` is between the "no allocation" check and the
+    /// insert. Two requests for one key must not both bind a relay and both
+    /// answer 200 (B2); this is the reservation, not the table lock.
+    creating: Mutex<HashSet<Key>>,
     /// RFC 6062 data connections by `CONNECTION-ID`. `Arc<Mutex<…>>` because the
     /// per-connection task also removes its own entry when it ends.
     connections: Arc<Mutex<HashMap<u32, TcpConnection>>>,
     counters: Arc<Counters>,
+    /// Multi-instance ownership. `None` (the default) keeps every path exactly
+    /// as it was before clusters existed; set once at startup.
+    cluster: OnceLock<Arc<Cluster>>,
+}
+
+/// Reservation for one in-flight `Allocate` (B2). Dropped on every exit path,
+/// including early returns, so a failed allocation never wedges the 5-tuple.
+struct Creating<'a> {
+    turn: &'a Turn,
+    key: Key,
+}
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        lock_lock(&self.turn.creating).remove(&self.key);
+    }
 }
 
 /// One pending `EVEN-PORT` reservation (the odd half of the requested pair).
@@ -815,8 +878,35 @@ impl Turn {
             used_ports: Mutex::new(HashSet::new()),
             used_tcp_ports: Mutex::new(HashSet::new()),
             reservations: Mutex::new(HashMap::new()),
+            creating: Mutex::new(HashSet::new()),
             connections: Arc::new(Mutex::new(HashMap::new())),
             counters: Arc::new(Counters::default()),
+            cluster: OnceLock::new(),
+        }
+    }
+
+    /// Attach the multi-instance handle. Startup only: the first value wins, so
+    /// a second call is a no-op rather than a silent reconfiguration.
+    pub fn set_cluster(&self, cluster: Arc<Cluster>) {
+        let _ = self.cluster.set(cluster);
+    }
+
+    /// The 5-tuple key for this request.
+    ///
+    /// In cluster mode `Key.server` is normalized to `0.0.0.0:<listen_port>`
+    /// (design D3): UDP/DTLS see the bound address and TCP the connection's
+    /// local address, so the raw value would make the same client a different
+    /// allocation on every instance. Without a cluster the key is untouched.
+    fn key_for(&self, client: SocketAddr, transport: ClientTransport, server: SocketAddr) -> Key {
+        let server = if self.cluster.get().is_some() {
+            cluster::normalized_server(server.port())
+        } else {
+            server
+        };
+        Key {
+            client,
+            transport,
+            server,
         }
     }
 
@@ -874,6 +964,17 @@ impl Turn {
 
     // -- lookup ------------------------------------------------------------
 
+    /// Claim the right to create an allocation for `key`, or `None` when
+    /// another request already holds it. The winner inserts before this guard
+    /// drops, so a later `get` sees the allocation and the loser answers `437`.
+    fn begin_creating(&self, key: Key) -> Option<Creating<'_>> {
+        let mut creating = lock_lock(&self.creating);
+        if !creating.insert(key) {
+            return None;
+        }
+        Some(Creating { turn: self, key })
+    }
+
     fn get(&self, key: &Key, now: Instant) -> Option<Arc<Allocation>> {
         let allocation = lock_read(&self.allocations).get(key).cloned()?;
         if allocation.remaining(now).is_zero() {
@@ -882,9 +983,24 @@ impl Turn {
         Some(allocation)
     }
 
-    fn insert(&self, allocation: Allocation) {
+    /// Publish `allocation`, or hand back the **live** competitor that won the
+    /// race for the same 5-tuple (B2). The loser's relay port goes back to the
+    /// pool and its relay/accept tasks are aborted by `Allocation::drop`.
+    fn insert(&self, allocation: Allocation) -> Result<(), Arc<Allocation>> {
         let key = allocation.key;
-        let replaced = lock_write(&self.allocations).insert(key, Arc::new(allocation));
+        let now = Instant::now();
+        let mut table = lock_write(&self.allocations);
+        let live = table
+            .get(&key)
+            .filter(|existing| !existing.remaining(now).is_zero())
+            .cloned();
+        if let Some(existing) = live {
+            drop(table);
+            self.release_port(allocation.relay_addr.port(), allocation.is_tcp());
+            return Err(existing);
+        }
+        let replaced = table.insert(key, Arc::new(allocation));
+        drop(table);
         // Replacing an expired-but-not-yet-swept entry must not leak its port;
         // the old socket dies with the last `Arc` right after this. Its data
         // connections go too (§5.5). Note it is the **previous** entry's port
@@ -892,8 +1008,14 @@ impl Turn {
         if let Some(previous) = replaced {
             self.release_port(previous.relay_addr.port(), previous.is_tcp());
             self.close_connections_for(&key);
+            if previous.session != 0
+                && let Some(cluster) = self.cluster.get()
+            {
+                cluster.forget_allocation(&previous.session_peer, previous.session);
+            }
             drop(previous);
         }
+        Ok(())
     }
 
     /// Return one relay port to the pool it came from (idempotent).
@@ -911,7 +1033,29 @@ impl Turn {
         let allocation = lock_write(&self.allocations).remove(key)?;
         self.release_port(allocation.relay_addr.port(), allocation.is_tcp());
         self.close_connections_for(key);
+        if allocation.session != 0
+            && let Some(cluster) = self.cluster.get()
+        {
+            cluster.forget_allocation(&allocation.session_peer, allocation.session);
+        }
         Some(allocation)
+    }
+
+    /// Owner side of a forwarded `CLIENT_CLOSED`: drop the allocation now.
+    pub(crate) fn remove_allocation(&self, key: &Key) {
+        self.remove(key);
+    }
+
+    /// Stop one `CONNECTION-ID` (raw relay abort). Same teardown as an
+    /// allocation removal, for one connection.
+    pub(crate) fn stop_connection(&self, id: u32) {
+        if let Some(connection) = lock_lock(&self.connections).remove(&id) {
+            let _ = connection.stop.send(true);
+        }
+    }
+
+    pub(crate) fn cluster(&self) -> Option<&Arc<Cluster>> {
+        self.cluster.get()
     }
 
     /// Signal every RFC 6062 data connection of `key` to stop. Pending ones are
@@ -943,12 +1087,21 @@ impl Turn {
         client: SocketAddr,
         server: SocketAddr,
         transport: ClientTransport,
+        session: u32,
     ) {
-        let key = Key {
-            client,
-            transport,
-            server,
-        };
+        let key = self.key_for(client, transport, server);
+        // Tell the owner first: the allocation (and its relay socket) lives
+        // there, and waiting for the TTL is exactly what R4 forbids.
+        if session != 0
+            && let Some(cluster) = self.cluster.get()
+        {
+            let node_key = cluster::NodeKey::new(client, transport.into(), server);
+            if let Some(owner) = cluster.owner_for(&node_key)
+                && owner.id != cluster.instance_id()
+            {
+                cluster.client_closed(&owner, session);
+            }
+        }
         self.remove(&key);
     }
 
@@ -982,7 +1135,7 @@ impl Turn {
     /// so `Connect` can dial out from the same address — RFC 6062 §5.2 requires
     /// the peer data connection to originate from the relayed transport address.
     fn take_tcp_port(&self, ip: IpAddr) -> Option<TcpRelay> {
-        let (lo, hi) = self.config.relay_ports;
+        let (lo, hi) = self.config.tcp_relay_ports;
         let mut used = lock_lock(&self.used_tcp_ports);
         for port in lo..=hi {
             if used.contains(&port) {
@@ -1023,21 +1176,92 @@ impl Turn {
     }
 
     /// Bind the port named by a reservation token, if it is still valid.
+    /// Bind the port named by a reservation token, if it is still valid.
+    ///
+    /// In a cluster the two `Allocate`s of an `EVEN-PORT` pair come from two
+    /// different 5-tuples, so they can (and often do) hash to **different**
+    /// owners. The token therefore carries the reserved port and the issuing
+    /// member's ring index (the client treats it as opaque, RFC 8656 §14.9):
+    ///
+    /// * the issuer still finds its own reservation and binds the exact port,
+    ///   with the single-use and 30 s expiry rules;
+    /// * another member tries the same port on **its own** relay address first
+    ///   and, if that number is already taken there, falls back to any free
+    ///   odd port. Answering `508` instead (§7.2 step 8) would make coturn's
+    ///   `turnutils_uclient` abort whenever the pair splits across instances,
+    ///   and EVEN-PORT adjacency is already unattainable across addresses.
     fn take_reserved_port(&self, ip: IpAddr, token: [u8; 8]) -> Option<Arc<UdpSocket>> {
         let now = Instant::now();
-        let reservation = lock_lock(&self.reservations).remove(&token)?;
-        if reservation.expires_at <= now {
-            self.release_port(reservation.port, false);
+        if let Some(reservation) = lock_lock(&self.reservations).remove(&token) {
+            if reservation.expires_at <= now {
+                self.release_port(reservation.port, false);
+                return None;
+            }
+            return match crate::udp_socket(SocketAddr::new(ip, reservation.port)) {
+                Ok(socket) => Some(Arc::new(socket)),
+                Err(_) => {
+                    // Give the port back rather than leave it reserved forever.
+                    self.release_port(reservation.port, false);
+                    None
+                }
+            };
+        }
+        if !self.foreign_token_is_valid(token[2]) {
+            tracing::debug!(%ip, "rstun: TURN reservation token is unknown or not from this cluster");
             return None;
         }
-        match crate::udp_socket(SocketAddr::new(ip, reservation.port)) {
-            Ok(socket) => Some(Arc::new(socket)),
-            Err(_) => {
-                // Give the port back rather than leave it reserved forever.
-                self.release_port(reservation.port, false);
-                None
+        let preferred = u16::from_be_bytes([token[0], token[1]]);
+        self.bind_odd_port(ip, Some(preferred))
+    }
+
+    /// An odd relay port, preferring `preferred` when it is inside the
+    /// configured range and free on this instance.
+    fn bind_odd_port(&self, ip: IpAddr, preferred: Option<u16>) -> Option<Arc<UdpSocket>> {
+        let (lo, hi) = self.config.relay_ports;
+        let mut used = lock_lock(&self.used_ports);
+        let candidates = preferred
+            .into_iter()
+            .chain((lo..=hi).filter(|port| !port.is_multiple_of(2)));
+        for port in candidates {
+            if !(lo..=hi).contains(&port) || used.contains(&port) {
+                continue;
             }
+            let Ok(socket) = crate::udp_socket(SocketAddr::new(ip, port)) else {
+                continue;
+            };
+            used.insert(port);
+            return Some(Arc::new(socket));
         }
+        None
+    }
+
+    /// Is `issuer` another member of this cluster? A token whose issuer index
+    /// is not a member (or is this instance, whose table missed it) is invalid
+    /// and keeps the RFC 8656 §7.2 step 8 `508`.
+    fn foreign_token_is_valid(&self, issuer: u8) -> bool {
+        let Some(cluster) = self.cluster.get() else {
+            return false;
+        };
+        let members = cluster.members();
+        let Some(own) = members
+            .iter()
+            .position(|member| member.id == cluster.instance_id())
+        else {
+            return false;
+        };
+        let issuer = usize::from(issuer);
+        issuer < members.len() && issuer != own
+    }
+
+    /// This instance's position in the sorted member ring, as encoded in an
+    /// `EVEN-PORT` token.
+    fn cluster_member_index(&self) -> Option<u8> {
+        let cluster = self.cluster.get()?;
+        let members = cluster.members();
+        let own = members
+            .iter()
+            .position(|member| member.id == cluster.instance_id())?;
+        u8::try_from(own).ok()
     }
 
     // -- sweeper -----------------------------------------------------------
@@ -1169,11 +1393,95 @@ impl Turn {
         // listening socket itself.
         sink: Option<&mpsc::Sender<Vec<u8>>>,
     ) -> Option<Result<Decision, protocol::ParseError>> {
+        self.dispatch(
+            datagram,
+            peer,
+            local,
+            client_transport,
+            context,
+            sink,
+            0,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Same as [`Turn::handle`], for one accepted **stream** connection
+    /// (TCP/TLS/DTLS). `session` identifies that connection on this instance;
+    /// forwarded requests carry it so the owner can push bytes back and release
+    /// the allocation when the connection ends (multi-instance M2).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_stream(
+        &self,
+        datagram: &[u8],
+        peer: SocketAddr,
+        local: SocketAddr,
+        client_transport: ClientTransport,
+        context: &ServerContext,
+        sink: Option<&mpsc::Sender<Vec<u8>>>,
+        session: u32,
+    ) -> Option<Result<Decision, protocol::ParseError>> {
+        self.dispatch(
+            datagram,
+            peer,
+            local,
+            client_transport,
+            context,
+            sink,
+            session,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Execute a frame the cluster already routed to this instance as its
+    /// owner: identical to [`Turn::handle`] minus the ownership check, so a
+    /// forwarded request can never be forwarded a second time.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_as_owner(
+        &self,
+        datagram: &[u8],
+        peer: SocketAddr,
+        local: SocketAddr,
+        client_transport: ClientTransport,
+        context: &ServerContext,
+        sink: Option<&mpsc::Sender<Vec<u8>>>,
+        remote: Option<&RemoteSink>,
+    ) -> Option<Result<Decision, protocol::ParseError>> {
+        self.dispatch(
+            datagram,
+            peer,
+            local,
+            client_transport,
+            context,
+            sink,
+            remote.map(|remote| remote.session).unwrap_or(0),
+            remote,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch(
+        &self,
+        datagram: &[u8],
+        peer: SocketAddr,
+        local: SocketAddr,
+        client_transport: ClientTransport,
+        context: &ServerContext,
+        sink: Option<&mpsc::Sender<Vec<u8>>>,
+        session: u32,
+        remote: Option<&RemoteSink>,
+        allow_forward: bool,
+    ) -> Option<Result<Decision, protocol::ParseError>> {
         // ChannelData is not STUN: first byte 0x40–0x7F (RFC 8656 §12.4).
-        // Over a datagram (UDP/DTLS) the frame is exactly header + payload;
-        // over a stream the caller has already de-framed it and calls
-        // `handle_channel_data`.
-        if client_transport.is_datagram() && is_channel_data(datagram) {
+        // Over a datagram the frame is exactly header + payload; a stream caller
+        // de-frames it and calls `handle_channel_data`, whose forwarded form
+        // rebuilds a complete frame and lands here on the owner.
+        if is_channel_data(datagram) {
             if datagram.len() < 4 {
                 // A truncated header is not a STUN frame either; ignore it
                 // rather than index past the datagram.
@@ -1190,7 +1498,14 @@ impl Turn {
                 // deliver bytes the peer never received.
                 return Some(Ok(Decision::Ignore("truncated TURN ChannelData")));
             }
-            self.handle_channel_data(
+            if let Some(owner) = self.forward_owner(peer, local, client_transport, allow_forward) {
+                // Fire-and-forget: the channel lookup, the permission check and
+                // the bandwidth bucket all stay on the owner.
+                self.push_to_owner(&owner, datagram, peer, local, client_transport, session)
+                    .await;
+                return Some(Ok(Decision::Ignore("TURN ChannelData")));
+            }
+            self.handle_channel_data_local(
                 channel,
                 &datagram[4..end],
                 peer,
@@ -1208,6 +1523,11 @@ impl Turn {
         let class = protocol::message_class(message.msg_type);
 
         if class == MessageClass::Indication && method == SEND_METHOD {
+            if let Some(owner) = self.forward_owner(peer, local, client_transport, allow_forward) {
+                self.push_to_owner(&owner, datagram, peer, local, client_transport, session)
+                    .await;
+                return Some(Ok(Decision::Ignore("TURN Send indication")));
+            }
             self.send_indication(&message, peer, local, client_transport, context);
             return Some(Ok(Decision::Ignore("TURN Send indication")));
         }
@@ -1227,6 +1547,35 @@ impl Turn {
         {
             return None;
         }
+        // `ConnectionBind` is never keyed by its own 5-tuple: the
+        // `CONNECTION-ID` names the instance that owns the pending peer data
+        // connection (its top byte is that instance's ring index). Falling back
+        // to the key would send it to an instance that cannot know the id.
+        if method == CONNECTION_BIND_METHOD && allow_forward && self.cluster.get().is_some() {
+            if let Some(owner) = self.connection_bind_owner(datagram, true) {
+                return Some(Ok(self
+                    .forward_request(&owner, datagram, peer, local, client_transport, session)
+                    .await));
+            }
+            return Some(Ok(self
+                .handle_request(
+                    datagram,
+                    &message,
+                    method,
+                    peer,
+                    local,
+                    client_transport,
+                    context,
+                    sink,
+                    remote,
+                )
+                .await));
+        }
+        if let Some(owner) = self.forward_owner(peer, local, client_transport, allow_forward) {
+            return Some(Ok(self
+                .forward_request(&owner, datagram, peer, local, client_transport, session)
+                .await));
+        }
         Some(Ok(self
             .handle_request(
                 datagram,
@@ -1237,8 +1586,137 @@ impl Turn {
                 client_transport,
                 context,
                 sink,
+                remote,
             )
             .await))
+    }
+
+    /// The owner of this client's 5-tuple when it is another instance.
+    /// `None` means "handle it here": no cluster, no member list, or this
+    /// instance *is* the owner.
+    fn forward_owner(
+        &self,
+        client: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        allow_forward: bool,
+    ) -> Option<cluster::Member> {
+        if !allow_forward {
+            return None;
+        }
+        let cluster = self.cluster.get()?;
+        let key = cluster::NodeKey::new(client, transport.into(), local);
+        let owner = cluster.owner_for(&key)?;
+        if owner.id == cluster.instance_id() {
+            None
+        } else {
+            Some(owner)
+        }
+    }
+
+    /// The instance that owns the `CONNECTION-ID` named by a `ConnectionBind`.
+    /// `None` = handle locally (no cluster, malformed id, or this instance).
+    fn connection_bind_owner(
+        &self,
+        datagram: &[u8],
+        allow_forward: bool,
+    ) -> Option<cluster::Member> {
+        if !allow_forward {
+            return None;
+        }
+        let cluster = self.cluster.get()?;
+        let message = protocol::parse(datagram).ok()?;
+        if protocol::message_method(message.msg_type) != CONNECTION_BIND_METHOD {
+            return None;
+        }
+        let bytes: [u8; 4] = attribute(message.body, ATTR_CONNECTION_ID)?
+            .try_into()
+            .ok()?;
+        let index = usize::try_from(u32::from_be_bytes(bytes) >> 24).ok()?;
+        let members = cluster.members();
+        let member = members.get(index)?.clone();
+        tracing::debug!(
+            id = u32::from_be_bytes(bytes),
+            index,
+            chosen = %member.id,
+            own = %cluster.instance_id(),
+            members = ?members.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            "rstun: TURN ConnectionBind routing"
+        );
+        if member.id == cluster.instance_id() {
+            None
+        } else {
+            Some(member)
+        }
+    }
+
+    /// Forward one control request and return the owner's signed response.
+    ///
+    /// An unreachable or slow owner is an explicit `500 Server Error` (design
+    /// D7): answering `437` would make the client believe its allocation is
+    /// gone and create a second one, and a silent drop would leave it guessing.
+    async fn forward_request(
+        &self,
+        owner: &cluster::Member,
+        datagram: &[u8],
+        client: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        session: u32,
+    ) -> Decision {
+        let Some(cluster) = self.cluster.get() else {
+            return Decision::Ignore("TURN request without a cluster");
+        };
+        let payload =
+            cluster::encode_payload(session, client, transport.into(), local.port(), datagram);
+        // Bind the session to this owner before the request is sent: any
+        // PUSH_CLIENT/RAW_RELAY for it must come from this instance.
+        if session != 0 {
+            cluster.claim_session_owner(session, &owner.id);
+        }
+        tracing::debug!(
+            cluster = "forward",
+            peer_instance = %owner.id,
+            %client,
+            "rstun: TURN request forwarded to its owner"
+        );
+        match cluster.request(owner, payload).await {
+            Some(cluster::Reply::Bound { response, .. }) => Decision::BoundRemote {
+                response,
+                owner: owner.id.clone(),
+            },
+            Some(cluster::Reply::Response(bytes)) if !bytes.is_empty() => Decision::Respond(bytes),
+            Some(cluster::Reply::Response(_)) => {
+                Decision::Ignore("TURN forwarded request produced no response")
+            }
+            None => {
+                tracing::warn!(
+                    cluster = "forward",
+                    peer_instance = %owner.id,
+                    %client,
+                    "rstun: TURN owner unreachable, answering 500 Server Error"
+                );
+                cluster_error(datagram)
+            }
+        }
+    }
+
+    /// Forward `Send` / `ChannelData` bytes to the owner (design D9).
+    async fn push_to_owner(
+        &self,
+        owner: &cluster::Member,
+        datagram: &[u8],
+        client: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        session: u32,
+    ) {
+        let Some(cluster) = self.cluster.get() else {
+            return;
+        };
+        let payload =
+            cluster::encode_payload(session, client, transport.into(), local.port(), datagram);
+        cluster.push_data(owner, &payload).await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1252,6 +1730,7 @@ impl Turn {
         transport: ClientTransport,
         context: &ServerContext,
         sink: Option<&mpsc::Sender<Vec<u8>>>,
+        remote: Option<&RemoteSink>,
     ) -> Decision {
         let transaction_id = &message.transaction_id;
 
@@ -1288,9 +1767,9 @@ impl Turn {
         }
 
         match method {
-            ALLOCATE_METHOD => {
-                self.allocate(message, peer, local, transport, context, sink, &identity)
-            }
+            ALLOCATE_METHOD => self.allocate(
+                message, peer, local, transport, context, sink, remote, &identity,
+            ),
             REFRESH_METHOD => self.refresh(message, peer, local, transport, &identity),
             CREATE_PERMISSION_METHOD => {
                 self.create_permission(message, peer, local, transport, context, &identity)
@@ -1320,6 +1799,7 @@ impl Turn {
         transport: ClientTransport,
         context: &ServerContext,
         sink: Option<&mpsc::Sender<Vec<u8>>>,
+        remote: Option<&RemoteSink>,
         identity: &Identity,
     ) -> Decision {
         let transaction_id = &message.transaction_id;
@@ -1422,11 +1902,7 @@ impl Turn {
         };
         let granted = self.granted_lifetime(requested_lifetime);
 
-        let key = Key {
-            client: peer,
-            transport,
-            server: local,
-        };
+        let key = self.key_for(peer, transport, local);
 
         // An existing allocation on this 5-tuple (§6.2): another user must not
         // learn or touch it (441), a *new* transaction is an allocation
@@ -1467,6 +1943,25 @@ impl Turn {
                 &self.software,
             ));
         }
+
+        // B2: two requests for one 5-tuple must not both bind a relay. The
+        // loser answers 437 immediately; its retransmission (same tid) then
+        // finds the winner and is answered idempotently by the check above.
+        let Some(_creating) = self.begin_creating(key) else {
+            // Not a quota rejection: the label set is fixed, and a concurrent
+            // duplicate says nothing about the configured limits.
+            tracing::debug!(
+                %peer,
+                "rstun: TURN concurrent Allocate for one 5-tuple, refusing the duplicate"
+            );
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                ERROR_ALLOCATION_MISMATCH,
+                "Allocation Mismatch",
+                identity,
+            ));
+        };
 
         // Quotas (§6.2 / §7.2): per authenticated user and per client IP.
         let (per_user, per_ip) = self.quota_counts(&identity.username, peer.ip());
@@ -1624,6 +2119,10 @@ impl Turn {
                 Some(relay) => (Relay::Udp(relay), None),
                 None => {
                     self.counters.rejected_ports.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        relay = %relay_ip,
+                        "rstun: TURN reservation token is unknown, expired or unbindable"
+                    );
                     return Decision::Respond(signed_error(
                         transaction_id,
                         ALLOCATE_METHOD,
@@ -1636,7 +2135,8 @@ impl Turn {
         } else if reserve_next {
             match self.take_even_port_with_reservation(relay_ip) {
                 Some((relay, next)) => {
-                    let token = fresh_reservation_token();
+                    let token =
+                        fresh_reservation_token(next, self.cluster_member_index().unwrap_or(0));
                     lock_lock(&self.reservations).insert(
                         token,
                         Reservation {
@@ -1648,6 +2148,11 @@ impl Turn {
                 }
                 None => {
                     self.counters.rejected_ports.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        relay = %relay_ip,
+                        ports = ?self.config.relay_ports,
+                        "rstun: TURN EVEN-PORT pair unavailable"
+                    );
                     return Decision::Respond(signed_error(
                         transaction_id,
                         ALLOCATE_METHOD,
@@ -1732,9 +2237,18 @@ impl Turn {
                     ));
                 }
             },
-            ClientTransport::Tcp | ClientTransport::Dtls => match sink {
-                Some(sink) => ClientSink::Queue(sink.clone()),
-                None => {
+            ClientTransport::Tcp | ClientTransport::Dtls => match (remote, sink) {
+                (Some(remote), _) => ClientSink::Remote {
+                    cluster: self
+                        .cluster
+                        .get()
+                        .expect("a remote sink only exists with a cluster")
+                        .clone(),
+                    peer: remote.peer.clone(),
+                    session: remote.session,
+                },
+                (None, Some(sink)) => ClientSink::Queue(sink.clone()),
+                (None, None) => {
                     self.release_port(relay_addr.port(), tcp_relay);
                     return Decision::Respond(signed_error(
                         transaction_id,
@@ -1781,6 +2295,7 @@ impl Turn {
                 sink.clone(),
                 self.connections.clone(),
                 self.counters.clone(),
+                self.cluster_member_index(),
             )),
             Relay::Udp(_) => None,
         };
@@ -1793,13 +2308,54 @@ impl Turn {
             lifetime: granted,
             client: peer,
             dont_fragment,
+            session: remote.map(|remote| remote.session).unwrap_or(0),
+            session_peer: remote.map(|remote| remote.peer.clone()).unwrap_or_default(),
             df_lock: Mutex::new(()),
             state,
             relay_task,
             accept_task,
         };
         let attributes = relay_attributes(&allocation, peer, transaction_id, granted, new_token);
-        self.insert(allocation);
+        let session = allocation.session;
+        let session_peer = allocation.session_peer.clone();
+        if let Err(existing) = self.insert(allocation) {
+            // A live allocation appeared between the check and the insert (a
+            // second control connection got there first). Mirror the normal
+            // decide-the-existing-allocation table: 441 for another user, the
+            // idempotent 200 for the same transaction, 437 otherwise.
+            if existing.username != identity.username {
+                return Decision::Respond(signed_error(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    ERROR_WRONG_CREDENTIALS,
+                    "Wrong Credentials",
+                    identity,
+                ));
+            }
+            if existing.transaction_id == *transaction_id {
+                let attributes =
+                    relay_attributes(&existing, peer, transaction_id, existing.lifetime, None);
+                return Decision::Respond(success(
+                    transaction_id,
+                    ALLOCATE_METHOD,
+                    &attributes,
+                    identity,
+                    &self.software,
+                ));
+            }
+            return Decision::Respond(signed_error(
+                transaction_id,
+                ALLOCATE_METHOD,
+                ERROR_ALLOCATION_MISMATCH,
+                "Allocation Mismatch",
+                identity,
+            ));
+        }
+        if session != 0
+            && let Some(cluster) = self.cluster.get()
+        {
+            cluster.remember_allocation(&session_peer, session, key);
+        }
         self.counters.created.fetch_add(1, Ordering::Relaxed);
 
         tracing::debug!(
@@ -1830,11 +2386,7 @@ impl Turn {
         identity: &Identity,
     ) -> Decision {
         let transaction_id = &message.transaction_id;
-        let key = Key {
-            client: peer,
-            transport,
-            server: local,
-        };
+        let key = self.key_for(peer, transport, local);
         let now = Instant::now();
         let Some(allocation) = self.get(&key, now) else {
             return Decision::Respond(signed_error(
@@ -1944,11 +2496,7 @@ impl Turn {
         identity: &Identity,
     ) -> Decision {
         let transaction_id = &message.transaction_id;
-        let key = Key {
-            client: peer,
-            transport,
-            server: local,
-        };
+        let key = self.key_for(peer, transport, local);
         let now = Instant::now();
         let Some(allocation) = self.get(&key, now) else {
             return Decision::Respond(signed_error(
@@ -2068,11 +2616,7 @@ impl Turn {
         identity: &Identity,
     ) -> Decision {
         let transaction_id = &message.transaction_id;
-        let key = Key {
-            client: peer,
-            transport,
-            server: local,
-        };
+        let key = self.key_for(peer, transport, local);
         let now = Instant::now();
         let Some(allocation) = self.get(&key, now) else {
             return Decision::Respond(signed_error(
@@ -2256,11 +2800,7 @@ impl Turn {
                 identity,
             ));
         }
-        let key = Key {
-            client: peer,
-            transport,
-            server: local,
-        };
+        let key = self.key_for(peer, transport, local);
         let now = Instant::now();
         let Some(allocation) = self.get(&key, now) else {
             return Decision::Respond(signed_error(
@@ -2349,7 +2889,7 @@ impl Turn {
                 ));
             }
             let id = loop {
-                let candidate = fresh_connection_id();
+                let candidate = self.fresh_connection_id();
                 if !connections.contains_key(&candidate) {
                     break candidate;
                 }
@@ -2489,6 +3029,10 @@ impl Turn {
         let transaction_id = &message.transaction_id;
         // §5.4 step 1: only a stream transport can carry a data connection.
         if !is_stream_transport(transport) {
+            tracing::debug!(
+                ?transport,
+                "rstun: TURN ConnectionBind refused: not a stream transport"
+            );
             self.counters
                 .rejected_tcp_bind
                 .fetch_add(1, Ordering::Relaxed);
@@ -2504,12 +3048,9 @@ impl Turn {
         // connection (RFC 6062 §3: the client data connection is a *new*
         // connection). This also leaves room for the ordinary 401 challenge
         // dance on a fresh connection.
-        let key = Key {
-            client: peer,
-            transport,
-            server: local,
-        };
+        let key = self.key_for(peer, transport, local);
         if self.get(&key, Instant::now()).is_some() {
+            tracing::debug!(%peer, %local, "rstun: TURN ConnectionBind refused: the 5-tuple already has an allocation");
             self.counters
                 .rejected_tcp_bind
                 .fetch_add(1, Ordering::Relaxed);
@@ -2523,6 +3064,7 @@ impl Turn {
         }
         // §5.4 step 2: the id must be present, well-formed and pending.
         let Some(value) = attribute(message.body, ATTR_CONNECTION_ID) else {
+            tracing::debug!("rstun: TURN ConnectionBind refused: no CONNECTION-ID");
             self.counters
                 .rejected_tcp_bind
                 .fetch_add(1, Ordering::Relaxed);
@@ -2535,6 +3077,7 @@ impl Turn {
             ));
         };
         let Ok(bytes) = <[u8; 4]>::try_from(value) else {
+            tracing::debug!("rstun: TURN ConnectionBind refused: malformed CONNECTION-ID");
             self.counters
                 .rejected_tcp_bind
                 .fetch_add(1, Ordering::Relaxed);
@@ -2569,6 +3112,7 @@ impl Turn {
             }
         };
         if !bound {
+            tracing::debug!(id, username = %identity.username, "rstun: TURN ConnectionBind refused: unknown/expired/pending state or allocation gone");
             self.counters
                 .rejected_tcp_bind
                 .fetch_add(1, Ordering::Relaxed);
@@ -2590,6 +3134,21 @@ impl Turn {
                 &self.software,
             ),
             id,
+        }
+    }
+
+    /// A `CONNECTION-ID` whose top byte names this instance's ring index, so a
+    /// `ConnectionBind` reaching any entry can be routed to the instance that
+    /// holds the pending peer data connection (multi-instance M3). Without a
+    /// cluster the id stays a plain random non-zero value.
+    fn fresh_connection_id(&self) -> u32 {
+        let base = fresh_connection_id();
+        match self.cluster_member_index() {
+            Some(index) => {
+                let id = (u32::from(index) << 24) | (base & 0x00FF_FFFF);
+                if id == 0 { 1 } else { id }
+            }
+            None => base,
         }
     }
 
@@ -2743,11 +3302,7 @@ impl Turn {
         transport: ClientTransport,
         context: &ServerContext,
     ) {
-        let key = Key {
-            client: peer,
-            transport,
-            server: local,
-        };
+        let key = self.key_for(peer, transport, local);
         let now = Instant::now();
         let Some(allocation) = self.get(&key, now) else {
             return;
@@ -2877,8 +3432,30 @@ impl Turn {
         }
     }
 
+    /// `ChannelData` from a stream connection: forward to the owner when the
+    /// allocation lives elsewhere (multi-instance M2), otherwise relay locally.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_channel_data(
+        &self,
+        channel: u16,
+        data: &[u8],
+        peer: SocketAddr,
+        local: SocketAddr,
+        transport: ClientTransport,
+        context: &ServerContext,
+        session: u32,
+    ) {
+        if let Some(owner) = self.forward_owner(peer, local, transport, true) {
+            let datagram = channel_data_frame(channel, data, transport);
+            self.push_to_owner(&owner, &datagram, peer, local, transport, session)
+                .await;
+            return;
+        }
+        self.handle_channel_data_local(channel, data, peer, local, transport, context);
+    }
+
     /// `ChannelData` from the client: channel hit → relay, no STUN parsing.
-    pub(crate) fn handle_channel_data(
+    fn handle_channel_data_local(
         &self,
         channel: u16,
         data: &[u8],
@@ -2887,11 +3464,7 @@ impl Turn {
         transport: ClientTransport,
         context: &ServerContext,
     ) {
-        let key = Key {
-            client: peer,
-            transport,
-            server: local,
-        };
+        let key = self.key_for(peer, transport, local);
         let now = Instant::now();
         let Some(allocation) = self.get(&key, now) else {
             return;
@@ -3034,13 +3607,18 @@ async fn run_tcp_connection(
         sender,
         writer_task,
         _permit: _inflight,
+        abort,
     } = data;
+    let mut aborted = false;
 
     // Phase 2: drain the pre-bind buffer through the same queue the client's
     // write half consumes, so ordering with the bind response is preserved.
     if !prebuffer.is_empty() {
         let buffered = prebuffer.len();
         if sender.send(prebuffer).await.is_err() {
+            if let Some(abort) = &abort {
+                abort.store(true, Ordering::Relaxed);
+            }
             return finish_tcp_connection(&connections, id);
         }
         counters
@@ -3103,20 +3681,28 @@ async fn run_tcp_connection(
     while !(client_to_peer_done && peer_to_client_done) {
         tokio::select! {
             biased;
-            _ = stop.changed() => break,
+            _ = stop.changed() => {
+                aborted = true;
+                break;
+            }
             result = &mut client_to_peer, if !client_to_peer_done => {
                 client_to_peer_done = true;
                 if result.is_err() {
+                    aborted = true;
                     break;
                 }
             }
             result = &mut peer_to_client, if !peer_to_client_done => {
                 peer_to_client_done = true;
                 if result.is_err() {
+                    aborted = true;
                     break;
                 }
             }
         }
+    }
+    if aborted && let Some(abort) = &abort {
+        abort.store(true, Ordering::Relaxed);
     }
     finish_tcp_connection(&connections, id);
 }
@@ -3172,6 +3758,7 @@ fn spawn_tcp_accept_loop(
     sink: ClientSink,
     connections: Arc<Mutex<HashMap<u32, TcpConnection>>>,
     counters: Arc<Counters>,
+    issuer: Option<u8>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // The listener's own address, for logs only (the allocation holds the
@@ -3228,7 +3815,14 @@ fn spawn_tcp_accept_loop(
                     continue;
                 }
                 let id = loop {
-                    let candidate = fresh_connection_id();
+                    let candidate = match issuer {
+                        Some(index) => {
+                            let id =
+                                (u32::from(index) << 24) | (fresh_connection_id() & 0x00FF_FFFF);
+                            if id == 0 { 1 } else { id }
+                        }
+                        None => fresh_connection_id(),
+                    };
                     if !table.contains_key(&candidate) {
                         break candidate;
                     }
@@ -3319,6 +3913,14 @@ async fn send_to_client(sink: &ClientSink, payload: Vec<u8>, client: SocketAddr)
         // Bounded queue: a client that stops reading loses datagrams
         // (relayed data is best-effort) but cannot grow memory.
         ClientSink::Queue(writer) => writer.try_send(payload).is_ok(),
+        // Multi-instance: the connection (and its queue) lives on the entry.
+        ClientSink::Remote {
+            cluster,
+            peer,
+            session,
+        } => cluster
+            .member_by_id(peer)
+            .is_some_and(|entry| cluster.push_client(&entry, *session, client, payload)),
     }
 }
 
@@ -3533,6 +4135,25 @@ fn signed_error(
         protocol::error_response(transaction_id, method, code, reason),
         identity,
     )
+}
+
+/// `500 Server Error` for a TURN request whose owner instance could not be
+/// reached (cluster D7).
+///
+/// Unsigned on purpose: the entry instance never authenticated the request (the
+/// owner does), so it has no key to seal with. RFC 5389 §10.2.3 allows a server
+/// to leave out `MESSAGE-INTEGRITY` when it cannot compute it, and the fixed
+/// reason keeps the answer at the familiar 40-byte shape.
+fn cluster_error(datagram: &[u8]) -> Decision {
+    match protocol::parse(datagram) {
+        Ok(message) => Decision::Respond(protocol::error_response(
+            &message.transaction_id,
+            protocol::message_method(message.msg_type),
+            protocol::ERROR_SERVER_ERROR,
+            "Server Error",
+        )),
+        Err(_) => Decision::Ignore("TURN request not answerable"),
+    }
 }
 
 /// First value of `attr_type` in `body`, if any.
@@ -3832,10 +4453,17 @@ fn fresh_transaction_id() -> TransactionId {
 }
 
 /// Opaque 8-byte token for an `EVEN-PORT` reservation.
-fn fresh_reservation_token() -> [u8; 8] {
+///
+/// `port (2) | issuer ring index (1) | unique (5)`. The client treats the token
+/// as opaque (RFC 8656 §14.9); the encoded issuer index is what lets a
+/// **different** cluster member tell "issued by a peer" from "invalid", after
+/// the pair's second allocation hashes elsewhere.
+fn fresh_reservation_token(port: u16, issuer: u8) -> [u8; 8] {
     let id = fresh_transaction_id();
     let mut token = [0_u8; 8];
-    token.copy_from_slice(&id.as_bytes()[..8]);
+    token[..2].copy_from_slice(&port.to_be_bytes());
+    token[2] = issuer;
+    token[3..].copy_from_slice(&id.as_bytes()[..5]);
     token
 }
 
