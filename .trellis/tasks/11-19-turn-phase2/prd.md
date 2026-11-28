@@ -37,7 +37,9 @@
 - [x] 与 coturn 对跑：三类能力差异逐项判定（出站/被动/DF/RAF 均已录入 spec 与 lab）
 - [x] 默认路径零差异：`frozen` 3 配置 × 17 请求与 `cad4fa2` 逐字节一致
 - [x] 依赖不新增（`libc` 为 unix-only DF 所需，已在 `.103` 单独说明；lean 10 / full 15 未变）
-- [ ] **多实例共享 allocation 状态**：仍未实现（可选，取决于部署形态；当前只共享 nonce secret）
+- [x] **多实例共享 allocation 状态**：已完成并归档（子任务 `11-28-rstun-turn-multi-instance`）——
+      确定性归属环 + 内部帧转发（M1 UDP / M2 TCP·TLS·DTLS / M3 RFC 6062）；
+      默认关闭，未开启时行为与 `.107` 逐字节一致
 
 ## 风险
 
@@ -65,5 +67,5 @@
 | `11-22-rstun-turn-cert-reload` | `turns:` 证书热载（SIGHUP + 轮询） | `26.410.104` |
 | `11-22-rstun-turn-passive` | RFC 6062 被动（`ConnectionAttempt`） | **未发布**（在 `main`） |
 
-唯一未做项是需求 4「多实例共享 allocation 状态」——需求里明确标注「可选，取决于部署形态」，
-且与协议合规无关。是否要做属产品决策，未擅自开工。
+**需求 1–4 全部完成**：需求 4「多实例共享 allocation 状态」由 `11-28-rstun-turn-multi-instance`
+交付（2026-11-28，含冷复核与 macOS CI 修复）。本任务可归档，剩余工作转入发布（`.108`）与长期回归。
