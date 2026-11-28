@@ -1,21 +1,44 @@
-# 观察：UDP relay 端口池「不复用」（与多实例改动无关）
+# 观察（**已撤回**）：所谓「UDP relay 端口池不复用」其实是 `EVEN-PORT` 预留语义
 
-- 来源：2026-11-28 多实例冷复核的独立压测（`11-28-rstun-turn-multi-instance`），复核原文：
-  「每轮 `Allocate` + `Refresh(0)` 后端口从 49500 → 49502 → 49504 前进；`used_ports` 释放了，
-  但 `take_port` 只发偶数端口且不回到起点，100 端口段约 50 次分配后 508。」
-- 代码：`src/turn.rs:1066-1085` `take_port` 每次从 `lo` 扫描，跳过 `used_ports` 命中项；
-  bind 失败即跳过（注释写明「held by someone else … skip it」）。本次多实例改动**未触碰**该函数。
-- **已验证（2026-11-28 复验实测，假设被否定）**：`Allocate → Refresh(LIFETIME=0)` 后 **500ms**，
-  该端口在 `ss -lun` 中已不存在（`port_still_bound_after_500ms=False`），但下一次仍从 49500 跳到 49502：
+> 2026-11-28 更正。前一版把「49500 → 49502 → 49504 递增、100 段约 50 次分配后 508」记成
+> 「确认缺陷」——**该结论错误**，实测与代码都表明端口池本身正常。
 
-  ```
-  round 0: relay=('127.0.0.1', 49500) active=0.0 port_still_bound_after_500ms=False
-  round 1: relay=('127.0.0.1', 49502) active=0.0 port_still_bound_after_500ms=False
-  ```
+## 实测结论
 
-  所以**不是异步释放延迟**，是端口池真的不回起点。原因待查：`take_port` 从 `lo` 扫描、`used_ports`
-  应已删除该项；怀疑与 `even`（只发偶数）后 `lo` 的推进或 `used_ports` 未删除有关（`src/turn.rs:1066-1085`）。
-- 影响面：lab/压测里会放大端口消耗（`bandwidth` 项曾因 508 假红，已加重试）；生产上若客户端轮换频繁，
-  有效容量可能远低于配置段大小（100 段 ≈ 50 次分配）。
-- 结论：**确认是缺陷**，但不属于 `11-28-rstun-turn-multi-instance` 的范围（该任务未触碰 `take_port`）。
-  待单独立项修复 + 回归测试（`Allocate → Refresh(0) → Allocate` 必须拿回同一端口）。
+同一个 relay 段 `61000-61004`、同样的「分配 → `Refresh(0)` → 再分配」循环：
+
+| 客户端请求 | 结果 |
+| --- | --- |
+| **带** `EVEN-PORT(R=1)`（lab 探针 `allocate_frame` 默认就带）| `61000 → 61002 → 61004`，第 3 次 `508` |
+| **不带** `EVEN-PORT` | `61000 → 61000 → 61000 → 61000`，每次都回到同一端口 |
+
+带临时日志的实测（已回滚）：
+
+```
+# 不带 EVEN-PORT
+DBG take_port picked=61000 set={61000}
+DBG release_port port=61000 tcp=false
+DBG take_port picked=61000 set={61000}
+...（4 轮完全一致）
+```
+
+## 为什么
+
+`EVEN-PORT(R=1)`（RFC 8656 §7.2）要求服务端**预留下一个奇数端口**，等第二个 allocation 用
+`RESERVATION-TOKEN` 来取。实现（`src/turn.rs` `take_even_port_with_reservation`）把
+`port` 与 `port+1` **都**记进 `used_ports`；allocation 释放时只归还偶数口，奇数口作为
+**预留**保留 30 秒（`RESERVATION_LIFETIME`），过期后由 `sweep` 归还。
+
+所以一段 N 个端口，在 30 秒窗口内最多服务约 **N/2** 个带 `EVEN-PORT` 的分配 —— 这是规范行为，
+不是泄漏。lab/压测之所以撞到 508，是因为 `turnutils_uclient` 与我们的探针**默认都带 EVEN-PORT**，
+而且连续跑得多、间隔小于 30 秒。
+
+## 影响与处置
+
+- **代码无需修改**；`bandwidth` 项历史上那次 `508` 也就是这个原因（连续 uclient + 紧端口段），
+  已有的「限速后仍能中继」508 重试仍是对症的。
+- **文档已补**：`docs/book/src/turn.md` 的「端口与配额」行写明 EVEN-PORT 的 30 秒预留与容量减半。
+- **lab 建议**（未改）：多轮分配类用例可以显式不带 EVEN-PORT（或把端口段放大一倍），
+  避免把「规范预留」误判成容量不足；现有 `bandwidth` 重试保留即可。
+- **教训**：验证端口池类问题必须控制「客户端是否请求 EVEN-PORT」这个变量；
+  只看 `ss` 与分配到的端口号会把预留语义看成泄漏。
