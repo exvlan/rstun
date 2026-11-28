@@ -3241,7 +3241,39 @@ impl ClusterPair {
     }
 }
 
+/// Is `127.0.0.2` usable as a second loopback address?
+///
+/// Linux and Windows treat all of `127/8` as loopback, so this always holds
+/// there. macOS `lo0` only carries `127.0.0.1` until an alias is added
+/// (`sudo ifconfig lo0 alias 127.0.0.2 up`), which the macOS CI job does.
+/// Every cluster test needs two instances on the same port on two IPs, so on a
+/// host without the alias they must skip **loudly** instead of failing.
+///
+/// `RSTUN_TEST_NO_CLUSTER_LOOPBACK=1` forces the skip path so the mechanism
+/// itself can be exercised on a host that does have the alias.
+fn cluster_loopback_ready() -> bool {
+    if std::env::var_os("RSTUN_TEST_NO_CLUSTER_LOOPBACK").is_some() {
+        return false;
+    }
+    std::net::UdpSocket::bind("127.0.0.2:0").is_ok()
+}
+
+/// Skip the test (and print why) when `127.0.0.2` is not configured.
+/// Deliberately not `#[ignore]`: that would skip the test on every platform,
+/// including the two where it must really run.
+macro_rules! require_cluster_loopback {
+    ($name:literal) => {
+        if !cluster_loopback_ready() {
+            eprintln!("skip {}: 127.0.0.2 is not configured (macOS: sudo ifconfig lo0 alias 127.0.0.2 up)", $name);
+            return;
+        }
+    };
+}
+
 /// A loopback port that is free on both `127.0.0.1` and `127.0.0.2`.
+///
+/// Only called by tests that already passed `require_cluster_loopback!`, so a
+/// host without the macOS alias never reaches the panic below.
 fn shared_loopback_port() -> u16 {
     for _ in 0..64 {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
@@ -3253,7 +3285,10 @@ fn shared_loopback_port() -> u16 {
             return port;
         }
     }
-    panic!("no loopback port free on both 127.0.0.1 and 127.0.0.2");
+    panic!(
+        "no loopback port free on both 127.0.0.1 and 127.0.0.2 (macOS needs \
+         `sudo ifconfig lo0 alias 127.0.0.2 up`)"
+    );
 }
 
 fn test_cluster_config(
@@ -3384,6 +3419,7 @@ async fn a_cluster_key_ignores_the_server_address() {
 /// `ChannelBind` on the other all answer `200` for the same allocation.
 #[tokio::test]
 async fn cluster_control_requests_reach_the_owner_from_any_instance() {
+    require_cluster_loopback!("cluster_control_requests_reach_the_owner_from_any_instance");
     let pair = start_cluster_pair(Config::default()).await;
     let mut client = Client::connect(pair.a.server).await;
     assert_eq!(error_code(&client.challenge().await), Some(401));
@@ -3430,6 +3466,7 @@ async fn cluster_control_requests_reach_the_owner_from_any_instance() {
 /// instance; a new transaction id must be `437`, never a second allocation.
 #[tokio::test]
 async fn cluster_retransmitted_allocate_converges_to_one_allocation() {
+    require_cluster_loopback!("cluster_retransmitted_allocate_converges_to_one_allocation");
     let pair = start_cluster_pair(Config::default()).await;
     let mut client = Client::connect(pair.a.server).await;
     client.challenge().await;
@@ -3463,6 +3500,7 @@ async fn cluster_retransmitted_allocate_converges_to_one_allocation() {
 /// comes back from the owner.
 #[tokio::test]
 async fn cluster_send_and_channel_data_are_relayed_from_a_non_owner() {
+    require_cluster_loopback!("cluster_send_and_channel_data_are_relayed_from_a_non_owner");
     let pair = start_cluster_pair(Config::default()).await;
     let mut client = Client::connect(pair.a.server).await;
     client.challenge().await;
@@ -3526,6 +3564,7 @@ async fn cluster_send_and_channel_data_are_relayed_from_a_non_owner() {
 /// would make the client rebuild its allocation) and not silence.
 #[tokio::test]
 async fn cluster_unreachable_owner_answers_500() {
+    require_cluster_loopback!("cluster_unreachable_owner_answers_500");
     let pair = start_cluster_pair(Config::default()).await;
     let mut client = Client::connect(pair.a.server).await;
     client.challenge().await;
@@ -3567,6 +3606,7 @@ async fn cluster_unreachable_owner_answers_500() {
 /// the instance that received it, even with a cluster configured.
 #[tokio::test]
 async fn cluster_does_not_forward_non_turn_frames() {
+    require_cluster_loopback!("cluster_does_not_forward_non_turn_frames");
     let pair = start_cluster_pair(Config::default()).await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let frame = request(0x0001, &transaction_id(77), &[]);
@@ -3595,6 +3635,7 @@ async fn cluster_does_not_forward_non_turn_frames() {
 /// `--cluster-secret`: the same flows work with every internal frame signed.
 #[tokio::test]
 async fn cluster_with_a_secret_relays_across_instances() {
+    require_cluster_loopback!("cluster_with_a_secret_relays_across_instances");
     let pair = start_cluster_pair_with(Config::default(), Some(b"cluster-test-secret")).await;
     let mut client = Client::connect(pair.a.server).await;
     client.challenge().await;
@@ -3649,7 +3690,10 @@ fn shared_loopback_tcp_port() -> u16 {
             return port;
         }
     }
-    panic!("no loopback port free (TCP+UDP) on both 127.0.0.1 and 127.0.0.2");
+    panic!(
+        "no loopback port free (TCP+UDP) on both 127.0.0.1 and 127.0.0.2 (macOS needs \
+         `sudo ifconfig lo0 alias 127.0.0.2 up`)"
+    );
 }
 
 async fn start_tcp_cluster_pair(config: Config) -> TcpClusterPair {
@@ -3731,6 +3775,7 @@ async fn tcp_client_for_owner(
 /// peer→client bytes come back through the entry's writer queue.
 #[tokio::test]
 async fn cluster_stream_control_forwards_and_pushes_bytes_back() {
+    require_cluster_loopback!("cluster_stream_control_forwards_and_pushes_bytes_back");
     let pair = start_tcp_cluster_pair(Config::default()).await;
     let mut client = tcp_client_for_owner(pair.a.server, "b", &pair.cluster_a).await;
 
@@ -3774,6 +3819,7 @@ async fn cluster_stream_control_forwards_and_pushes_bytes_back() {
 /// its relay socket immediately (no TTL wait).
 #[tokio::test]
 async fn cluster_stream_close_releases_the_owner_allocation() {
+    require_cluster_loopback!("cluster_stream_close_releases_the_owner_allocation");
     let pair = start_tcp_cluster_pair(Config::default()).await;
     let mut client = tcp_client_for_owner(pair.a.server, "b", &pair.cluster_a).await;
     let allocation = client.allocate_with(TRANSPORT_UDP).await;
@@ -3802,6 +3848,7 @@ async fn cluster_stream_close_releases_the_owner_allocation() {
 /// (the ownership key contains the port, so the cluster would split clients).
 #[tokio::test]
 async fn cluster_hello_rejects_a_different_listen_port() {
+    require_cluster_loopback!("cluster_hello_rejects_a_different_listen_port");
     let _serial = cluster_test_lock().lock_owned().await;
     let (cluster_a, listener_a) =
         cluster::Cluster::bind(test_cluster_config("a", "127.0.0.1:0", None, 3478))
@@ -3846,6 +3893,7 @@ async fn cluster_hello_rejects_a_different_listen_port() {
 /// then exchange raw bytes through `RAW_RELAY`.
 #[tokio::test]
 async fn cluster_raw_relay_binds_and_carries_bytes_both_ways() {
+    require_cluster_loopback!("cluster_raw_relay_binds_and_carries_bytes_both_ways");
     let pair = start_tcp_cluster_pair_each(tcp_relay_config(), tcp_relay_config()).await;
     let mut control = tcp_client_for_owner(pair.a.server, "b", &pair.cluster_a).await;
     let (listener, peer_addr) = peer_listener().await;
@@ -3904,6 +3952,7 @@ async fn cluster_raw_relay_binds_and_carries_bytes_both_ways() {
 /// `ConnectionBind` on another connection joins the raw relay.
 #[tokio::test]
 async fn cluster_passive_attempt_is_pushed_to_the_entry() {
+    require_cluster_loopback!("cluster_passive_attempt_is_pushed_to_the_entry");
     let pair = start_tcp_cluster_pair_each(tcp_relay_config(), tcp_relay_config()).await;
     let mut control = tcp_client_for_owner(pair.a.server, "b", &pair.cluster_a).await;
     let allocation = control.allocate_tcp().await;
@@ -4068,6 +4117,7 @@ async fn concurrent_allocate_for_one_five_tuple_yields_one_allocation() {
 /// handshake: the missing key would silently move to another owner.
 #[tokio::test]
 async fn cluster_hello_rejects_a_member_list_mismatch() {
+    require_cluster_loopback!("cluster_hello_rejects_a_member_list_mismatch");
     let _serial = cluster_test_lock().lock_owned().await;
     let (cluster_a, listener_a) =
         cluster::Cluster::bind(test_cluster_config("a", "127.0.0.1:0", None, 3478))

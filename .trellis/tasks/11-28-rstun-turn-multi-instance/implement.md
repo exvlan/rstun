@@ -238,3 +238,16 @@ DSR（源地址仍是 VIP）或 NAT 型 LB 转发回程。lab 的假 LB 是 NAT 
 | **N-h** 文档 | `turn.md` + `design.md`：成员一致性只校验 id（地址漂移不 fail-fast，落到 500）；集群用具体 `--listen` IP（`0.0.0.0` 仍按路由反推）| 两处已写入 |
 
 最终数字：`cargo test` **305**、`--all-features` **314**；clippy 两套 / fmt 全绿；`rstun-turn.sh` 35 passed / 0 failed / 6 SKIP；`--tls --dtls` 含 DTLS relay-ip 项。
+
+## CI 修复：macOS 的 127.0.0.2（2026-11-28）
+
+- 现象：`test (macos-latest)` 12 条集群单测 panic `no loopback port free on both 127.0.0.1 and 127.0.0.2`。
+  根因是 macOS `lo0` 只有 `127.0.0.1`（Linux/Windows 整个 `127/8` 都是 loopback），而集群单测需要
+  「同端口、两个不同 IP」。
+- 测试侧：新增 `cluster_loopback_ready()`（`UdpSocket::bind("127.0.0.2:0")`）+ `require_cluster_loopback!` 宏，
+  12 条集群单测开头显式 skip 并打印原因（**不用** `#[ignore]`，否则三个平台都零覆盖）。
+  `RSTUN_TEST_NO_CLUSTER_LOOPBACK=1` 可强制走 skip 路径做自检。
+- CI 侧：`test` job 增加 macOS-only `sudo ifconfig lo0 alias 127.0.0.2 up || true`（在 `cargo test` 之前），
+  macOS 因此与 Linux/Windows 一样真跑这 12 条。
+- 证据：Linux 上 `turn::tests::cluster` 12 passed（真跑）；强制 skip 时 12 条均打印
+  `skip <test>: 127.0.0.2 is not configured …` 并 pass；`cargo test` 305、`--all-features` 314 不变。

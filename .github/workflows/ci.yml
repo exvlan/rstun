@@ -70,6 +70,13 @@ jobs:
         with:
           key: test-${{ runner.os }}-${{ runner.arch }}
 
+      # macOS 的 lo0 默认只带 127.0.0.1（Linux/Windows 整个 127/8 都是 loopback），
+      # 而集群单测必须「同端口、两个不同 IP」。装别名让 macOS 真跑这 12 条；
+      # 装不上也不致命 —— 测试自己会打印 skip 原因并 pass，不会 panic。
+      - name: Loopback alias for cluster tests (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up || true
+
       # 单测里 bind 不到 127.0.0.2 / IPv6 的用例会自行跳过，
       # 环境差异不会把「平台不支持某个地址」变成红灯。
       #
